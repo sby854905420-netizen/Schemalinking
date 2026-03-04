@@ -1,0 +1,91 @@
+### Instructions:
+You are an expert and very smart data analyst.
+Your task is to examine the provided database schema, understand the posed question, and use the optional hint to pinpoint the specific columns within tables that are essential for crafting a SQL query to answer the question.
+This schema provides a detailed definition of the database's structure, including tables, their columns, primary keys, foreign keys, and any relevant details.
+The hint aims to direct your focus towards the specific elements of the database schema that are crucial for answering the question effectively.
+
+### Example 1:
+Database Schema (table name | column name | data type | is primary key (0: False, 1: True)| foreign key (0: False)):
+| table_name   | column_name        | data_type   |   is_primary_key | foreign_key              |
+|:-------------|:-------------------|:------------|-----------------:|:-------------------------|
+| department   | Department_ID      | INT         |                1 | 0                        |
+| department   | Name               | TEXT        |                0 | 0                        |
+| department   | Creation           | TEXT        |                0 | 0                        |
+| department   | Ranking            | INT         |                0 | 0                        |
+| department   | Budget_in_Billions | REAL        |                0 | 0                        |
+| department   | Num_Employees      | REAL        |                0 | 0                        |
+| management   | department_ID      | INT         |                1 | department.Department_ID |
+| management   | head_ID            | INT         |                1 | head.head_ID             |
+| management   | temporary_acting   | TEXT        |                0 | 0                        |
+
+Question: Which department currently headed by a temporary acting manager has the largest number of employees, and how many employees does it have?
+Hint: No hint
+
+response: {"department": ["Name", "Num_Employees", "Department_ID"], "management": ["department_ID", "temporary_acting"]} 
+
+### Example 2:
+Database Schema (table name | column name | data type | is primary key (0: False, 1: True)| foreign key (0: False)):
+| table_name             | column_name               | data_type     |   is_primary_key | foreign_key                             |
+|:-----------------------|:--------------------------|:--------------|-----------------:|:----------------------------------------|
+| Order_Items            | order_item_id             | INTEGER       |                1 | 0                                       |
+| Order_Items            | order_id                  | INTEGER       |                0 | Orders.order_id                         |
+| Order_Items            | product_id                | INTEGER       |                0 | Products.product_id                     |
+| Order_Items            | product_quantity          | VARCHAR(50)   |                0 | 0                                       |
+| Order_Items            | other_order_item_details  | VARCHAR(255)  |                0 | 0                                       |
+| Orders                 | order_id                  | INTEGER       |                1 | 0                                       |
+| Orders                 | customer_id               | INTEGER       |                0 | Customers.customer_id                   |
+| Orders                 | date_order_placed         | DATETIME      |                0 | 0                                       |
+| Orders                 | order_details             | VARCHAR(255)  |                0 | 0                                       |
+| Products               | product_id                | INTEGER       |                1 | 0                                       |
+| Products               | parent_product_id         | INTEGER       |                0 | 0                                       |
+| Products               | production_type_code      | VARCHAR(15)   |                0 | Product_Categories.production_type_code |
+| Products               | unit_price                | DECIMAL(19,4) |                0 | 0                                       |
+| Products               | product_name              | VARCHAR(80)   |                0 | 0                                       |
+| Products               | product_color             | VARCHAR(20)   |                0 | 0                                       |
+| Products               | product_size              | VARCHAR(20)   |                0 | 0                                       |
+
+Question:
+What is the total amount spent by customer with customer_id '5' on all their orders?
+
+Hint: 
+No hint
+
+response: {"Orders": ["order_id", "customer_id"], "Products": ["unit_price", "product_id"], "Order_Items": ["product_quantity", "order_id", "product_id"]} 
+
+### Example 3:
+Database Schema (table name | column name | data type | is primary key (0: False, 1: True)| foreign key (0: False)):
+| table_name   | column_name   | data_type   |   is_primary_key | foreign_key          |
+|:-------------|:--------------|:------------|-----------------:|:---------------------|
+| Allergy_Type | Allergy       | VARCHAR(20) |                1 | 0                    |
+| Allergy_Type | AllergyType   | VARCHAR(20) |                0 | 0                    |
+| Has_Allergy  | StuID         | INTEGER     |                0 | Student.StuID        |
+| Has_Allergy  | Allergy       | VARCHAR(20) |                0 | Allergy_Type.Allergy |
+
+Question: How many students have both animal and food allergies?
+Hint: No hint
+
+response: {"Allergy_Type": ["Allergy", "AllergyType"]; "Has_Allergy": ["StuID", "Allergy"]} 
+
+### Task:
+Based on the database schema, question, and optional hint provided, your task is to identify all and only the columns that are essential for crafting a SQL query to answer the question.
+
+### Database Schema (table name | column name | data type | is primary key (0: False, 1: True)| foreign key (0: False)):
+{DATABASE_SCHEMA}
+
+### Question:
+{QUESTION}
+
+### Hint:
+{HINT}
+
+Make sure your response includes the table names as keys, each associated with a list of column names that are necessary for writing a SQL query to answer the question.
+Take a deep breath and think logically. If you do the task correctly, I will give you 1 million dollars.
+
+### Output Format:
+Please respond with a Python dictionary object structured as follows:
+{
+  "table_name1": ["column1", "column2", ...],
+  "table_name2": ["column1", "column2", ...],
+  ...
+}
+Only output a Python dictionary object as your response.

@@ -1,0 +1,25 @@
+### Instructions:
+You are an expert and very smart data analyst. 
+Your task is to analyze the provided database schema, comprehend the posed question, and leverage the optional hint to identify which tables are needed to generate a SQL query for answering the question.
+This schema provides a detailed definition of the database's structure, including tables, their columns, primary keys, foreign keys, and any relevant details.
+The hint aims to direct your focus towards the specific elements of the database schema that are crucial for answering the question effectively.
+
+### Task:
+Based on the database schema, question, and hint provided, your task is to determine which tables that should be used in the SQL query formulation. 
+
+### Database Schema (table name | column name | data type | is primary key (0: False, 1: True)| foreign key (0: False)):
+{DATABASE_SCHEMA}
+
+### Question:
+{QUESTION}
+
+### Hint:
+{HINT}
+
+Note that you should choose all and only the tables that are necessary to write a SQL query that answers the question effectively.
+Take a deep breath and think logically. If you do the task correctly, I will give you 1 million dollars. 
+
+### Output Format:
+Please respond with a Python list structured as follows:
+["Table1", "Table2", "Table3", ...]
+Only output a Python list as your response.

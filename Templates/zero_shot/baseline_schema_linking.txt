@@ -1,0 +1,28 @@
+### Instructions:
+You are now a professional SQL analyst.
+Your task is to examine the provided database schema, understand the posed question, and use the optional hint to select the columns within tables that are essential for crafting a SQL query to answer the question.
+This schema provides a detailed definition of the database's structure, including tables, their columns, primary keys, foreign keys, and any relevant details.
+The hint aims to direct your focus towards the specific elements of the database schema that are crucial for answering the question effectively.
+
+### Task:
+Based on the database schema, question, and optional hint provided, your task is to identify all and only the columns that are essential for crafting a SQL query to answer the question.
+
+### Database Schema (table name | column name | data type | is primary key (0: False, 1: True)| foreign key (0: False)):
+{DATABASE_SCHEMA}
+
+### Question:
+{QUESTION}
+
+### Hint:
+{HINT}
+
+Make sure your response includes the table names as keys, each associated with a list of column names that are necessary for writing a SQL query to answer the question.
+
+### Output Format:
+Please respond with a Python dictionary object structured as follows:
+{
+  "table_name1": ["column1", "column2", ...],
+  "table_name2": ["column1", "column2", ...],
+  ...
+}
+Only output a Python dictionary object as your response.

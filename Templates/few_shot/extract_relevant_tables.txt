@@ -1,0 +1,139 @@
+### Instructions:
+You are an expert and very smart data analyst. 
+Your task is to analyze the provided database schema, comprehend the posed question, and leverage the optional hint to identify which tables are needed to generate a SQL query for answering the question.
+This schema provides a detailed definition of the database's structure, including tables, their columns, primary keys, foreign keys, and any relevant details.
+The hint aims to direct your focus towards the specific elements of the database schema that are crucial for answering the question effectively.
+
+### Example 1:
+Database Schema (table name | column name | data type | is primary key (0: False, 1: True)| foreign key (0: False)):
+| table_name   | column_name        | data_type   |   is_primary_key | foreign_key              |
+|:-------------|:-------------------|:------------|-----------------:|:-------------------------|
+| department   | Department_ID      | INT         |                1 | 0                        |
+| department   | Name               | TEXT        |                0 | 0                        |
+| department   | Creation           | TEXT        |                0 | 0                        |
+| department   | Ranking            | INT         |                0 | 0                        |
+| department   | Budget_in_Billions | REAL        |                0 | 0                        |
+| department   | Num_Employees      | REAL        |                0 | 0                        |
+| head         | head_ID            | INT         |                1 | 0                        |
+| head         | name               | TEXT        |                0 | 0                        |
+| head         | born_state         | TEXT        |                0 | 0                        |
+| head         | age                | REAL        |                0 | 0                        |
+| management   | department_ID      | INT         |                1 | department.Department_ID |
+| management   | head_ID            | INT         |                1 | head.head_ID             |
+| management   | temporary_acting   | TEXT        |                0 | 0                        |
+
+Question: Which department currently headed by a temporary acting manager has the largest number of employees, and how many employees does it have?
+Hint: No hint
+
+response:  ["department", "management"]
+
+### Example 2:
+Database Schema (table name | column name | data type | is primary key (0: False, 1: True)| foreign key (0: False)):
+| table_name             | column_name               | data_type     |   is_primary_key | foreign_key                             |
+|:-----------------------|:--------------------------|:--------------|-----------------:|:----------------------------------------|
+| Accounts               | account_id                | INTEGER       |                1 | 0                                       |
+| Accounts               | customer_id               | INTEGER       |                0 | Customers.customer_id                   |
+| Accounts               | date_account_opened       | DATETIME      |                0 | 0                                       |
+| Accounts               | account_name              | VARCHAR(50)   |                0 | 0                                       |
+| Accounts               | other_account_details     | VARCHAR(255)  |                0 | 0                                       |
+| Customers              | customer_id               | INTEGER       |                1 | 0                                       |
+| Customers              | customer_first_name       | VARCHAR(50)   |                0 | 0                                       |
+| Customers              | customer_middle_initial   | VARCHAR(1)    |                0 | 0                                       |
+| Customers              | customer_last_name        | VARCHAR(50)   |                0 | 0                                       |
+| Customers              | gender                    | VARCHAR(1)    |                0 | 0                                       |
+| Customers              | email_address             | VARCHAR(255)  |                0 | 0                                       |
+| Customers              | login_name                | VARCHAR(80)   |                0 | 0                                       |
+| Customers              | login_password            | VARCHAR(20)   |                0 | 0                                       |
+| Customers              | phone_number              | VARCHAR(255)  |                0 | 0                                       |
+| Customers              | town_city                 | VARCHAR(50)   |                0 | 0                                       |
+| Customers              | state_county_province     | VARCHAR(50)   |                0 | 0                                       |
+| Customers              | country                   | VARCHAR(50)   |                0 | 0                                       |
+| Financial_Transactions | transaction_id            | INTEGER       |                0 | 0                                       |
+| Financial_Transactions | account_id                | INTEGER       |                0 | Accounts.account_id                     |
+| Financial_Transactions | invoice_number            | INTEGER       |                0 | Invoices.invoice_number                 |
+| Financial_Transactions | transaction_type          | VARCHAR(15)   |                0 | 0                                       |
+| Financial_Transactions | transaction_date          | DATETIME      |                0 | 0                                       |
+| Financial_Transactions | transaction_amount        | DECIMAL(19,4) |                0 | 0                                       |
+| Financial_Transactions | transaction_comment       | VARCHAR(255)  |                0 | 0                                       |
+| Financial_Transactions | other_transaction_details | VARCHAR(255)  |                0 | 0                                       |
+| Invoice_Line_Items     | order_item_id             | INTEGER       |                0 | Order_Items.order_item_id               |
+| Invoice_Line_Items     | invoice_number            | INTEGER       |                0 | Invoices.invoice_number                 |
+| Invoice_Line_Items     | product_id                | INTEGER       |                0 | Products.product_id                     |
+| Invoice_Line_Items     | product_title             | VARCHAR(80)   |                0 | 0                                       |
+| Invoice_Line_Items     | product_quantity          | VARCHAR(50)   |                0 | 0                                       |
+| Invoice_Line_Items     | product_price             | DECIMAL(19,4) |                0 | 0                                       |
+| Invoice_Line_Items     | derived_product_cost      | DECIMAL(19,4) |                0 | 0                                       |
+| Invoice_Line_Items     | derived_vat_payable       | DECIMAL(19,4) |                0 | 0                                       |
+| Invoice_Line_Items     | derived_total_cost        | DECIMAL(19,4) |                0 | 0                                       |
+| Invoices               | invoice_number            | INTEGER       |                1 | 0                                       |
+| Invoices               | order_id                  | INTEGER       |                0 | Orders.order_id                         |
+| Invoices               | invoice_date              | DATETIME      |                0 | 0                                       |
+| Order_Items            | order_item_id             | INTEGER       |                1 | 0                                       |
+| Order_Items            | order_id                  | INTEGER       |                0 | Orders.order_id                         |
+| Order_Items            | product_id                | INTEGER       |                0 | Products.product_id                     |
+| Order_Items            | product_quantity          | VARCHAR(50)   |                0 | 0                                       |
+| Order_Items            | other_order_item_details  | VARCHAR(255)  |                0 | 0                                       |
+| Orders                 | order_id                  | INTEGER       |                1 | 0                                       |
+| Orders                 | customer_id               | INTEGER       |                0 | Customers.customer_id                   |
+| Orders                 | date_order_placed         | DATETIME      |                0 | 0                                       |
+| Orders                 | order_details             | VARCHAR(255)  |                0 | 0                                       |
+| Product_Categories     | production_type_code      | VARCHAR(15)   |                1 | 0                                       |
+| Product_Categories     | product_type_description  | VARCHAR(80)   |                0 | 0                                       |
+| Product_Categories     | vat_rating                | DECIMAL(19,4) |                0 | 0                                       |
+| Products               | product_id                | INTEGER       |                1 | 0                                       |
+| Products               | parent_product_id         | INTEGER       |                0 | 0                                       |
+| Products               | production_type_code      | VARCHAR(15)   |                0 | Product_Categories.production_type_code |
+| Products               | unit_price                | DECIMAL(19,4) |                0 | 0                                       |
+| Products               | product_name              | VARCHAR(80)   |                0 | 0                                       |
+| Products               | product_color             | VARCHAR(20)   |                0 | 0                                       |
+| Products               | product_size              | VARCHAR(20)   |                0 | 0                                       |
+
+Question:
+What is the total amount spent by customer with customer_id '5' on all their orders?
+
+Hint: 
+No hint
+
+response: ["Orders", "Products", "Order_Items"]
+
+### Example 3:
+Database Schema (table name | column name | data type | is primary key (0: False, 1: True)| foreign key (0: False)):
+| table_name   | column_name   | data_type   |   is_primary_key | foreign_key          |
+|:-------------|:--------------|:------------|-----------------:|:---------------------|
+| Allergy_Type | Allergy       | VARCHAR(20) |                1 | 0                    |
+| Allergy_Type | AllergyType   | VARCHAR(20) |                0 | 0                    |
+| Has_Allergy  | StuID         | INTEGER     |                0 | Student.StuID        |
+| Has_Allergy  | Allergy       | VARCHAR(20) |                0 | Allergy_Type.Allergy |
+| Student      | StuID         | INTEGER     |                1 | 0                    |
+| Student      | LName         | VARCHAR(12) |                0 | 0                    |
+| Student      | Fname         | VARCHAR(12) |                0 | 0                    |
+| Student      | Age           | INTEGER     |                0 | 0                    |
+| Student      | Sex           | VARCHAR(1)  |                0 | 0                    |
+| Student      | Major         | INTEGER     |                0 | 0                    |
+| Student      | Advisor       | INTEGER     |                0 | 0                    |
+| Student      | city_code     | VARCHAR(3)  |                0 | 0                    |
+
+Question: How many students have both animal and food allergies?
+Hint: No hint
+
+response: ["Allergy_Type", "Has_Allergy"]
+
+### Task:
+Based on the database schema, question, and hint provided, your task is to determine which tables that should be used in the SQL query formulation. 
+
+### Database Schema (table name | column name | data type | is primary key (0: False, 1: True)| foreign key (0: False)):
+{DATABASE_SCHEMA}
+
+### Question:
+{QUESTION}
+
+### Hint:
+{HINT}
+
+Note that you should choose all and only the tables that are necessary to write a SQL query that answers the question effectively.
+Take a deep breath and think logically. If you do the task correctly, I will give you 1 million dollars. 
+
+### Output Format:
+Please respond with a Python list structured as follows:
+["Table1", "Table2", "Table3", ...]
+Only output a Python list as your response.

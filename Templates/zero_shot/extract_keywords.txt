@@ -1,0 +1,24 @@
+### Objective: 
+Analyze the given question and hint to identify and extract keywords, keyphrases, and named entities. These elements are crucial for understanding the core components of the inquiry and the guidance provided. This process involves recognizing and isolating significant terms and phrases that could be instrumental in formulating searches or queries related to the posed question.
+
+### Instructions:
+1. Read the Question Carefully: Understand the primary focus and specific details of the question. Look for any named entities (such as organizations, locations, etc.), technical terms, and other phrases that encapsulate important aspects of the inquiry.
+2. Analyze the Hint: The hint is optional. The hint is designed to direct attention toward certain elements relevant to answering the question. 
+3. List Keyphrases and Entities: Combine your findings from both the question and the hint into a single Python list. This list should contain:
+Keywords: Single words that capture essential aspects of the question or hint.
+Keyphrases: Short phrases or named entities that represent specific concepts, locations, organizations, or other significant details.
+Ensure to maintain the original phrasing or terminology used in the question and hint.
+
+### Task:
+Given the following question and hint (optional), identify and list all relevant keywords, keyphrases, and named entities.
+
+### Question: 
+{QUESTION}
+
+### Hint: 
+{HINT}
+
+### Output Format:
+Please provide your findings as a Python list, capturing the essence of both the question and hint through the identified terms and phrases, as follows:
+["keyphrases1", "keyphrases2", "keyphrases3", ...]
+Only output the Python list, no explanations needed. 

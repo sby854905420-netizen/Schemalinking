@@ -1,0 +1,11 @@
+.env
+.DS_Store
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Local experiment artifacts
+Logs/
+
+# Large local datasets
+Data/
