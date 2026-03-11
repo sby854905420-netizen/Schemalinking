@@ -1,29 +1,63 @@
 ### Instructions:
-You are an expert and very smart data analyst.
-Your task is to examine the provided database schema, understand the posed question, and use the optional hint to pinpoint the specific columns within tables that are essential for crafting a SQL query to answer the question.
-This schema provides a detailed definition of the database's structure, including tables, their columns, primary keys, foreign keys, and any relevant details.
-The hint aims to direct your focus towards the specific elements of the database schema that are crucial for answering the question effectively.
+You are an expert data analyst specializing in database querying.
 
-### Task:
-Based on the database schema, question, and optional hint provided, your task is to identify all and only the columns that are essential for crafting a SQL query to answer the question.
+Your task is to identify the minimal set of columns used to write a correct SQL query that answers the question.
 
-### Database Schema (table name | column name | data type | is primary key (0: False, 1: True)| foreign key (0: False)):
-{DATABASE_SCHEMA}
+The database schema provided to you has already been filtered to contain only relevant tables.
+Do NOT decide which tables are relevant.
+Your job is only to identify which columns from these provided tables are necessary for the SQL query.
 
-### Question:
-{QUESTION}
+Only include columns that are necessary for the SQL query.
+Do not include irrelevant columns.
+Do not include extra columns just because they appear in the same table.
+Include join keys only when they are needed to connect tables in the SQL query.
+
+### Database Schema:
+The schema describes the structure of the filtered relevant tables, including columns, primary keys, foreign keys, and other relevant information.
+Primary keys uniquely identify rows in a table.
+Foreign keys represent relationships between tables and may indicate how tables should be joined.
 
 ### Hint:
-{HINT}
+The hint (if provided) may highlight columns, conditions, or relationships that are relevant to the question.
+Use the hint as additional guidance, but rely primarily on the schema and the question.
 
-Make sure your response includes the table names as keys, each associated with a list of column names that are necessary for writing a SQL query to answer the question.
-Take a deep breath and think logically. If you do the task correctly, I will give you 1 million dollars.
+### Output Requirements (STRICT):
 
-### Output Format:
-Please respond with a Python dictionary object structured as follows:
+Return ONLY a valid JSON object.
+
+Format:
 {
-  "table_name1": ["column1", "column2", ...],
-  "table_name2": ["column1", "column2", ...],
-  ...
+  "relevant_columns": {
+    "table_name1": ["column1", "column2"],
+    "table_name2": ["column3"],
+    "table_name3": ["column4", "column5", "column6"]
+  }
 }
-Only output a Python dictionary object as your response.
+
+Rules (STRICT):
+- Keys must be table names from the provided database schema.
+- Values must be lists of column names from the schema.
+- Use double quotes for all keys and strings.
+- Do NOT invent tables or columns that do not exist in the schema.
+- Do NOT include explanations.
+- Do NOT include reasoning.
+- Do NOT include markdown or code blocks.
+- Do NOT include any text before or after the JSON.
+- Only include columns required for writing the SQL query.
+- If a table has no required columns, do NOT include that table.
+
+If no columns can be confidently identified, return:
+{}
+
+You may reason internally to determine the correct columns, but do NOT output the reasoning.
+Only output the final JSON object.
+
+### INPUT:
+Database Schema (table name | column name | data type | is primary key (0: False, 1: True)| foreign key (0: False)):
+{DATABASE_SCHEMA}
+
+Question:
+{QUESTION}
+
+Hint (may be empty):
+{HINT}

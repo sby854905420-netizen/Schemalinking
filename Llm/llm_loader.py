@@ -49,7 +49,8 @@ class LLM:
         response = client.chat.completions.create(
             model=self.model_name,
             messages=[{"role": "user", "content": prompt}],
-            max_completion_tokens=4096,
+            response_format={"type": "json_object"},
+            temperature=0,
         )
         # print(response)
         return response.choices[0].message.content
@@ -57,7 +58,15 @@ class LLM:
     
     def _query_ollama(self, prompt: str) -> str:
         """Call local Ollama to generate text"""
-        response = ollama.chat(model=self.model_name, messages=[{"role": "user", "content": prompt}])
+        response = ollama.chat(model=self.model_name, 
+                               messages=[{"role": "user", "content": prompt}],
+                               format="json",
+                               options={
+                                   "temperature": 0,
+                                   "num_predict": 128,
+                                   "repeat_penalty": 1.1,
+                                }    
+                               )
         return response["message"]["content"]
 
     def _query_transformers(self, prompt: str) -> str:

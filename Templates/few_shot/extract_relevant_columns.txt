@@ -1,8 +1,56 @@
 ### Instructions:
-You are an expert and very smart data analyst.
-Your task is to examine the provided database schema, understand the posed question, and use the optional hint to pinpoint the specific columns within tables that are essential for crafting a SQL query to answer the question.
-This schema provides a detailed definition of the database's structure, including tables, their columns, primary keys, foreign keys, and any relevant details.
-The hint aims to direct your focus towards the specific elements of the database schema that are crucial for answering the question effectively.
+You are an expert data analyst specializing in database querying.
+
+Your task is to identify the minimal set of columns used to write a correct SQL query that answers the question.
+
+The database schema provided to you has already been filtered to contain only relevant tables.
+Do NOT decide which tables are relevant.
+Your job is only to identify which columns from these provided tables are necessary for the SQL query.
+
+Only include columns that are necessary for the SQL query.
+Do not include irrelevant columns.
+Do not include extra columns just because they appear in the same table.
+Include join keys only when they are needed to connect tables in the SQL query.
+
+### Database Schema:
+The schema describes the structure of the filtered relevant tables, including columns, primary keys, foreign keys, and other relevant information.
+Primary keys uniquely identify rows in a table.
+Foreign keys represent relationships between tables and may indicate how tables should be joined.
+
+### Hint:
+The hint (if provided) may highlight columns, conditions, or relationships that are relevant to the question.
+Use the hint as additional guidance, but rely primarily on the schema and the question.
+
+### Output Requirements (STRICT):
+
+Return ONLY a valid JSON object.
+
+Format:
+{
+  "relevant_columns": {
+    "table_name1": ["column1", "column2"],
+    "table_name2": ["column3"],
+    "table_name3": ["column4", "column5", "column6"]
+  }
+}
+
+Rules (STRICT):
+- Keys must be table names from the provided database schema.
+- Values must be lists of column names from the schema.
+- Use double quotes for all keys and strings.
+- Do NOT invent tables or columns that do not exist in the schema.
+- Do NOT include explanations.
+- Do NOT include reasoning.
+- Do NOT include markdown or code blocks.
+- Do NOT include any text before or after the JSON.
+- Only include columns required for writing the SQL query.
+- If a table has no required columns, do NOT include that table.
+
+If no columns can be confidently identified, return:
+{}
+
+You may reason internally to determine the correct columns, but do NOT output the reasoning.
+Only output the final JSON object.
 
 ### Example 1:
 Database Schema (table name | column name | data type | is primary key (0: False, 1: True)| foreign key (0: False)):
@@ -18,74 +66,117 @@ Database Schema (table name | column name | data type | is primary key (0: False
 | management   | head_ID            | INT         |                1 | head.head_ID             |
 | management   | temporary_acting   | TEXT        |                0 | 0                        |
 
-Question: Which department currently headed by a temporary acting manager has the largest number of employees, and how many employees does it have?
-Hint: No hint
+Question: 
+Which department currently headed by a temporary acting manager has the largest number of employees, and how many employees does it have?
 
-response: {"department": ["Name", "Num_Employees", "Department_ID"], "management": ["department_ID", "temporary_acting"]} 
+Hint (may be empty): 
+No hint
+
+response:
+{
+  "relevant_columns": {
+    "department": ["Name", "Num_Employees", "Department_ID"],
+    "management": ["department_ID", "temporary_acting"]
+  }
+}
 
 ### Example 2:
 Database Schema (table name | column name | data type | is primary key (0: False, 1: True)| foreign key (0: False)):
-| table_name             | column_name               | data_type     |   is_primary_key | foreign_key                             |
-|:-----------------------|:--------------------------|:--------------|-----------------:|:----------------------------------------|
-| Order_Items            | order_item_id             | INTEGER       |                1 | 0                                       |
-| Order_Items            | order_id                  | INTEGER       |                0 | Orders.order_id                         |
-| Order_Items            | product_id                | INTEGER       |                0 | Products.product_id                     |
-| Order_Items            | product_quantity          | VARCHAR(50)   |                0 | 0                                       |
-| Order_Items            | other_order_item_details  | VARCHAR(255)  |                0 | 0                                       |
-| Orders                 | order_id                  | INTEGER       |                1 | 0                                       |
-| Orders                 | customer_id               | INTEGER       |                0 | Customers.customer_id                   |
-| Orders                 | date_order_placed         | DATETIME      |                0 | 0                                       |
-| Orders                 | order_details             | VARCHAR(255)  |                0 | 0                                       |
-| Products               | product_id                | INTEGER       |                1 | 0                                       |
-| Products               | parent_product_id         | INTEGER       |                0 | 0                                       |
-| Products               | production_type_code      | VARCHAR(15)   |                0 | Product_Categories.production_type_code |
-| Products               | unit_price                | DECIMAL(19,4) |                0 | 0                                       |
-| Products               | product_name              | VARCHAR(80)   |                0 | 0                                       |
-| Products               | product_color             | VARCHAR(20)   |                0 | 0                                       |
-| Products               | product_size              | VARCHAR(20)   |                0 | 0                                       |
+| table_name   | column_name        | data_type   |   is_primary_key | foreign_key       |
+|:-------------|:-------------------|:------------|-----------------:|:------------------|
+| matches      | best_of            | INT         |                0 | 0                 |
+| matches      | draw_size          | INT         |                0 | 0                 |
+| matches      | loser_age          | FLOAT       |                0 | 0                 |
+| matches      | loser_entry        | TEXT        |                0 | 0                 |
+| matches      | loser_hand         | TEXT        |                0 | 0                 |
+| matches      | loser_ht           | INT         |                0 | 0                 |
+| matches      | loser_id           | INT         |                0 | players.player_id |
+| matches      | loser_ioc          | TEXT        |                0 | 0                 |
+| matches      | loser_name         | TEXT        |                0 | 0                 |
+| matches      | loser_rank         | INT         |                0 | 0                 |
+| matches      | loser_rank_points  | INT         |                0 | 0                 |
+| matches      | loser_seed         | INT         |                0 | 0                 |
+| matches      | match_num          | INT         |                0 | 0                 |
+| matches      | minutes            | INT         |                0 | 0                 |
+| matches      | round              | TEXT        |                0 | 0                 |
+| matches      | score              | TEXT        |                0 | 0                 |
+| matches      | surface            | TEXT        |                0 | 0                 |
+| matches      | tourney_date       | DATE        |                0 | 0                 |
+| matches      | tourney_id         | TEXT        |                0 | 0                 |
+| matches      | tourney_level      | TEXT        |                0 | 0                 |
+| matches      | tourney_name       | TEXT        |                0 | 0                 |
+| matches      | winner_age         | FLOAT       |                0 | 0                 |
+| matches      | winner_entry       | TEXT        |                0 | 0                 |
+| matches      | winner_hand        | TEXT        |                0 | 0                 |
+| matches      | winner_ht          | INT         |                0 | 0                 |
+| matches      | winner_id          | INT         |                0 | players.player_id |
+| matches      | winner_ioc         | TEXT        |                0 | 0                 |
+| matches      | winner_name        | TEXT        |                0 | 0                 |
+| matches      | winner_rank        | INT         |                0 | 0                 |
+| matches      | winner_rank_points | INT         |                0 | 0                 |
+| matches      | winner_seed        | INT         |                0 | 0                 |
+| matches      | year               | INT         |                0 | 0                 |
+| players      | player_id          | INT         |                1 | 0                 |
+| players      | first_name         | TEXT        |                0 | 0                 |
+| players      | last_name          | TEXT        |                0 | 0                 |
+| players      | hand               | TEXT        |                0 | 0                 |
+| players      | birth_date         | DATE        |                0 | 0                 |
+| players      | country_code       | TEXT        |                0 | 0                 |
 
 Question:
-What is the total amount spent by customer with customer_id '5' on all their orders?
+What is the first name, country code, and birth date of the player with the most winner rank points across all matches?
 
-Hint: 
+Hint (may be empty): 
 No hint
 
-response: {"Orders": ["order_id", "customer_id"], "Products": ["unit_price", "product_id"], "Order_Items": ["product_quantity", "order_id", "product_id"]} 
+response:
+{
+  "relevant_columns": {
+    "players": ["first_name", "country_code", "birth_date", "player_id"],
+    "matches": ["winner_id", "winner_rank_points"]
+  }
+}
 
 ### Example 3:
 Database Schema (table name | column name | data type | is primary key (0: False, 1: True)| foreign key (0: False)):
-| table_name   | column_name   | data_type   |   is_primary_key | foreign_key          |
-|:-------------|:--------------|:------------|-----------------:|:---------------------|
-| Allergy_Type | Allergy       | VARCHAR(20) |                1 | 0                    |
-| Allergy_Type | AllergyType   | VARCHAR(20) |                0 | 0                    |
-| Has_Allergy  | StuID         | INTEGER     |                0 | Student.StuID        |
-| Has_Allergy  | Allergy       | VARCHAR(20) |                0 | Allergy_Type.Allergy |
+| table_name   | column_name   | data_type   |   is_primary_key | foreign_key   |
+|:-------------|:--------------|:------------|-----------------:|:--------------|
+| event        | ID            | INT         |                1 | 0             |
+| event        | Name          | TEXT        |                0 | 0             |
+| event        | Stadium_ID    | INT         |                0 | stadium.ID    |
+| event        | Year          | TEXT        |                0 | 0             |
+| record       | ID            | INT         |                0 | 0             |
+| record       | Result        | TEXT        |                0 | 0             |
+| record       | Swimmer_ID    | INT         |                1 | swimmer.ID    |
+| record       | Event_ID      | INT         |                1 | event.ID      |
+| stadium      | ID            | INT         |                1 | 0             |
+| stadium      | name          | TEXT        |                0 | 0             |
+| stadium      | Capacity      | INT         |                0 | 0             |
+| stadium      | City          | TEXT        |                0 | 0             |
+| stadium      | Country       | TEXT        |                0 | 0             |
+| stadium      | Opening_year  | INT         |                0 | 0             |
 
-Question: How many students have both animal and food allergies?
-Hint: No hint
+Question: 
+Which stadium hosted events where the swimmer with ID 1 had a loss?
 
-response: {"Allergy_Type": ["Allergy", "AllergyType"]; "Has_Allergy": ["StuID", "Allergy"]} 
+Hint (may be empty): 
+No hint
 
-### Task:
-Based on the database schema, question, and optional hint provided, your task is to identify all and only the columns that are essential for crafting a SQL query to answer the question.
+response:
+{
+  "relevant_columns": {
+    "stadium": ["name", "ID"],
+    "event": ["Stadium_ID", "ID"],
+    "record": ["Event_ID", "Result", "Swimmer_ID"]
+  }
+}
 
-### Database Schema (table name | column name | data type | is primary key (0: False, 1: True)| foreign key (0: False)):
+### INPUT:
+Database Schema (table name | column name | data type | is primary key (0: False, 1: True)| foreign key (0: False)):
 {DATABASE_SCHEMA}
 
-### Question:
+Question:
 {QUESTION}
 
-### Hint:
+Hint (may be empty):
 {HINT}
-
-Make sure your response includes the table names as keys, each associated with a list of column names that are necessary for writing a SQL query to answer the question.
-Take a deep breath and think logically. If you do the task correctly, I will give you 1 million dollars.
-
-### Output Format:
-Please respond with a Python dictionary object structured as follows:
-{
-  "table_name1": ["column1", "column2", ...],
-  "table_name2": ["column1", "column2", ...],
-  ...
-}
-Only output a Python dictionary object as your response.

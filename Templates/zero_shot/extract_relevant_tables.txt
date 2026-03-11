@@ -1,25 +1,51 @@
 ### Instructions:
-You are an expert and very smart data analyst. 
-Your task is to analyze the provided database schema, comprehend the posed question, and leverage the optional hint to identify which tables are needed to generate a SQL query for answering the question.
-This schema provides a detailed definition of the database's structure, including tables, their columns, primary keys, foreign keys, and any relevant details.
-The hint aims to direct your focus towards the specific elements of the database schema that are crucial for answering the question effectively.
+You are an expert data analyst specializing in database querying.
 
-### Task:
-Based on the database schema, question, and hint provided, your task is to determine which tables that should be used in the SQL query formulation. 
+Your task is to identify the minimal set of tables used to write a correct SQL query that answers the question.
 
-### Database Schema (table name | column name | data type | is primary key (0: False, 1: True)| foreign key (0: False)):
-{DATABASE_SCHEMA}
+Only include tables that are necessary for the SQL query.
+Do not include irrelevant tables.
 
-### Question:
-{QUESTION}
+### Database Schema:
+The schema describes the structure of the database, including tables, columns, primary keys, foreign keys, and other relevant information.
+Primary keys uniquely identify rows in a table.
+Foreign keys represent relationships between tables and may indicate how tables should be joined.
 
 ### Hint:
+The hint (if provided) may highlight tables, columns, or relationships that are relevant to the question.
+Use the hint as additional guidance, but rely primarily on the schema and the question.
+
+### Output Requirements (STRICT):
+
+Return ONLY a valid JSON object.
+
+Format:
+{
+    "relevant_tables": ["table_name1", "table_name2", "table_name3"]
+}
+
+Rules (STRICT):
+- Each item must be a table name from the database schema.
+- Include all and only the tables required to write the SQL query.
+- Use double quotes for all strings.
+- Do NOT invent table names that do not exist in the schema.
+- Do NOT include explanations.
+- Do NOT include reasoning.
+- Do NOT include markdown or code blocks.
+- Do NOT include any text before or after the JSON array.
+
+If no table can be confidently identified, return:
+{}
+
+You may reason internally to determine the correct tables, but do NOT output the reasoning.
+Only output the final JSON array.
+
+### INPUT:
+Database Schema (table name | column name | data type | is primary key (0: False, 1: True)| foreign key (0: False)):
+{DATABASE_SCHEMA}
+
+Question:
+{QUESTION}
+
+Hint (may be empty):
 {HINT}
-
-Note that you should choose all and only the tables that are necessary to write a SQL query that answers the question effectively.
-Take a deep breath and think logically. If you do the task correctly, I will give you 1 million dollars. 
-
-### Output Format:
-Please respond with a Python list structured as follows:
-["Table1", "Table2", "Table3", ...]
-Only output a Python list as your response.

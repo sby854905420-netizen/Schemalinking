@@ -1,8 +1,44 @@
 ### Instructions:
-You are an expert and very smart data analyst. 
-Your task is to analyze the provided database schema, comprehend the posed question, and leverage the optional hint to identify which tables are needed to generate a SQL query for answering the question.
-This schema provides a detailed definition of the database's structure, including tables, their columns, primary keys, foreign keys, and any relevant details.
-The hint aims to direct your focus towards the specific elements of the database schema that are crucial for answering the question effectively.
+You are an expert data analyst specializing in database querying.
+
+Your task is to identify the minimal set of tables used to write a correct SQL query that answers the question.
+
+Only include tables that are necessary for the SQL query.
+Do not include irrelevant tables.
+
+### Database Schema:
+The schema describes the structure of the database, including tables, columns, primary keys, foreign keys, and other relevant information.
+Primary keys uniquely identify rows in a table.
+Foreign keys represent relationships between tables and may indicate how tables should be joined.
+
+### Hint:
+The hint (if provided) may highlight tables, columns, or relationships that are relevant to the question.
+Use the hint as additional guidance, but rely primarily on the schema and the question.
+
+### Output Requirements (STRICT):
+
+Return ONLY a valid JSON object.
+
+Format:
+{
+    "relevant_tables": ["table_name1", "table_name2", "table_name3"]
+}
+
+Rules (STRICT):
+- Each item must be a table name from the database schema.
+- Include all and only the tables required to write the SQL query.
+- Use double quotes for all strings.
+- Do NOT invent table names that do not exist in the schema.
+- Do NOT include explanations.
+- Do NOT include reasoning.
+- Do NOT include markdown or code blocks.
+- Do NOT include any text before or after the JSON array.
+
+If no table can be confidently identified, return:
+{}
+
+You may reason internally to determine the correct tables, but do NOT output the reasoning.
+Only output the final JSON array.
 
 ### Example 1:
 Database Schema (table name | column name | data type | is primary key (0: False, 1: True)| foreign key (0: False)):
@@ -22,118 +58,124 @@ Database Schema (table name | column name | data type | is primary key (0: False
 | management   | head_ID            | INT         |                1 | head.head_ID             |
 | management   | temporary_acting   | TEXT        |                0 | 0                        |
 
-Question: Which department currently headed by a temporary acting manager has the largest number of employees, and how many employees does it have?
-Hint: No hint
+Question:
+Which department currently headed by a temporary acting manager has the largest number of employees, and how many employees does it have?
 
-response:  ["department", "management"]
+Hint (may be empty):
+No hint
+
+response:
+{
+    "relevant_tables": ["department", "management"]
+}
+
 
 ### Example 2:
 Database Schema (table name | column name | data type | is primary key (0: False, 1: True)| foreign key (0: False)):
-| table_name             | column_name               | data_type     |   is_primary_key | foreign_key                             |
-|:-----------------------|:--------------------------|:--------------|-----------------:|:----------------------------------------|
-| Accounts               | account_id                | INTEGER       |                1 | 0                                       |
-| Accounts               | customer_id               | INTEGER       |                0 | Customers.customer_id                   |
-| Accounts               | date_account_opened       | DATETIME      |                0 | 0                                       |
-| Accounts               | account_name              | VARCHAR(50)   |                0 | 0                                       |
-| Accounts               | other_account_details     | VARCHAR(255)  |                0 | 0                                       |
-| Customers              | customer_id               | INTEGER       |                1 | 0                                       |
-| Customers              | customer_first_name       | VARCHAR(50)   |                0 | 0                                       |
-| Customers              | customer_middle_initial   | VARCHAR(1)    |                0 | 0                                       |
-| Customers              | customer_last_name        | VARCHAR(50)   |                0 | 0                                       |
-| Customers              | gender                    | VARCHAR(1)    |                0 | 0                                       |
-| Customers              | email_address             | VARCHAR(255)  |                0 | 0                                       |
-| Customers              | login_name                | VARCHAR(80)   |                0 | 0                                       |
-| Customers              | login_password            | VARCHAR(20)   |                0 | 0                                       |
-| Customers              | phone_number              | VARCHAR(255)  |                0 | 0                                       |
-| Customers              | town_city                 | VARCHAR(50)   |                0 | 0                                       |
-| Customers              | state_county_province     | VARCHAR(50)   |                0 | 0                                       |
-| Customers              | country                   | VARCHAR(50)   |                0 | 0                                       |
-| Financial_Transactions | transaction_id            | INTEGER       |                0 | 0                                       |
-| Financial_Transactions | account_id                | INTEGER       |                0 | Accounts.account_id                     |
-| Financial_Transactions | invoice_number            | INTEGER       |                0 | Invoices.invoice_number                 |
-| Financial_Transactions | transaction_type          | VARCHAR(15)   |                0 | 0                                       |
-| Financial_Transactions | transaction_date          | DATETIME      |                0 | 0                                       |
-| Financial_Transactions | transaction_amount        | DECIMAL(19,4) |                0 | 0                                       |
-| Financial_Transactions | transaction_comment       | VARCHAR(255)  |                0 | 0                                       |
-| Financial_Transactions | other_transaction_details | VARCHAR(255)  |                0 | 0                                       |
-| Invoice_Line_Items     | order_item_id             | INTEGER       |                0 | Order_Items.order_item_id               |
-| Invoice_Line_Items     | invoice_number            | INTEGER       |                0 | Invoices.invoice_number                 |
-| Invoice_Line_Items     | product_id                | INTEGER       |                0 | Products.product_id                     |
-| Invoice_Line_Items     | product_title             | VARCHAR(80)   |                0 | 0                                       |
-| Invoice_Line_Items     | product_quantity          | VARCHAR(50)   |                0 | 0                                       |
-| Invoice_Line_Items     | product_price             | DECIMAL(19,4) |                0 | 0                                       |
-| Invoice_Line_Items     | derived_product_cost      | DECIMAL(19,4) |                0 | 0                                       |
-| Invoice_Line_Items     | derived_vat_payable       | DECIMAL(19,4) |                0 | 0                                       |
-| Invoice_Line_Items     | derived_total_cost        | DECIMAL(19,4) |                0 | 0                                       |
-| Invoices               | invoice_number            | INTEGER       |                1 | 0                                       |
-| Invoices               | order_id                  | INTEGER       |                0 | Orders.order_id                         |
-| Invoices               | invoice_date              | DATETIME      |                0 | 0                                       |
-| Order_Items            | order_item_id             | INTEGER       |                1 | 0                                       |
-| Order_Items            | order_id                  | INTEGER       |                0 | Orders.order_id                         |
-| Order_Items            | product_id                | INTEGER       |                0 | Products.product_id                     |
-| Order_Items            | product_quantity          | VARCHAR(50)   |                0 | 0                                       |
-| Order_Items            | other_order_item_details  | VARCHAR(255)  |                0 | 0                                       |
-| Orders                 | order_id                  | INTEGER       |                1 | 0                                       |
-| Orders                 | customer_id               | INTEGER       |                0 | Customers.customer_id                   |
-| Orders                 | date_order_placed         | DATETIME      |                0 | 0                                       |
-| Orders                 | order_details             | VARCHAR(255)  |                0 | 0                                       |
-| Product_Categories     | production_type_code      | VARCHAR(15)   |                1 | 0                                       |
-| Product_Categories     | product_type_description  | VARCHAR(80)   |                0 | 0                                       |
-| Product_Categories     | vat_rating                | DECIMAL(19,4) |                0 | 0                                       |
-| Products               | product_id                | INTEGER       |                1 | 0                                       |
-| Products               | parent_product_id         | INTEGER       |                0 | 0                                       |
-| Products               | production_type_code      | VARCHAR(15)   |                0 | Product_Categories.production_type_code |
-| Products               | unit_price                | DECIMAL(19,4) |                0 | 0                                       |
-| Products               | product_name              | VARCHAR(80)   |                0 | 0                                       |
-| Products               | product_color             | VARCHAR(20)   |                0 | 0                                       |
-| Products               | product_size              | VARCHAR(20)   |                0 | 0                                       |
+| table_name   | column_name        | data_type   |   is_primary_key | foreign_key       |
+|:-------------|:-------------------|:------------|-----------------:|:------------------|
+| matches      | best_of            | INT         |                0 | 0                 |
+| matches      | draw_size          | INT         |                0 | 0                 |
+| matches      | loser_age          | FLOAT       |                0 | 0                 |
+| matches      | loser_entry        | TEXT        |                0 | 0                 |
+| matches      | loser_hand         | TEXT        |                0 | 0                 |
+| matches      | loser_ht           | INT         |                0 | 0                 |
+| matches      | loser_id           | INT         |                0 | players.player_id |
+| matches      | loser_ioc          | TEXT        |                0 | 0                 |
+| matches      | loser_name         | TEXT        |                0 | 0                 |
+| matches      | loser_rank         | INT         |                0 | 0                 |
+| matches      | loser_rank_points  | INT         |                0 | 0                 |
+| matches      | loser_seed         | INT         |                0 | 0                 |
+| matches      | match_num          | INT         |                0 | 0                 |
+| matches      | minutes            | INT         |                0 | 0                 |
+| matches      | round              | TEXT        |                0 | 0                 |
+| matches      | score              | TEXT        |                0 | 0                 |
+| matches      | surface            | TEXT        |                0 | 0                 |
+| matches      | tourney_date       | DATE        |                0 | 0                 |
+| matches      | tourney_id         | TEXT        |                0 | 0                 |
+| matches      | tourney_level      | TEXT        |                0 | 0                 |
+| matches      | tourney_name       | TEXT        |                0 | 0                 |
+| matches      | winner_age         | FLOAT       |                0 | 0                 |
+| matches      | winner_entry       | TEXT        |                0 | 0                 |
+| matches      | winner_hand        | TEXT        |                0 | 0                 |
+| matches      | winner_ht          | INT         |                0 | 0                 |
+| matches      | winner_id          | INT         |                0 | players.player_id |
+| matches      | winner_ioc         | TEXT        |                0 | 0                 |
+| matches      | winner_name        | TEXT        |                0 | 0                 |
+| matches      | winner_rank        | INT         |                0 | 0                 |
+| matches      | winner_rank_points | INT         |                0 | 0                 |
+| matches      | winner_seed        | INT         |                0 | 0                 |
+| matches      | year               | INT         |                0 | 0                 |
+| players      | player_id          | INT         |                1 | 0                 |
+| players      | first_name         | TEXT        |                0 | 0                 |
+| players      | last_name          | TEXT        |                0 | 0                 |
+| players      | hand               | TEXT        |                0 | 0                 |
+| players      | birth_date         | DATE        |                0 | 0                 |
+| players      | country_code       | TEXT        |                0 | 0                 |
+| rankings     | ranking_date       | DATE        |                0 | 0                 |
+| rankings     | ranking            | INT         |                0 | 0                 |
+| rankings     | player_id          | INT         |                0 | players.player_id |
+| rankings     | ranking_points     | INT         |                0 | 0                 |
+| rankings     | tours              | INT         |                0 | 0                 |
 
 Question:
-What is the total amount spent by customer with customer_id '5' on all their orders?
+What is the first name, country code, and birth date of the player with the most winner rank points across all matches?
 
-Hint: 
+Hint (may be empty): 
 No hint
 
-response: ["Orders", "Products", "Order_Items"]
+response:
+{
+    "relevant_tables": ["players", "matches"]
+}
 
 ### Example 3:
 Database Schema (table name | column name | data type | is primary key (0: False, 1: True)| foreign key (0: False)):
-| table_name   | column_name   | data_type   |   is_primary_key | foreign_key          |
-|:-------------|:--------------|:------------|-----------------:|:---------------------|
-| Allergy_Type | Allergy       | VARCHAR(20) |                1 | 0                    |
-| Allergy_Type | AllergyType   | VARCHAR(20) |                0 | 0                    |
-| Has_Allergy  | StuID         | INTEGER     |                0 | Student.StuID        |
-| Has_Allergy  | Allergy       | VARCHAR(20) |                0 | Allergy_Type.Allergy |
-| Student      | StuID         | INTEGER     |                1 | 0                    |
-| Student      | LName         | VARCHAR(12) |                0 | 0                    |
-| Student      | Fname         | VARCHAR(12) |                0 | 0                    |
-| Student      | Age           | INTEGER     |                0 | 0                    |
-| Student      | Sex           | VARCHAR(1)  |                0 | 0                    |
-| Student      | Major         | INTEGER     |                0 | 0                    |
-| Student      | Advisor       | INTEGER     |                0 | 0                    |
-| Student      | city_code     | VARCHAR(3)  |                0 | 0                    |
+| table_name   | column_name   | data_type   |   is_primary_key | foreign_key   |
+|:-------------|:--------------|:------------|-----------------:|:--------------|
+| event        | ID            | INT         |                1 | 0             |
+| event        | Name          | TEXT        |                0 | 0             |
+| event        | Stadium_ID    | INT         |                0 | stadium.ID    |
+| event        | Year          | TEXT        |                0 | 0             |
+| record       | ID            | INT         |                0 | 0             |
+| record       | Result        | TEXT        |                0 | 0             |
+| record       | Swimmer_ID    | INT         |                1 | swimmer.ID    |
+| record       | Event_ID      | INT         |                1 | event.ID      |
+| stadium      | ID            | INT         |                1 | 0             |
+| stadium      | name          | TEXT        |                0 | 0             |
+| stadium      | Capacity      | INT         |                0 | 0             |
+| stadium      | City          | TEXT        |                0 | 0             |
+| stadium      | Country       | TEXT        |                0 | 0             |
+| stadium      | Opening_year  | INT         |                0 | 0             |
+| swimmer      | ID            | INT         |                1 | 0             |
+| swimmer      | name          | TEXT        |                0 | 0             |
+| swimmer      | Nationality   | TEXT        |                0 | 0             |
+| swimmer      | meter_100     | REAL        |                0 | 0             |
+| swimmer      | meter_200     | TEXT        |                0 | 0             |
+| swimmer      | meter_300     | TEXT        |                0 | 0             |
+| swimmer      | meter_400     | TEXT        |                0 | 0             |
+| swimmer      | meter_500     | TEXT        |                0 | 0             |
+| swimmer      | meter_600     | TEXT        |                0 | 0             |
+| swimmer      | meter_700     | TEXT        |                0 | 0             |
+| swimmer      | Time          | TEXT        |                0 | 0             |
 
-Question: How many students have both animal and food allergies?
-Hint: No hint
+Question:
+Which stadium hosted events where the swimmer with ID 1 had a loss?
 
-response: ["Allergy_Type", "Has_Allergy"]
+Hint (may be empty):
+No hint
 
-### Task:
-Based on the database schema, question, and hint provided, your task is to determine which tables that should be used in the SQL query formulation. 
+response:
+{
+    "relevant_tables": ["stadium", "event", "record"]
+}
 
-### Database Schema (table name | column name | data type | is primary key (0: False, 1: True)| foreign key (0: False)):
+### INPUT:
+Database Schema (table name | column name | data type | is primary key (0: False, 1: True)| foreign key (0: False)):
 {DATABASE_SCHEMA}
 
-### Question:
+Question:
 {QUESTION}
 
-### Hint:
+Hint (may be empty):
 {HINT}
-
-Note that you should choose all and only the tables that are necessary to write a SQL query that answers the question effectively.
-Take a deep breath and think logically. If you do the task correctly, I will give you 1 million dollars. 
-
-### Output Format:
-Please respond with a Python list structured as follows:
-["Table1", "Table2", "Table3", ...]
-Only output a Python list as your response.
