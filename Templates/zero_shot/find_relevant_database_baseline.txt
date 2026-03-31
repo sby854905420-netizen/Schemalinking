@@ -1,0 +1,51 @@
+### Instructions:
+You are an expert data analyst specializing in database querying.
+
+Your task is to identify the most relevant database needed to write a correct SQL query that answers the question.
+
+Select only one database that are most likely to contain the necessary tables, columns, and relationships required for answering the question.
+Do not select irrelevant databases.
+
+### Database Schemas:
+Each database schema describes the structure of one database, including its name, tables, columns, primary keys, foreign keys, and possible join paths.
+
+Table names, column names, and join paths may help indicate whether a database is relevant to the question.
+Primary keys uniquely identify rows in a table.
+Foreign keys represent relationships between tables and may indicate how tables should be joined.
+
+### Hint:
+The hint (if provided) may highlight databases, tables, columns, or relationships that are relevant to the question.
+Use the hint as additional guidance, but rely primarily on the database schemas and the question.
+
+Return ONLY a valid JSON object.
+
+Format:
+{
+    "relevant_database": "database_name"
+}
+
+Rules (STRICT):
+- The value must be exactly one database name from the provided database schemas.
+- Select the single most relevant database for answering the question.
+- Use double quotes for all strings.
+- Do NOT invent database names that do not exist in the input.
+- Do NOT include explanations.
+- Do NOT include reasoning.
+- Do NOT include markdown or code blocks.
+- Do NOT include any text before or after the JSON object.
+
+If no database can be confidently identified, return:
+{}
+
+You may reason internally to determine the correct database, but do NOT output the reasoning.
+Only output the final JSON object.
+
+### INPUT:
+Database Schemas:
+{DATABASE_SCHEMAS}
+
+Question:
+{QUESTION}
+
+Hint (may be empty):
+{HINT}

@@ -1,0 +1,44 @@
+### Instructions:
+You are an expert data analyst specializing in database querying.
+
+Your task is to determine whether the given database is suitable for writing a correct SQL query that answers the question.
+
+You must carefully examine the database schema and decide whether it contains the necessary tables, columns, and relationships required to answer the question.
+Return only "yes" or "no".
+
+### Database Schemas:
+The database schema describes the structure of the database, including its tables, columns, primary keys, foreign keys, and possible relationships.
+
+Table names and column names should be directly relevant to the entities, attributes, and conditions mentioned in the question.
+Primary keys uniquely identify rows.
+Foreign keys define relationships between tables.
+These elements together determine whether the database can support answering the question.
+
+### Hint:
+The hint (if provided) may suggest relevant tables, columns, or relationships.
+Use the hint as additional guidance, but rely primarily on the database schema and the question.
+
+### Output Format (STRICT):
+- Output must be exactly one word: "yes" or "no"
+- Use lowercase only
+- Do NOT include any explanations
+- Do NOT include reasoning
+- Do NOT include JSON
+- Do NOT include markdown
+- Do NOT include any extra text or symbols
+
+### Decision Rules:
+- Answer "yes" if the database contains sufficient information (tables, columns, relationships) to construct a correct SQL query for the question.
+- Answer "no" if the database lacks key information required to answer the question.
+- Prefer strict judgment: if unsure, answer "no".
+- You may reason internally to determine the answer, but do NOT output the reasoning.
+
+### INPUT:
+Database Schemas:
+{DATABASE_SCHEMAS}
+
+Question:
+{QUESTION}
+
+Hint (may be empty):
+{HINT}

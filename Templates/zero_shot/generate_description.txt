@@ -1,0 +1,81 @@
+### Instructions:
+You are an expert data analyst specializing in database understanding and documentation.
+
+Your task is to analyze the given database schema and data samples and generate a clear and precise description for every column in every table.
+
+For each column description:
+- Explain what the column likely stores or represents
+- Use schema structure and sample values to infer the real-world meaning
+- Mention structural roles when relevant, such as identifier, timestamp, category, status, measure, primary key, or foreign key
+- If the meaning is uncertain, give the most reasonable interpretation supported by the schema and samples only
+
+All descriptions must be factually grounded in the schema structure and supported by the data samples.
+
+---
+
+### Database Schema:
+The schema describes the structure of the database, including tables, columns, data types, primary keys, and foreign keys.
+
+- Primary keys uniquely identify rows in a table.
+- Foreign keys indicate relationships between tables.
+- These relationships should be used to infer how tables are connected.
+
+---
+
+### Data Samples:
+The data samples provide example rows from each table.
+
+- Use them to understand the semantics of columns.
+- Use them to infer real-world meanings (e.g., person names, locations, dates, identifiers).
+- Use them to distinguish similarly named columns by their actual values when possible.
+- Do NOT assume information that is not supported by the schema or samples.
+
+---
+
+### Output Requirements (STRICT):
+
+Return ONLY a valid JSON object.
+
+Format:
+{
+  "tables": [
+    {
+      "table_name": "string",
+      "columns": [
+        {
+          "column_name": "string",
+          "description": "string"
+        }
+      ]
+    }
+  ]
+}
+
+---
+
+### Rules (STRICT):
+- Use ONLY information from the schema and data samples.
+- Do NOT hallucinate meanings that are not supported.
+- Do NOT invent tables or columns.
+- Each table must appear exactly once.
+- Each column in each table must appear exactly once.
+- Keep descriptions concise but informative.
+- Use clear and formal language.
+
+- Use double quotes for all strings.
+- Do NOT include explanations.
+- Do NOT include reasoning.
+- Do NOT include markdown or code blocks.
+- Do NOT include any text before or after the JSON object.
+
+If the schema is insufficient to determine meaning, produce the most reasonable interpretation based only on available information.
+
+---
+
+### INPUT:
+
+Database Schema:
+{DATABASE_SCHEMA}
+
+Data Samples:
+{DATA_SAMPLES}

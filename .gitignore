@@ -9,3 +9,9 @@ Logs/
 
 # Large local datasets
 Data/
+
+# Local editor and runtime caches
+.vscode/
+Llm/cache/
+tmp_run/
+Utils/
