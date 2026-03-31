@@ -297,7 +297,7 @@ def main() -> None:
     dataset_name = "MMQA"
     run_id = datetime.now().strftime('%Y%m%d_%H%M%S')
     
-    qa_df = pd.read_json(PROJECT_ROOT / "Data" / "MMQA"/ "preprocessed_data.json")[0:5]
+    qa_df = pd.read_json(PROJECT_ROOT / "Data" / "MMQA"/ "preprocessed_data.json")
     prompt_path = PROJECT_ROOT / "Templates" / "zero_shot" / "binary_classification_database.txt"
     prompt_template = prompt_path.read_text(encoding='utf-8').strip()
 
