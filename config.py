@@ -12,7 +12,7 @@ DEVICE = "cuda"
 
 EMBEDDING_MODEL_NAME = "Qwen/Qwen3-Embedding-0.6B"
 
-ANSWER_LLM_NAME = "Qwen/Qwen3.5-9B"
+ANSWER_LLM_NAME = "mistralai/Ministral-3-8B-Instruct-2512"
 
 PROVIDER = "transformers"
 

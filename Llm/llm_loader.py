@@ -2,7 +2,7 @@ import os
 from typing import List, Union
 import openai
 import os
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, Mistral3ForConditionalGeneration, FineGrainedFP8Config, MistralCommonBackend
 import torch
 import ollama
 
@@ -54,10 +54,65 @@ class LLM:
         self.device_map = "auto"
 
         if self.provider == "transformers":
-            self._load_transformers_model()
+            if "ministral" in self.model_name.lower():
+                self._load_ministral_model()
+            else:
+                self._load_transformers_model()
+        
+        
+
+    def _load_ministral_model(self):
+        self.tokenizer = MistralCommonBackend.from_pretrained(self.model_name)
+        self.model = Mistral3ForConditionalGeneration.from_pretrained(
+            self.model_name,
+            device_map=self.device_map,
+            quantization_config=FineGrainedFP8Config(dequantize=True),
+        )
+
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+    
+    def _query_ministral(self, prompt: str,output_hidden_states:bool=False):
+        messages = [{"role": "user", "content": prompt}]
+        model_inputs = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_tensors="pt",
+        )
+        model_inputs = model_inputs.to(self.model.device)    
+        input_ids = model_inputs["input_ids"]
+        attention_mask = model_inputs.get("attention_mask")
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
+
+        generation_kwargs = dict(self.query_settings)
+        generation_kwargs.setdefault("do_sample", generation_kwargs.get("temperature", 0.0) > 0)
+        generation_kwargs.setdefault("pad_token_id", self.tokenizer.pad_token_id)
+        generation_kwargs.setdefault("eos_token_id", self.tokenizer.eos_token_id)
+
+        if output_hidden_states:
+            with torch.inference_mode():
+                outputs = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    output_hidden_states=False,
+                    use_cache=False,
+                    return_dict=True,
+                )
+            return outputs.logits[:, -1, :].float()
+        else:
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_length=self.num_ctx,
+                    **generation_kwargs,
+                )
+            generated_tokens = outputs[0][input_ids.shape[-1]:]
+            return self.tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
 
 
-            
     def _load_transformers_model(self):
         """Load local or Hugging Face causal language model"""
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -75,7 +130,7 @@ class LLM:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-    def _query_transformers(self, prompt: str,output_hidden_states:bool=False) -> str:
+    def _query_transformers(self, prompt: str,output_hidden_states:bool=False):
         """Call local transformers model to generate text"""
         messages = [{"role": "user", "content": prompt}]
 
@@ -174,6 +229,8 @@ class LLM:
         elif provider == "openai":
             return self._query_openai(prompt)
         elif provider == "transformers":
+            if "ministral" in self.model_name.lower():
+                return self._query_ministral(prompt)
             return self._query_transformers(prompt)
         else:
             raise ValueError(f"Unsupported LLM provider: {provider}")
