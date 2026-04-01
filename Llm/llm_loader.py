@@ -222,7 +222,7 @@ class LLM:
         return [self.query(prompt) for prompt in prompts]
 
 
-    def query(self, prompt: str):
+    def query(self, prompt: str) -> str:
         provider = self.provider
         if provider == "ollama":
             return self._query_ollama(prompt)

@@ -37,7 +37,7 @@ Rules (STRICT):
 If no table can be confidently identified, return:
 {}
 
-You may reason internally to determine the correct tables, but do NOT output the reasoning.
+You may reason internally to determine the correct tables, but do NOT output the reasoning content.
 Only output the final JSON array.
 
 ### INPUT:

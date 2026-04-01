@@ -49,7 +49,7 @@ Rules (STRICT):
 If no columns can be confidently identified, return:
 {}
 
-You may reason internally to determine the correct columns, but do NOT output the reasoning.
+You may reason internally to determine the correct columns, but do NOT output the reasoning content.
 Only output the final JSON object.
 
 ### Example 1:

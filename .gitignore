@@ -9,9 +9,13 @@ Logs/
 
 # Large local datasets
 Data/
+Evluation/
 
 # Local editor and runtime caches
 .vscode/
 Llm/cache/
 tmp_run/
 Utils/
+
+# Local dependency snapshot
+requirements.txt

@@ -37,7 +37,7 @@ Rules (STRICT):
 If no database can be confidently identified, return:
 {}
 
-You may reason internally to determine the correct database, but do NOT output the reasoning.
+You may reason internally to determine the correct database, but do NOT output the reasoning content.
 Only output the final JSON object.
 
 ### INPUT:

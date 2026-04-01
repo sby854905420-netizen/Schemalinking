@@ -31,7 +31,7 @@ Use the hint as additional guidance, but rely primarily on the database schema a
 - Answer "yes" if the database contains sufficient information (tables, columns, relationships) to construct a correct SQL query for the question.
 - Answer "no" if the database lacks key information required to answer the question.
 - Prefer strict judgment: if unsure, answer "no".
-- You may reason internally to determine the answer, but do NOT output the reasoning.
+- You may reason internally to determine the answer, but do NOT output the reasoning content.
 
 ### INPUT:
 Database Schemas:

@@ -61,7 +61,6 @@ Format:
 - Each column in each table must appear exactly once.
 - Keep descriptions concise but informative.
 - Use clear and formal language.
-
 - Use double quotes for all strings.
 - Do NOT include explanations.
 - Do NOT include reasoning.
