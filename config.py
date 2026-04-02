@@ -4,6 +4,8 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
+DATASET_NAME = "MMQA"
+
 DEFAULT_QDRANT_PATH = PROJECT_ROOT / "Data" / "MMQA" / "qdrant_column_index"
 
 DEFAULT_SCHEMA_DIR = PROJECT_ROOT / "Data" / "MMQA" / "Column_level_schema"
@@ -16,24 +18,28 @@ ANSWER_LLM_NAME = "mistralai/Ministral-3-8B-Instruct-2512"
 
 PROVIDER = "transformers"
 
-CONTEXT_WINDOW_SIZE = 120000
+MAX_GENERATEION_NUM = 2048
 
-# qwen3.5 Instruct (or non-thinking) mode for general tasks
-LLM_SETTINGS = {
-    "temperature": 0.7,
-    "top_p": 0.8,
-    "top_k": 20,
-    "min_p": 0.0,
+MAX_INPUT_LENGTH = 110000
+
+HRC_TOP_P = 0.02
+
+CANDIDATE_DB_TOP_K = 3
+
+BASELINE_DATABASE_RETRIVAL_QUERY_SETTINGS = {
+    "temperature": 0.0,
     "repetition_penalty": 1.0,
 }
 
-# LLM_SETTINGS = {
-#     "temperature": 0.7,
-#     "top_p": 0.8,
-#     "top_k": 20,
-#     "min_p": 0.0,
-#     "presence_penalty": 1.5,
-#     "repetition_penalty": 1.0,
-# }
+BASELINE_SCHEMA_LINKING_QUERY_SETTINGS = {
+    "temperature": 0.1,
+    "top_p": 0.9,
+    "repetition_penalty": 1.02,
+}
+
+TABLE2COLUMN_QUERY_SETTINGS = {
+    "temperature": 0.0,
+    "top_p": 1.0,
+}
 
 THINKING_MODE = False

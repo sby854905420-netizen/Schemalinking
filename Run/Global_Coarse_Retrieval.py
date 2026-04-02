@@ -71,6 +71,28 @@ def resolve_top_k(client:QdrantClient, collection_name: str, top_ratio: float, q
 
     return max(1, math.ceil(total_points * top_ratio))
 
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Iterative coarse database retrieval.")
+    parser.add_argument("--dataset-name", dest="dataset_name", type=str, default=None)
+    parser.add_argument("--answer-llm-name", dest="answer_llm_name", type=str, default=None)
+    parser.add_argument("--provider", dest="provider", type=str, default=None)
+    parser.add_argument(
+        "--max-input-length",
+        dest="max_input_length",
+        type=int,
+        default=None,
+    )
+    parser.add_argument(
+        "--max-generation-num",
+        dest="max_generation_num",
+        type=int,
+        default=None,
+    )
+    parser.add_argument("--hrc-top-p", dest="hrc_top_p", type=float, default=None)
+    parser.add_argument("--candidate-db-top-k", dest="candidate_db_top_k", type=int, default=None)
+    return parser.parse_args()
+
 def query_qdrant(client:QdrantClient, collection_name: str, query_vector: list[float], top_k: int, with_vector: bool, query_filter=None):
     response = client.query_points(
         collection_name=collection_name,
@@ -252,12 +274,13 @@ def compute_yes_probability(next_token_logits:torch.tensor, tokenizer):
 
 
 def CFCD_rerank_select(query:str, ranking_llm:LLM, 
-                       CFCD_db_ids: list[str], prompt_template:str, top_k:float):
+                       CFCD_db_ids: list[str], prompt_template:str, top_k:float,
+                       schema_dir: Path):
     split_line = '\n'+ '-'*80 + '\n'
     yes_scores = []
     for db_id in CFCD_db_ids:
         documents: list[str] = []
-        column_files = list(iter_column_files(DEFAULT_SCHEMA_DIR / db_id))
+        column_files = list(iter_column_files(schema_dir / db_id))
         for column_file in column_files:
             record = load_column_record(column_file)
             document = build_document(record)
@@ -270,6 +293,8 @@ def CFCD_rerank_select(query:str, ranking_llm:LLM,
                 .replace('{QUESTION}', query)
                 .replace('{HINT}', 'No hint')
                 )
+        # prompt_token_count = ranking_llm.count_input_tokens(prompt)
+        # print(f"[GlobalCoarse] db_id={db_id} prompt_tokens={prompt_token_count}")
         next_token_logits = ranking_llm._query_transformers(prompt, output_hidden_states=True)
         yes_prob_binary = compute_yes_probability(next_token_logits,ranking_llm.tokenizer)
         yes_scores.append(float(yes_prob_binary.detach()))
@@ -294,53 +319,91 @@ def CFCD_rerank_select(query:str, ranking_llm:LLM,
     
 
 def main() -> None:
-    dataset_name = "MMQA"
-    run_id = datetime.now().strftime('%Y%m%d_%H%M%S')
+    args = parse_args()
+
+    dataset_name = args.dataset_name or DATASET_NAME
+    answer_llm_name = args.answer_llm_name or ANSWER_LLM_NAME
+    provider = args.provider or PROVIDER
+    max_input_length = args.max_input_length or MAX_INPUT_LENGTH
+    max_generation_num = args.max_generation_num or MAX_GENERATEION_NUM
+    hrc_top_p = args.hrc_top_p if args.hrc_top_p is not None else HRC_TOP_P
+    candidate_db_top_k = args.candidate_db_top_k if args.candidate_db_top_k is not None else CANDIDATE_DB_TOP_K
     
-    qa_df = pd.read_json(PROJECT_ROOT / "Data" / "MMQA"/ "preprocessed_data.json")
+    run_id = datetime.now().strftime('%Y%m%d_%H%M%S')
+    dataset_root = PROJECT_ROOT / "Data" / dataset_name
+    qdrant_path = dataset_root / "qdrant_column_index"
+    schema_dir = dataset_root / "Column_level_schema"
+
+    dataset_df = pd.read_json(dataset_root / "preprocessed_data.json")
     prompt_path = PROJECT_ROOT / "Templates" / "zero_shot" / "binary_classification_database.txt"
     prompt_template = prompt_path.read_text(encoding='utf-8').strip()
-
-    logs_dir = PROJECT_ROOT / 'Logs' / ANSWER_LLM_NAME
+    
+    logs_dir = PROJECT_ROOT / 'Logs' / answer_llm_name / "Database_Retrival"
     logs_dir.mkdir(parents=True,exist_ok=True)
     log_path = logs_dir / f'iterative_database_retrival_{dataset_name}_{run_id}.json'
 
     embedder = EmbeddingModelLoader(
         model_name=EMBEDDING_MODEL_NAME,
     )
-    client = get_qdrant_client(DEFAULT_QDRANT_PATH)
+    client = get_qdrant_client(qdrant_path)
     
-    ranking_llm = LLM(model_name = ANSWER_LLM_NAME, provider = PROVIDER, num_ctx = CONTEXT_WINDOW_SIZE)
+    ranking_llm = LLM(
+        model_name=answer_llm_name,
+        provider=provider,
+        max_input_length=max_input_length,
+        max_generation_num=max_generation_num,
+    )
 
     log_records = []
-    
-    for _,row in tqdm(qa_df.iterrows(),total=len(qa_df)):
+
+
+    for _,row in tqdm(dataset_df.iterrows(),total=len(dataset_df)):
         # First Round for all databases
         # step 1: Global Highly Relevant columns (HRC) Retrival
         query_embedding = embedder.encode(row['question'], convert_to_list=True)
-        HRC_points = get_Highly_Relevant_Columns(query_embedding,client,top_p=0.02)
+        HRC_points = get_Highly_Relevant_Columns(query_embedding, client, top_p=hrc_top_p)
 
         # step 2: Support-Based Database Pruning, resulting Coarsely_Filtered Candidate Databases (CFCD)
         CFCD_db_ids  = database_pruning(HRC_points, min_hit_count=2, min_sim_ratio=0.9)
 
         # step 3：CFCD Reranking & Selection Top-K, resulting in Final Candidate Databases (FCD)
-        FCD_db_ids = CFCD_rerank_select(row['question'],ranking_llm,CFCD_db_ids,prompt_template,top_k=3)
+        FCD_db_ids = CFCD_rerank_select(
+            row['question'],
+            ranking_llm,
+            CFCD_db_ids,
+            prompt_template,
+            top_k=candidate_db_top_k,
+            schema_dir=schema_dir,
+        )
 
         # Second Round for Final Candidate Databases
         # step 1: Global Highly Relevant columns (HRC) Retrival for Final Candidate Databases
-        Last_HRC_points = get_Highly_Relevant_Columns(query_embedding,client,top_p=0.02,candidate_db_ids=FCD_db_ids)
+        Last_HRC_points = get_Highly_Relevant_Columns(
+            query_embedding,
+            client,
+            top_p=hrc_top_p,
+            candidate_db_ids=FCD_db_ids,
+        )
         # step 2: Support-Based Database Pruning, resulting Coarsely_Filtered Candidate Databases (CFCD)
         CFCD_db_ids  = database_pruning(Last_HRC_points, min_hit_count=2, min_sim_ratio=0.9)
         # step 3：CFCD Reranking & Selection Top-1, resulting in Target Database
-        target_db_id = CFCD_rerank_select(row['question'],ranking_llm,CFCD_db_ids,prompt_template,top_k=1)
+        target_db_id = CFCD_rerank_select(
+            row['question'],
+            ranking_llm,
+            CFCD_db_ids,
+            prompt_template,
+            top_k=1,
+            schema_dir=schema_dir,
+        )
         # save the predict results
         log_records.append(
             {
-                'model': ANSWER_LLM_NAME,
-                'provider': "transformers",
+                'model': answer_llm_name,
+                'provider': provider,
                 'id': f"{row['instance_id']}",
                 'spider_db_id': row['db_id'],
                 'question': row['question'],
+                'FCD_ids': ",".join(FCD_db_ids),
                 'predict_db_id': target_db_id[0]
             }
         )
