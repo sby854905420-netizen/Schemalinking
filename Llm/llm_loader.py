@@ -170,7 +170,12 @@ class LLM:
         generation_kwargs = deepcopy(self.query_settings)
         generation_kwargs.pop("max_new_tokens", None)
         generation_kwargs["max_length"] = self.max_input_length + self.max_generation_num
-        generation_kwargs["do_sample"] = generation_kwargs.get("temperature", 0.0) > 0
+        do_sample = generation_kwargs.get("temperature", 0.0) > 0
+        generation_kwargs["do_sample"] = do_sample
+        if not do_sample:
+            generation_kwargs.pop("temperature", None)
+            generation_kwargs.pop("top_p", None)
+            generation_kwargs.pop("top_k", None)
         generation_kwargs.setdefault("pad_token_id", self.tokenizer.pad_token_id)
         generation_kwargs.setdefault("eos_token_id", self.tokenizer.eos_token_id)
         return generation_kwargs
@@ -277,6 +282,8 @@ class LLM:
                     "factor": resolved_context_window / QWEN25_DEFAULT_CONTEXT_WINDOW,
                     "original_max_position_embeddings": QWEN25_DEFAULT_CONTEXT_WINDOW,
                 }
+                # Keep generate() length checks aligned with the expanded YaRN window.
+                config.max_position_embeddings = resolved_context_window
                 model_kwargs["config"] = config
         else:
             self.current_context_window = self._get_max_context_window()
