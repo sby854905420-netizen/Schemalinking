@@ -205,15 +205,16 @@ def append_log_entry(
         predict_columns = json.loads(column_response_text)['relevant_columns']
     except json.JSONDecodeError:
         predict_columns = {}
-
+    except KeyError:
+        predict_columns = {}
     log_records.append(
         {
             "model": answer_llm_name,
             "provider": provider,
-            "id": f"{get_row_value(row, 'id', 'instance_id')}",
+            "id": f"{get_row_value(row, 'id')}",
             "question": row["question"],
             "spider_db_id": get_row_value(row, "spider_db_id"),
-            "predict_db_id": get_row_value(row, "predict_db_id", "db_id"),
+            "predict_db_id": get_row_value(row, "predict_db_id"),
             "predict_tables_text":table_response_text,
             "predict_columns_text":column_response_text,
             "predict_tables": predict_tables,
@@ -237,7 +238,20 @@ def run_table2column(
     log_records: list[dict[str, Any]] = []
 
     for _, row in tqdm(dataset_df.iterrows(), total=len(dataset_df)):
-        predict_db_id = str(get_row_value(row, "predict_db_id"))
+        predict_db_id = get_row_value(row, "predict_db_id")
+        if predict_db_id is None or str(predict_db_id).strip() == "":
+            append_log_entry(
+                log_records=log_records,
+                row=row,
+                predict_tables=[],
+                table_response_text="No Vaild Database.",
+                column_response_text="No Vaild Database.",
+                answer_llm_name=answer_llm_name,
+                provider=provider,
+                output_path=output_path,
+            )
+            continue
+        predict_db_id = str(predict_db_id)
         total_schema_df = load_database_schema(table_schema_dir, predict_db_id)
 
         table_prompt = build_prompt(

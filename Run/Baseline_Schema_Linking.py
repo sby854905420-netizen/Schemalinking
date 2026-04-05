@@ -47,7 +47,6 @@ def resolve_method(method: str | None) -> str:
 
 
 def load_dataset(input_path: Path):
-    import pandas as pd
 
     return pd.read_json(input_path)
 
@@ -141,7 +140,6 @@ def resolve_output_path(
 
 
 def get_row_value(row: pd.Series, *keys: str) -> Any:
-    import pandas as pd
 
     for key in keys:
         value = row.get(key)
@@ -216,6 +214,16 @@ def run_baseline_schema_linking(
 
     for _, row in tqdm(dataset_df.iterrows(), total=len(dataset_df)):
         predict_db_id = get_row_value(row, "predict_db_id")
+        if predict_db_id is None or str(predict_db_id).strip() == "":
+            append_log_entry(
+                log_records=log_records,
+                row=row,
+                response_text="No Valid Database.",
+                answer_llm_name=answer_llm_name,
+                provider=provider,
+                output_path=output_path,
+            )
+            continue
         database_schema = load_database_schema(table_schema_dir, str(predict_db_id))
         prompt = build_prompt(prompt_template, database_schema, row["question"])
         response_text = normalize_response(answer_llm.query(prompt))

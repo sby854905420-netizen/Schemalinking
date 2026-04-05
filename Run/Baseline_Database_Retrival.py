@@ -64,6 +64,9 @@ def append_log_entry(
         predict_db_id = json.loads(response_text)["relevant_database"]
     except json.JSONDecodeError:
         predict_db_id = ""
+    except KeyError:
+        predict_db_id = ""
+
     log_records.append(
         {
             "model": answer_llm_name,
