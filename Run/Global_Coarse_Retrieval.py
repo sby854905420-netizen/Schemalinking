@@ -14,6 +14,7 @@ from datetime import datetime
 from Llm.embedding_model_loader import EmbeddingModelLoader
 from config import *
 from Llm.llm_loader import LLM
+from Run.logging_utils import log_run_configuration, setup_task_logger
 
 
 def get_qdrant_client(qdrant_path: Path):
@@ -341,6 +342,28 @@ def main() -> None:
     logs_dir = PROJECT_ROOT / 'Logs' / answer_llm_name / "Database_Retrival"
     logs_dir.mkdir(parents=True,exist_ok=True)
     log_path = logs_dir / f'iterative_database_retrival_{dataset_name}_{run_id}.json'
+    logger, logger_path = setup_task_logger("iterative_database_retrival", log_path)
+
+    log_run_configuration(
+        logger,
+        task_name="Global Coarse Retrieval",
+        dataset_name=dataset_name,
+        data_count=len(dataset_df),
+        model_name=answer_llm_name,
+        provider=provider,
+        result_path=log_path,
+        extra_fields={
+            "Embedding model": EMBEDDING_MODEL_NAME,
+            "Prompt template": prompt_path,
+            "Qdrant path": qdrant_path,
+            "Schema dir": schema_dir,
+            "HRC top p": hrc_top_p,
+            "Candidate db top k": candidate_db_top_k,
+            "Max input length": max_input_length,
+            "Max generation num": max_generation_num,
+            "Logger path": logger_path,
+        },
+    )
 
     embedder = EmbeddingModelLoader(
         model_name=EMBEDDING_MODEL_NAME,
@@ -408,6 +431,8 @@ def main() -> None:
             }
         )
         log_path.write_text(json.dumps(log_records, ensure_ascii=False, indent=2), encoding='utf-8')
+
+    logger.info("Completed %s records.", len(log_records))
     
 
 if __name__ == "__main__":

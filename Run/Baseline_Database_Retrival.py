@@ -9,6 +9,7 @@ from tqdm import tqdm
 
 from Llm.llm_loader import LLM
 from config import *
+from Run.logging_utils import log_run_configuration, setup_task_logger
 
 
 def parse_args() -> argparse.Namespace:
@@ -105,9 +106,10 @@ def run_baseline_retrieval(
     ranking_llm: LLM,
     answer_llm_name: str,
     provider: str,
-) -> None:
+) -> int:
     database_schemas = load_database_schema(database_schema_path)
     log_records: list[dict[str, Any]] = []
+    database_count = len(database_schemas)
 
     for _, row in tqdm(dataset_df.iterrows(), total=len(dataset_df)):
         schemas_string = database_schema_to_string(database_schemas)
@@ -123,6 +125,8 @@ def run_baseline_retrieval(
             provider=provider,
             log_path=log_path,
         )
+
+    return database_count
 
 
 def main() -> None:
@@ -153,8 +157,26 @@ def main() -> None:
     logs_dir = PROJECT_ROOT / "Logs" / answer_llm_name / "Database_Retrival"
     logs_dir.mkdir(parents=True, exist_ok=True)
     log_path = logs_dir / f"baseline_database_retrival_{dataset_name}_{run_id}.json"
+    logger, logger_path = setup_task_logger("baseline_database_retrival", log_path)
 
-    run_baseline_retrieval(
+    log_run_configuration(
+        logger,
+        task_name="Baseline Database Retrieval",
+        dataset_name=dataset_name,
+        data_count=len(dataset_df),
+        model_name=answer_llm_name,
+        provider=provider,
+        result_path=log_path,
+        extra_fields={
+            "Prompt template": prompt_path,
+            "Database schema path": database_schema_path,
+            "Max input length": max_input_length,
+            "Max generation num": max_generation_num,
+            "Logger path": logger_path,
+        },
+    )
+
+    database_count = run_baseline_retrieval(
         dataset_df=dataset_df,
         prompt_template=prompt_template,
         log_path=log_path,
@@ -163,6 +185,8 @@ def main() -> None:
         answer_llm_name=answer_llm_name,
         provider=provider,
     )
+    logger.info("Loaded database schema count: %s", database_count)
+    logger.info("Completed %s records.", len(dataset_df))
 
 
 if __name__ == "__main__":

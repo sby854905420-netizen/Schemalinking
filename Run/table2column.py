@@ -10,6 +10,7 @@ import pandas as pd
 
 from config import *
 from Llm.llm_loader import LLM
+from Run.logging_utils import log_run_configuration, setup_task_logger
 
 SUPPORTED_METHODS = {"zero_shot", "few_shot"}
 INPUT_FILE_PATTERNS = (
@@ -232,7 +233,7 @@ def run_table2column(
     answer_llm: Any,
     answer_llm_name: str,
     provider: str,
-) -> None:
+) -> int:
     from tqdm import tqdm
 
     log_records: list[dict[str, Any]] = []
@@ -252,7 +253,20 @@ def run_table2column(
             )
             continue
         predict_db_id = str(predict_db_id)
-        total_schema_df = load_database_schema(table_schema_dir, predict_db_id)
+        try:
+            total_schema_df = load_database_schema(table_schema_dir, predict_db_id)
+        except FileNotFoundError:
+            append_log_entry(
+                log_records=log_records,
+                row=row,
+                predict_tables=[],
+                table_response_text="No Vaild Database.",
+                column_response_text="No Vaild Database.",
+                answer_llm_name=answer_llm_name,
+                provider=provider,
+                output_path=output_path,
+            )
+            continue
 
         table_prompt = build_prompt(
             prompt_templates["table"],
@@ -285,6 +299,8 @@ def run_table2column(
             output_path=output_path,
         )
 
+    return len(log_records)
+
 
 def main() -> None:
     args = parse_args()
@@ -311,9 +327,30 @@ def main() -> None:
         dataset_name=dataset_name,
         method_name=method_name,
     )
+    logger, logger_path = setup_task_logger("table2column", output_path)
 
     dataset_df = load_dataset(input_path)
     prompt_templates = load_prompt_templates(method_name)
+
+    log_run_configuration(
+        logger,
+        task_name="Table-to-Column Schema Linking",
+        dataset_name=dataset_name,
+        data_count=len(dataset_df),
+        model_name=answer_llm_name,
+        provider=provider,
+        result_path=output_path,
+        extra_fields={
+            "Method": method_name,
+            "Input path": input_path,
+            "Table prompt template": PROJECT_ROOT / "Templates" / method_name / "extract_relevant_tables.txt",
+            "Column prompt template": PROJECT_ROOT / "Templates" / method_name / "extract_relevant_columns.txt",
+            "Table schema dir": table_schema_dir,
+            "Max input length": max_input_length,
+            "Max generation num": max_generation_num,
+            "Logger path": logger_path,
+        },
+    )
 
     answer_llm = LLM(
         model_name=answer_llm_name,
@@ -323,7 +360,7 @@ def main() -> None:
         query_settings=BASELINE_SCHEMA_LINKING_QUERY_SETTINGS,
     )
 
-    run_table2column(
+    processed_count = run_table2column(
         dataset_df=dataset_df,
         prompt_templates=prompt_templates,
         output_path=output_path,
@@ -332,6 +369,7 @@ def main() -> None:
         answer_llm_name=answer_llm_name,
         provider=provider,
     )
+    logger.info("Completed %s records.", processed_count)
 
 
 if __name__ == "__main__":

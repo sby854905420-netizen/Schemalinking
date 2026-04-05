@@ -11,6 +11,7 @@ import pandas as pd
 
 from config import *
 from Llm.llm_loader import LLM
+from Run.logging_utils import log_run_configuration, setup_task_logger
 
 SUPPORTED_METHODS = {"zero_shot", "few_shot"}
 INPUT_FILE_PATTERNS = (
@@ -207,7 +208,7 @@ def run_baseline_schema_linking(
     answer_llm: Any,
     answer_llm_name: str,
     provider: str,
-) -> None:
+) -> int:
     from tqdm import tqdm
 
     log_records: list[dict[str, Any]] = []
@@ -224,7 +225,18 @@ def run_baseline_schema_linking(
                 output_path=output_path,
             )
             continue
-        database_schema = load_database_schema(table_schema_dir, str(predict_db_id))
+        try:
+            database_schema = load_database_schema(table_schema_dir, str(predict_db_id))
+        except FileNotFoundError:
+            append_log_entry(
+                log_records=log_records,
+                row=row,
+                response_text="No Valid Database.",
+                answer_llm_name=answer_llm_name,
+                provider=provider,
+                output_path=output_path,
+            )
+            continue
         prompt = build_prompt(prompt_template, database_schema, row["question"])
         response_text = normalize_response(answer_llm.query(prompt))
         append_log_entry(
@@ -235,6 +247,8 @@ def run_baseline_schema_linking(
             provider=provider,
             output_path=output_path,
         )
+
+    return len(log_records)
 
 
 def main() -> None:
@@ -263,9 +277,29 @@ def main() -> None:
         dataset_name=dataset_name,
         method_name=method_name,
     )
+    logger, logger_path = setup_task_logger("baseline_schema_linking", output_path)
 
     dataset_df = load_dataset(input_path)
     prompt_template = load_prompt_template(prompt_path)
+
+    log_run_configuration(
+        logger,
+        task_name="Baseline Schema Linking",
+        dataset_name=dataset_name,
+        data_count=len(dataset_df),
+        model_name=answer_llm_name,
+        provider=provider,
+        result_path=output_path,
+        extra_fields={
+            "Method": method_name,
+            "Input path": input_path,
+            "Prompt template": prompt_path,
+            "Table schema dir": table_schema_dir,
+            "Max input length": max_input_length,
+            "Max generation num": max_generation_num,
+            "Logger path": logger_path,
+        },
+    )
 
     answer_llm = LLM(
         model_name=answer_llm_name,
@@ -275,7 +309,7 @@ def main() -> None:
         query_settings=BASELINE_SCHEMA_LINKING_QUERY_SETTINGS,
     )
 
-    run_baseline_schema_linking(
+    processed_count = run_baseline_schema_linking(
         dataset_df=dataset_df,
         prompt_template=prompt_template,
         output_path=output_path,
@@ -284,6 +318,7 @@ def main() -> None:
         answer_llm_name=answer_llm_name,
         provider=provider,
     )
+    logger.info("Completed %s records.", processed_count)
 
 
 if __name__ == "__main__":
