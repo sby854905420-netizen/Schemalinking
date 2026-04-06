@@ -52,6 +52,25 @@ def normalize_response(response_text: str) -> str:
         normalized_response = normalized_response.split("</think>")[-1].strip()
     return normalized_response
 
+
+def parse_db_response(response_text:str) -> str:
+    nor_response_text = normalize_response(response_text)
+    try:
+        response_json = json.loads(nor_response_text)
+    except json.JSONDecodeError:
+        return ""
+    
+    if not isinstance(response_json, dict):
+        return ""
+    
+    try:
+        pred_db_id = response_json["relevant_database"]
+    except KeyError:
+        return ""
+    
+    return pred_db_id
+    
+
 def append_log_entry(
     log_records: list[dict[str, Any]],
     row: pd.Series,
@@ -60,14 +79,7 @@ def append_log_entry(
     provider: str,
     log_path: Path,
 ) -> None:
-    response_text = response_text.replace("```","").replace("json","").strip()
-    try:
-        predict_db_id = json.loads(response_text)["relevant_database"]
-    except json.JSONDecodeError:
-        predict_db_id = ""
-    except KeyError:
-        predict_db_id = ""
-
+    predict_db_id = parse_db_response(response_text)
     log_records.append(
         {
             "model": answer_llm_name,
@@ -116,7 +128,7 @@ def run_baseline_retrieval(
         prompt = build_prompt(prompt_template, schemas_string, row["question"])
         # prompt_token_count = ranking_llm.count_input_tokens(prompt)
         # print(f"[Baseline] instance_id={row['instance_id']} prompt_tokens={prompt_token_count}")
-        response_text = normalize_response(ranking_llm.query(prompt))
+        response_text = ranking_llm.query(prompt)
         append_log_entry(
             log_records=log_records,
             row=row,

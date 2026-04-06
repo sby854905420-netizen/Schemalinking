@@ -427,6 +427,7 @@ def main() -> None:
                 'spider_db_id': row['db_id'],
                 'question': row['question'],
                 'FCD_ids': ",".join(FCD_db_ids),
+                'CFCD_db_ids': ",".join(CFCD_db_ids),
                 'predict_db_id': target_db_id[0]
             }
         )

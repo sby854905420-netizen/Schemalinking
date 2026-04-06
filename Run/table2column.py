@@ -171,30 +171,52 @@ def normalize_response(response_text: str) -> str:
     return normalized_response
 
 
-def parse_table_response(response_text: str) -> tuple[list[str], str]:
+def parse_table_response(response_text: str) -> list:
+    nor_response_text = normalize_response(response_text)
     try:
-        response_json = json.loads(response_text)
+        response_json = json.loads(nor_response_text)
     except json.JSONDecodeError:
-        return [], "Invalid JSON:\n" + response_text.strip()
+        return []
 
     if not response_json:
-        return [], "Empty Resulst:\n" + response_text.strip()
-
+        return []
+    
     try:
         relevant_table_list = response_json["relevant_tables"]
     except KeyError:
-        return [], "Invalid Key:\n" + response_text.strip()
+        return []
 
     if not isinstance(relevant_table_list, list):
-        return [], "Invalid Key:\n" + response_text.strip()
+        return []
 
-    return relevant_table_list, response_text
+    return relevant_table_list
+
+def parse_column_response(response_text: str) -> dict:
+    nor_response_text = normalize_response(response_text)
+    try:
+        response_json = json.loads(nor_response_text)
+    except json.JSONDecodeError:
+        return {}
+
+    if not response_json:
+        return {}
+
+    try:
+        relevant_columns = response_json['relevant_columns']
+    except KeyError:
+        return {}
+
+    if not isinstance(relevant_columns, dict):
+        return {}
+
+    return relevant_columns
 
 
 def append_log_entry(
     log_records: list[dict[str, Any]],
     row: Any,
     predict_tables:list,
+    predict_columns:dict,
     table_response_text: str,
     column_response_text: str,
     answer_llm_name: str,
@@ -202,12 +224,6 @@ def append_log_entry(
     output_path: Path,
 ) -> None:
     
-    try:
-        predict_columns = json.loads(column_response_text)['relevant_columns']
-    except json.JSONDecodeError:
-        predict_columns = {}
-    except KeyError:
-        predict_columns = {}
     log_records.append(
         {
             "model": answer_llm_name,
@@ -245,6 +261,7 @@ def run_table2column(
                 log_records=log_records,
                 row=row,
                 predict_tables=[],
+                predict_columns= {},
                 table_response_text="No Vaild Database.",
                 column_response_text="No Vaild Database.",
                 answer_llm_name=answer_llm_name,
@@ -259,7 +276,8 @@ def run_table2column(
             append_log_entry(
                 log_records=log_records,
                 row=row,
-                predict_tables=[],
+                predict_tables= [],
+                predict_columns= {},
                 table_response_text="No Vaild Database.",
                 column_response_text="No Vaild Database.",
                 answer_llm_name=answer_llm_name,
@@ -273,8 +291,8 @@ def run_table2column(
             total_schema_df.to_markdown(index=False),
             row["question"],
         )
-        table_response_text = normalize_response(answer_llm.query(table_prompt))
-        relevant_table_list, table_response_text = parse_table_response(table_response_text)
+        table_response_text = answer_llm.query(table_prompt)
+        relevant_table_list = parse_table_response(table_response_text)
 
         if relevant_table_list:
             relevant_schema_df = total_schema_df[total_schema_df["table_name"].isin(relevant_table_list)]
@@ -286,12 +304,13 @@ def run_table2column(
             relevant_schema_df.to_markdown(index=False),
             row["question"],
         )
-        column_response_text = normalize_response(answer_llm.query(column_prompt))
-
+        column_response_text = answer_llm.query(column_prompt)
+        predict_columns = parse_column_response(column_response_text)
         append_log_entry(
             log_records=log_records,
             row=row,
-            predict_tables=relevant_table_list,
+            predict_tables= relevant_table_list,
+            predict_columns= predict_columns,
             table_response_text=table_response_text,
             column_response_text=column_response_text,
             answer_llm_name=answer_llm_name,

@@ -15,7 +15,7 @@ Evluation/
 .vscode/
 Llm/cache/
 tmp_run/
-dep_tool/
+dep_tools/
 
 # Local dependency snapshot
 requirements.txt

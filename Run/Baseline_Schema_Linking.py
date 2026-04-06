@@ -173,6 +173,23 @@ def normalize_response(response_text: str) -> str:
     return normalized_response
 
 
+def parse_sl_response(response:str) -> dict:
+    nor_response = normalize_response(response)
+    try:
+        response_json = json.loads(nor_response)
+    except json.JSONDecodeError:
+        return {}
+
+    if not isinstance(response_json, dict):
+        return {}
+
+    try:
+        pred_sl = response_json["relevant_columns"]
+    except KeyError:
+        return {}
+    
+    return pred_sl
+    
 def append_log_entry(
     log_records: list[dict[str, Any]],
     row: Any,
@@ -181,10 +198,7 @@ def append_log_entry(
     provider: str,
     output_path: Path,
 ) -> None:
-    try:
-        predict_columns = json.loads(response_text)
-    except json.JSONDecodeError:
-        predict_columns = {}
+    predict_columns = parse_sl_response(response_text)
     log_records.append(
         {
             "model": answer_llm_name,
@@ -238,7 +252,7 @@ def run_baseline_schema_linking(
             )
             continue
         prompt = build_prompt(prompt_template, database_schema, row["question"])
-        response_text = normalize_response(answer_llm.query(prompt))
+        response_text = answer_llm.query(prompt)
         append_log_entry(
             log_records=log_records,
             row=row,
