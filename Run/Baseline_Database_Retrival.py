@@ -10,6 +10,7 @@ from tqdm import tqdm
 from Llm.llm_loader import LLM
 from config import *
 from Run.logging_utils import log_run_configuration, setup_task_logger
+from Utils.tools import normalize_response_text, render_prompt, resolve_hint
 
 
 def parse_args() -> argparse.Namespace:
@@ -46,15 +47,9 @@ def load_database_schema(path: Path) -> dict[str, str]:
     with path.open("r", encoding="utf-8") as file:
         return json.load(file)
 
-def normalize_response(response_text: str) -> str:
-    normalized_response = response_text.replace("```", "").replace("json", "").strip()
-    if "</think>" in normalized_response:
-        normalized_response = normalized_response.split("</think>")[-1].strip()
-    return normalized_response
-
 
 def parse_db_response(response_text:str) -> str:
-    nor_response_text = normalize_response(response_text)
+    nor_response_text = normalize_response_text(response_text)
     try:
         response_json = json.loads(nor_response_text)
     except json.JSONDecodeError:
@@ -101,15 +96,6 @@ def database_schema_to_string(
     return ("\n" + "=" * 80 + "\n").join(schema_chunks).strip()
 
 
-def build_prompt(prompt_template: str, schemas_string: str, question: str) -> str:
-    return (
-        prompt_template
-        .replace("{DATABASE_SCHEMAS}", schemas_string)
-        .replace("{QUESTION}", question)
-        .replace("{HINT}", "No hint")
-    )
-
-
 def run_baseline_retrieval(
     dataset_df: pd.DataFrame,
     prompt_template: str,
@@ -125,7 +111,12 @@ def run_baseline_retrieval(
 
     for _, row in tqdm(dataset_df.iterrows(), total=len(dataset_df)):
         schemas_string = database_schema_to_string(database_schemas)
-        prompt = build_prompt(prompt_template, schemas_string, row["question"])
+        prompt = render_prompt(
+            prompt_template,
+            DATABASE_SCHEMAS=schemas_string,
+            QUESTION=row["question"],
+            HINT=resolve_hint(row),
+        )
         # prompt_token_count = ranking_llm.count_input_tokens(prompt)
         # print(f"[Baseline] instance_id={row['instance_id']} prompt_tokens={prompt_token_count}")
         response_text = ranking_llm.query(prompt)

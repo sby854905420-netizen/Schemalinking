@@ -40,11 +40,11 @@ Format:
 {
   "tables": [
     {
-      "table_name": "string",
+      "table_name": "table name",
       "columns": [
         {
-          "column_name": "string",
-          "description": "string"
+          "column_name": "column name",
+          "description": "generated description"
         }
       ]
     }

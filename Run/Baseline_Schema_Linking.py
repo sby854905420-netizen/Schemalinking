@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 import pandas as pd
@@ -12,6 +10,17 @@ import pandas as pd
 from config import *
 from Llm.llm_loader import LLM
 from Run.logging_utils import log_run_configuration, setup_task_logger
+from Utils.tools import (
+    build_db_schema_text,
+    get_row_value,
+    load_db_info_index,
+    load_schema_dataframe_from_db_info,
+    normalize_response_text,
+    render_prompt,
+    resolve_hint,
+    resolve_input_path,
+    resolve_output_path,
+)
 
 SUPPORTED_METHODS = {"zero_shot", "few_shot"}
 INPUT_FILE_PATTERNS = (
@@ -34,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-generation-num", dest="max_generation_num", type=int, default=None)
     parser.add_argument("--input-path", dest="input_path", type=Path, default=None)
     parser.add_argument("--logs-dir", dest="logs_dir", type=Path, default=None)
-    parser.add_argument("--table-schema-dir", dest="table_schema_dir", type=Path, default=None)
+    parser.add_argument("--db-info-path", dest="db_info_path", type=Path, default=None)
     parser.add_argument("--output-path", dest="output_path", type=Path, default=None)
     return parser.parse_args()
 
@@ -56,125 +65,8 @@ def load_prompt_template(prompt_path: Path) -> str:
     return prompt_path.read_text(encoding="utf-8").strip()
 
 
-def extract_timestamp(path: Path, dataset_name: str) -> str | None:
-    timestamp_pattern = re.compile(
-        TIMESTAMP_PATTERN_TEMPLATE.format(dataset_name=re.escape(dataset_name))
-    )
-    match = timestamp_pattern.search(path.name)
-    if match is None:
-        return None
-    return match.group(1)
-
-
-def find_model_dir(logs_dir: Path, model_name: str) -> Path:
-    direct_path = logs_dir / model_name / "Database_Retrival"
-    if direct_path.is_dir():
-        return direct_path
-
-    model_leaf_name = Path(model_name).name
-    matching_dirs = sorted(
-        path
-        for path in logs_dir.rglob("Database_Retrival")
-        if path.is_dir() and path.parent.name == model_leaf_name
-    )
-    if not matching_dirs:
-        raise FileNotFoundError(
-            f"Could not find a Database_Retrival directory for model '{model_name}' under {logs_dir}."
-        )
-    if len(matching_dirs) > 1:
-        matched_paths = "\n".join(str(path) for path in matching_dirs)
-        raise ValueError(
-            f"Found multiple Database_Retrival directories for model '{model_name}'. Please disambiguate:\n{matched_paths}"
-        )
-    return matching_dirs[0]
-
-
-def find_result_file(model_dir: Path, dataset_name: str) -> Path:
-    candidate_files: list[tuple[str, Path]] = []
-
-    for pattern_template in INPUT_FILE_PATTERNS:
-        pattern = pattern_template.format(dataset_name=dataset_name, timestamp="*")
-        for path in model_dir.glob(pattern):
-            file_timestamp = extract_timestamp(path, dataset_name)
-            if file_timestamp is None:
-                continue
-            candidate_files.append((file_timestamp, path))
-
-    if not candidate_files:
-        expected_patterns = ", ".join(
-            pattern_template.format(dataset_name=dataset_name, timestamp="*")
-            for pattern_template in INPUT_FILE_PATTERNS
-        )
-        raise FileNotFoundError(f"Could not find any of [{expected_patterns}] under {model_dir}.")
-
-    candidate_files.sort(key=lambda item: item[0], reverse=True)
-    return candidate_files[0][1]
-
-
-def resolve_input_path(
-    input_path: Path | None,
-    logs_dir: Path,
-    answer_llm_name: str,
-    dataset_name: str,
-) -> Path:
-    if input_path is not None:
-        return input_path
-
-    model_dir = find_model_dir(logs_dir=logs_dir, model_name=answer_llm_name)
-    return find_result_file(model_dir=model_dir, dataset_name=dataset_name)
-
-
-def resolve_output_path(
-    output_path: Path | None,
-    answer_llm_name: str,
-    dataset_name: str,
-    method_name: str,
-) -> Path:
-    if output_path is not None:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        return output_path
-
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_dir = PROJECT_ROOT / "Logs" / answer_llm_name
-    save_dir.mkdir(parents=True, exist_ok=True)
-    return save_dir / f"{method_name}_baseline_schema_linking_{dataset_name}_{run_id}.json"
-
-
-def get_row_value(row: pd.Series, *keys: str) -> Any:
-
-    for key in keys:
-        value = row.get(key)
-        if pd.notna(value):
-            return value
-    return None
-
-
-def load_database_schema(table_schema_dir: Path, predict_db_id: str) -> str:
-    import pandas as pd
-
-    schema_path = table_schema_dir / f"{predict_db_id}.csv"
-    schema_df = pd.read_csv(schema_path)
-    return schema_df.to_markdown(index=False)
-
-
-def build_prompt(prompt_template: str, database_schema: str, question: str) -> str:
-    return (
-        prompt_template
-        .replace("{DATABASE_SCHEMA}", database_schema)
-        .replace("{QUESTION}", question)
-        .replace("{HINT}", "No hint")
-    )
-
-
-def normalize_response(response_text: str) -> str:
-    normalized_response = response_text.replace("```", "").replace("json", "").strip()
-    if "</think>" in normalized_response:
-        normalized_response = normalized_response.split("</think>")[-1].strip()
-    return normalized_response
-
-
 def parse_sl_response(response:str) -> dict:
-    nor_response = normalize_response(response)
+    nor_response = normalize_response_text(response)
     try:
         response_json = json.loads(nor_response)
     except json.JSONDecodeError:
@@ -216,9 +108,10 @@ def append_log_entry(
 
 def run_baseline_schema_linking(
     dataset_df: Any,
+    dataset_name: str,
     prompt_template: str,
     output_path: Path,
-    table_schema_dir: Path,
+    db_info_index: dict[str, dict[str, Any]],
     answer_llm: Any,
     answer_llm_name: str,
     provider: str,
@@ -240,7 +133,12 @@ def run_baseline_schema_linking(
             )
             continue
         try:
-            database_schema = load_database_schema(table_schema_dir, str(predict_db_id))
+            schema_df = load_schema_dataframe_from_db_info(
+                predict_db_id=str(predict_db_id),
+                dataset_name=dataset_name,
+                db_info_index=db_info_index,
+            )
+            database_schema = build_db_schema_text(schema_df=schema_df, db_id=str(predict_db_id))
         except FileNotFoundError:
             append_log_entry(
                 log_records=log_records,
@@ -251,7 +149,12 @@ def run_baseline_schema_linking(
                 output_path=output_path,
             )
             continue
-        prompt = build_prompt(prompt_template, database_schema, row["question"])
+        prompt = render_prompt(
+            prompt_template,
+            DATABASE_SCHEMA=database_schema,
+            QUESTION=row["question"],
+            HINT=resolve_hint(row),
+        )
         response_text = answer_llm.query(prompt)
         append_log_entry(
             log_records=log_records,
@@ -278,23 +181,27 @@ def main() -> None:
     dataset_root = PROJECT_ROOT / "Data" / dataset_name
     logs_dir = args.logs_dir or (PROJECT_ROOT / "Logs")
     prompt_path = PROJECT_ROOT / "Templates" / method_name / "baseline_schema_linking.txt"
-    table_schema_dir = args.table_schema_dir or (dataset_root / "Table_schema_csv")
+    db_info_path = args.db_info_path or (dataset_root / "db_info.json")
     input_path = resolve_input_path(
         input_path=args.input_path,
         logs_dir=logs_dir,
         answer_llm_name=answer_llm_name,
         dataset_name=dataset_name,
+        input_file_patterns=INPUT_FILE_PATTERNS,
+        timestamp_pattern_template=TIMESTAMP_PATTERN_TEMPLATE,
     )
     output_path = resolve_output_path(
         output_path=args.output_path,
         answer_llm_name=answer_llm_name,
         dataset_name=dataset_name,
-        method_name=method_name,
+        output_stem=f"{method_name}_baseline_schema_linking",
+        project_root=PROJECT_ROOT,
     )
     logger, logger_path = setup_task_logger("baseline_schema_linking", output_path)
 
     dataset_df = load_dataset(input_path)
     prompt_template = load_prompt_template(prompt_path)
+    db_info_index = load_db_info_index(db_info_path)
 
     log_run_configuration(
         logger,
@@ -308,7 +215,7 @@ def main() -> None:
             "Method": method_name,
             "Input path": input_path,
             "Prompt template": prompt_path,
-            "Table schema dir": table_schema_dir,
+            "DB info path": db_info_path,
             "Max input length": max_input_length,
             "Max generation num": max_generation_num,
             "Logger path": logger_path,
@@ -325,9 +232,10 @@ def main() -> None:
 
     processed_count = run_baseline_schema_linking(
         dataset_df=dataset_df,
+        dataset_name=dataset_name,
         prompt_template=prompt_template,
         output_path=output_path,
-        table_schema_dir=table_schema_dir,
+        db_info_index=db_info_index,
         answer_llm=answer_llm,
         answer_llm_name=answer_llm_name,
         provider=provider,

@@ -6,9 +6,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 
 DATASET_NAME = "MMQA"
 
-DEFAULT_QDRANT_PATH = PROJECT_ROOT / "Data" / "MMQA" / "qdrant_column_index"
+DEFAULT_QDRANT_PATH = PROJECT_ROOT / "Data" / DATASET_NAME / "qdrant_column_index"
 
-DEFAULT_SCHEMA_DIR = PROJECT_ROOT / "Data" / "MMQA" / "Column_level_schema"
+DEFAULT_SCHEMA_DIR = PROJECT_ROOT / "Data" / DATASET_NAME / "Column_level_schema"
 
 DEVICE = "cuda"
 
@@ -22,7 +22,8 @@ MAX_GENERATEION_NUM = 2048
 
 MAX_INPUT_LENGTH = 110000
 
-HRC_TOP_P = 0.02
+TOP_KD_CAP = 512
+
 
 CANDIDATE_DB_TOP_K = 3
 
@@ -43,3 +44,4 @@ TABLE2COLUMN_QUERY_SETTINGS = {
 }
 
 THINKING_MODE = False
+

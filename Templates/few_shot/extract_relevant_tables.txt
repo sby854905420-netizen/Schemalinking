@@ -7,9 +7,20 @@ Only include tables that are necessary for the SQL query.
 Do not include irrelevant tables.
 
 ### Database Schema:
-The schema describes the structure of the database, including tables, columns, primary keys, foreign keys, and other relevant information.
-Primary keys uniquely identify rows in a table.
-Foreign keys represent relationships between tables and may indicate how tables should be joined.
+The schema is organized into sections such as [DATABASE_ID], [FOREIGN_KEY_RELATIONSHIPS], and [TABLE].
+
+Each column line provides:
+column_name | data_type | key_type | referenced_column | column_description | example_values
+
+Important notes:
+- key_type is one of: PRIMARY KEY, FOREIGN KEY, NONE, NOT_AVAILABLE
+- referenced_column is a full column path such as TableName.ColumnName
+- referenced_column is NONE when the source data shows the column is not a foreign key
+- referenced_column is NOT_AVAILABLE when foreign key information is not provided in the source data
+- the foreign key relationship section is NONE when the source data shows no relationships in scope
+- column_description may be NOT_AVAILABLE
+- example_values may be NOT_AVAILABLE
+- Table names and column names must be used exactly as provided in the schema
 
 ### Hint:
 The hint (if provided) may highlight tables, columns, or relationships that are relevant to the question.
@@ -41,22 +52,31 @@ You may reason internally to determine the correct tables, but do NOT output the
 Only output the final JSON array.
 
 ### Example 1:
-Database Schema (table name | column name | data type | is primary key (0: False, 1: True)| foreign key (0: False)):
-| table_name   | column_name        | data_type   |   is_primary_key | foreign_key              |
-|:-------------|:-------------------|:------------|-----------------:|:-------------------------|
-| department   | Department_ID      | INT         |                1 | 0                        |
-| department   | Name               | TEXT        |                0 | 0                        |
-| department   | Creation           | TEXT        |                0 | 0                        |
-| department   | Ranking            | INT         |                0 | 0                        |
-| department   | Budget_in_Billions | REAL        |                0 | 0                        |
-| department   | Num_Employees      | REAL        |                0 | 0                        |
-| head         | head_ID            | INT         |                1 | 0                        |
-| head         | name               | TEXT        |                0 | 0                        |
-| head         | born_state         | TEXT        |                0 | 0                        |
-| head         | age                | REAL        |                0 | 0                        |
-| management   | department_ID      | INT         |                1 | department.Department_ID |
-| management   | head_ID            | INT         |                1 | head.head_ID             |
-| management   | temporary_acting   | TEXT        |                0 | 0                        |
+[DATABASE_ID]
+department_management
+
+[FOREIGN_KEY_RELATIONSHIPS]
+- management.department_ID -> department.Department_ID
+- management.head_ID -> head.head_ID
+
+[TABLE] department
+- Department_ID | INT | PRIMARY KEY | NONE | Unique identifier for a department. | NOT_AVAILABLE
+- Name | TEXT | NONE | NONE | Department name. | NOT_AVAILABLE
+- Creation | TEXT | NONE | NONE | Creation date or period. | NOT_AVAILABLE
+- Ranking | INT | NONE | NONE | Department ranking. | NOT_AVAILABLE
+- Budget_in_Billions | REAL | NONE | NONE | Department budget. | NOT_AVAILABLE
+- Num_Employees | REAL | NONE | NONE | Number of employees. | NOT_AVAILABLE
+
+[TABLE] head
+- head_ID | INT | PRIMARY KEY | NONE | Unique identifier for a department head. | NOT_AVAILABLE
+- name | TEXT | NONE | NONE | Head name. | NOT_AVAILABLE
+- born_state | TEXT | NONE | NONE | State of birth. | NOT_AVAILABLE
+- age | REAL | NONE | NONE | Age. | NOT_AVAILABLE
+
+[TABLE] management
+- department_ID | INT | FOREIGN KEY | department.Department_ID | Department managed by a head. | NOT_AVAILABLE
+- head_ID | INT | FOREIGN KEY | head.head_ID | Head managing the department. | NOT_AVAILABLE
+- temporary_acting | TEXT | NONE | NONE | Whether the head is temporary acting. | NOT_AVAILABLE
 
 Question:
 Which department currently headed by a temporary acting manager has the largest number of employees, and how many employees does it have?
@@ -69,109 +89,86 @@ response:
     "relevant_tables": ["department", "management"]
 }
 
-
 ### Example 2:
-Database Schema (table name | column name | data type | is primary key (0: False, 1: True)| foreign key (0: False)):
-| table_name   | column_name        | data_type   |   is_primary_key | foreign_key       |
-|:-------------|:-------------------|:------------|-----------------:|:------------------|
-| matches      | best_of            | INT         |                0 | 0                 |
-| matches      | draw_size          | INT         |                0 | 0                 |
-| matches      | loser_age          | FLOAT       |                0 | 0                 |
-| matches      | loser_entry        | TEXT        |                0 | 0                 |
-| matches      | loser_hand         | TEXT        |                0 | 0                 |
-| matches      | loser_ht           | INT         |                0 | 0                 |
-| matches      | loser_id           | INT         |                0 | players.player_id |
-| matches      | loser_ioc          | TEXT        |                0 | 0                 |
-| matches      | loser_name         | TEXT        |                0 | 0                 |
-| matches      | loser_rank         | INT         |                0 | 0                 |
-| matches      | loser_rank_points  | INT         |                0 | 0                 |
-| matches      | loser_seed         | INT         |                0 | 0                 |
-| matches      | match_num          | INT         |                0 | 0                 |
-| matches      | minutes            | INT         |                0 | 0                 |
-| matches      | round              | TEXT        |                0 | 0                 |
-| matches      | score              | TEXT        |                0 | 0                 |
-| matches      | surface            | TEXT        |                0 | 0                 |
-| matches      | tourney_date       | DATE        |                0 | 0                 |
-| matches      | tourney_id         | TEXT        |                0 | 0                 |
-| matches      | tourney_level      | TEXT        |                0 | 0                 |
-| matches      | tourney_name       | TEXT        |                0 | 0                 |
-| matches      | winner_age         | FLOAT       |                0 | 0                 |
-| matches      | winner_entry       | TEXT        |                0 | 0                 |
-| matches      | winner_hand        | TEXT        |                0 | 0                 |
-| matches      | winner_ht          | INT         |                0 | 0                 |
-| matches      | winner_id          | INT         |                0 | players.player_id |
-| matches      | winner_ioc         | TEXT        |                0 | 0                 |
-| matches      | winner_name        | TEXT        |                0 | 0                 |
-| matches      | winner_rank        | INT         |                0 | 0                 |
-| matches      | winner_rank_points | INT         |                0 | 0                 |
-| matches      | winner_seed        | INT         |                0 | 0                 |
-| matches      | year               | INT         |                0 | 0                 |
-| players      | player_id          | INT         |                1 | 0                 |
-| players      | first_name         | TEXT        |                0 | 0                 |
-| players      | last_name          | TEXT        |                0 | 0                 |
-| players      | hand               | TEXT        |                0 | 0                 |
-| players      | birth_date         | DATE        |                0 | 0                 |
-| players      | country_code       | TEXT        |                0 | 0                 |
-| rankings     | ranking_date       | DATE        |                0 | 0                 |
-| rankings     | ranking            | INT         |                0 | 0                 |
-| rankings     | player_id          | INT         |                0 | players.player_id |
-| rankings     | ranking_points     | INT         |                0 | 0                 |
-| rankings     | tours              | INT         |                0 | 0                 |
+[DATABASE_ID]
+activity_1
+
+[FOREIGN_KEY_RELATIONSHIPS]
+- Faculty_Participates_in.FacID -> Faculty.FacID
+- Faculty_Participates_in.actid -> Activity.actid
+- Participates_in.stuid -> Student.StuID
+- Participates_in.actid -> Activity.actid
+
+[TABLE] Activity
+- actid | integer | PRIMARY KEY | NONE | Unique identifier for an activity. | 770, 771, 772
+- activity_name | text | NONE | NONE | Name of the activity. | Mountain Climbing, Canoeing, Kayaking
+
+[TABLE] Faculty
+- FacID | integer | PRIMARY KEY | NONE | Unique identifier for a faculty member. | 1082, 1121, 1148
+- Lname | text | NONE | NONE | Last name of the faculty member. | Giuliano, Goodrich, Masson
+- Fname | text | NONE | NONE | First name of the faculty member. | Mark, Michael, Gerald
+
+[TABLE] Faculty_Participates_in
+- FacID | integer | FOREIGN KEY | Faculty.FacID | Foreign key referencing the Faculty table, indicating the faculty member participating. | 1082, 1121
+- actid | integer | FOREIGN KEY | Activity.actid | Foreign key referencing the Activity table, indicating the activity the faculty member participates in. | 784, 785, 790
+
+[TABLE] Participates_in
+- stuid | integer | FOREIGN KEY | Student.StuID | Foreign key referencing the Student table, indicating the student participating. | 1001, 1002
+- actid | integer | FOREIGN KEY | Activity.actid | Foreign key referencing the Activity table, indicating the activity the student participates in. | 770, 771, 777
+
+[TABLE] Student
+- StuID | integer | PRIMARY KEY | NONE | Unique identifier for a student. | 1001, 1002, 1003
+- LName | text | NONE | NONE | Last name of the student. | Smith, Kim, Jones
+- Fname | text | NONE | NONE | First name of the student. | Linda, Tracy, Shiela
+- Age | integer | NONE | NONE | Age of the student. | 18, 19, 21
+- Sex | text | NONE | NONE | Gender of the student. | F, M
+- Major | integer | NONE | NONE | Major code of the student. | 600
+- Advisor | integer | NONE | NONE | Faculty ID of the student's advisor. | 1121, 7712, 7792
+- city_code | text | NONE | NONE | City code associated with the student. | BAL, HKG, WAS
 
 Question:
-What is the first name, country code, and birth date of the player with the most winner rank points across all matches?
-
-Hint (may be empty): 
-No hint
-
-response:
-{
-    "relevant_tables": ["players", "matches"]
-}
-
-### Example 3:
-Database Schema (table name | column name | data type | is primary key (0: False, 1: True)| foreign key (0: False)):
-| table_name   | column_name   | data_type   |   is_primary_key | foreign_key   |
-|:-------------|:--------------|:------------|-----------------:|:--------------|
-| event        | ID            | INT         |                1 | 0             |
-| event        | Name          | TEXT        |                0 | 0             |
-| event        | Stadium_ID    | INT         |                0 | stadium.ID    |
-| event        | Year          | TEXT        |                0 | 0             |
-| record       | ID            | INT         |                0 | 0             |
-| record       | Result        | TEXT        |                0 | 0             |
-| record       | Swimmer_ID    | INT         |                1 | swimmer.ID    |
-| record       | Event_ID      | INT         |                1 | event.ID      |
-| stadium      | ID            | INT         |                1 | 0             |
-| stadium      | name          | TEXT        |                0 | 0             |
-| stadium      | Capacity      | INT         |                0 | 0             |
-| stadium      | City          | TEXT        |                0 | 0             |
-| stadium      | Country       | TEXT        |                0 | 0             |
-| stadium      | Opening_year  | INT         |                0 | 0             |
-| swimmer      | ID            | INT         |                1 | 0             |
-| swimmer      | name          | TEXT        |                0 | 0             |
-| swimmer      | Nationality   | TEXT        |                0 | 0             |
-| swimmer      | meter_100     | REAL        |                0 | 0             |
-| swimmer      | meter_200     | TEXT        |                0 | 0             |
-| swimmer      | meter_300     | TEXT        |                0 | 0             |
-| swimmer      | meter_400     | TEXT        |                0 | 0             |
-| swimmer      | meter_500     | TEXT        |                0 | 0             |
-| swimmer      | meter_600     | TEXT        |                0 | 0             |
-| swimmer      | meter_700     | TEXT        |                0 | 0             |
-| swimmer      | Time          | TEXT        |                0 | 0             |
-
-Question:
-Which stadium hosted events where the swimmer with ID 1 had a loss?
+Which activities does student Linda Smith participate in?
 
 Hint (may be empty):
 No hint
 
 response:
 {
-    "relevant_tables": ["stadium", "event", "record"]
+    "relevant_tables": ["Student", "Participates_in", "Activity"]
+}
+
+### Example 3:
+[DATABASE_ID]
+ADVENTUREWORKS
+
+[FOREIGN_KEY_RELATIONSHIPS]
+NOT_AVAILABLE
+
+[TABLE] ADVENTUREWORKS.ADVENTUREWORKS.COUNTRYREGIONCURRENCY
+- modifieddate | TIMESTAMP | NOT_AVAILABLE | NOT_AVAILABLE | NOT_AVAILABLE | 2014-02-08 10:17:21.51
+- countryregioncode | STRING | NOT_AVAILABLE | NOT_AVAILABLE | NOT_AVAILABLE | AE, AR, AT
+- currencycode | STRING | NOT_AVAILABLE | NOT_AVAILABLE | NOT_AVAILABLE | AED, ARS, ATS
+
+[TABLE] ADVENTUREWORKS.ADVENTUREWORKS.CURRENCYRATE
+- currencyrateid | INT | NOT_AVAILABLE | NOT_AVAILABLE | NOT_AVAILABLE | 2, 4, 5
+- tocurrencycode | STRING | NOT_AVAILABLE | NOT_AVAILABLE | NOT_AVAILABLE | AUD, CAD, CNY
+- endofdayrate | FLOAT | NOT_AVAILABLE | NOT_AVAILABLE | NOT_AVAILABLE | 1.55, 1.4683, 8.2784
+- currencyratedate | TIMESTAMP | NOT_AVAILABLE | NOT_AVAILABLE | NOT_AVAILABLE | 2011-05-31 00:00:00
+- fromcurrencycode | STRING | NOT_AVAILABLE | NOT_AVAILABLE | NOT_AVAILABLE | USD
+- averagerate | FLOAT | NOT_AVAILABLE | NOT_AVAILABLE | NOT_AVAILABLE | 1.5491, 1.4641, 8.2781
+
+Question:
+What are the average and end-of-day exchange rates from USD to CAD?
+
+Hint (may be empty):
+No hint
+
+response:
+{
+    "relevant_tables": ["ADVENTUREWORKS.ADVENTUREWORKS.CURRENCYRATE"]
 }
 
 ### INPUT:
-Database Schema (table name | column name | data type | is primary key (0: False, 1: True)| foreign key (0: False)):
 {DATABASE_SCHEMA}
 
 Question:

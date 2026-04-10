@@ -13,9 +13,20 @@ Do not include extra columns just because they appear in the same table.
 Include join keys only when they are needed to connect tables in the SQL query.
 
 ### Database Schema:
-The schema describes the structure of the filtered relevant tables, including columns, primary keys, foreign keys, and other relevant information.
-Primary keys uniquely identify rows in a table.
-Foreign keys represent relationships between tables and may indicate how tables should be joined.
+The schema is organized into sections such as [DATABASE_ID], [SELECTED_TABLES], [FOREIGN_KEY_RELATIONSHIPS_WITHIN_SELECTED_TABLES], and [TABLE].
+
+Each column line provides:
+column_name | data_type | key_type | referenced_column | column_description | example_values
+
+Important notes:
+- key_type is one of: PRIMARY KEY, FOREIGN KEY, NONE, NOT_AVAILABLE
+- referenced_column is a full column path such as TableName.ColumnName
+- referenced_column is NONE when the source data shows the column is not a foreign key
+- referenced_column is NOT_AVAILABLE when foreign key information is not provided in the source data
+- the foreign key relationship section is NONE when the source data shows no relationships in scope
+- column_description may be NOT_AVAILABLE
+- example_values may be NOT_AVAILABLE
+- Table names and column names must be used exactly as provided in the schema
 
 ### Hint:
 The hint (if provided) may highlight columns, conditions, or relationships that are relevant to the question.
@@ -53,7 +64,6 @@ You may reason internally to determine the correct columns, but do NOT output th
 Only output the final JSON object.
 
 ### INPUT:
-Database Schema (table name | column name | data type | is primary key (0: False, 1: True)| foreign key (0: False)):
 {DATABASE_SCHEMA}
 
 Question:

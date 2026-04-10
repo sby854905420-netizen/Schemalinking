@@ -1,9 +1,8 @@
 import pandas as pd
 import argparse
-import math
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import ScoredPoint
-from typing import Any,Iterable
+from typing import Any, Iterable
 from pathlib import Path
 from tqdm import tqdm
 import json
@@ -15,62 +14,121 @@ from Llm.embedding_model_loader import EmbeddingModelLoader
 from config import *
 from Llm.llm_loader import LLM
 from Run.logging_utils import log_run_configuration, setup_task_logger
+from Utils.tools import (
+    build_db_id_filter,
+    get_qdrant_client,
+    query_qdrant,
+    render_prompt,
+    resolve_hint,
+    resolve_prompt_token_cap,
+)
+
+FULL_SCHEMA_COLUMN_THRESHOLD = 300
+PROMPT_BUDGET_BUFFER = 512
+PROMPT_BUDGET_RATIO = 0.85
+SCHEMA_SPLIT_LINE = "\n" + "-" * 80 + "\n"
+
+def clean_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return str(value).strip()
 
 
-def get_qdrant_client(qdrant_path: Path):
-    return QdrantClient(path=str(qdrant_path))
+def normalize_sample_values(record: dict[str, Any]) -> tuple[list[Any], str]:
+    raw_values = record.get("sample_values", [])
+    if isinstance(raw_values, list):
+        sample_values = raw_values
+    elif raw_values is None:
+        sample_values = []
+    else:
+        sample_values = [raw_values]
 
-def build_db_id_filter(candidate_db_ids: list[str] | None):
+    sample_values_text = clean_text(record.get("sample_values_text"))
+    if not sample_values_text and sample_values:
+        sample_values_text = ", ".join(clean_text(value) for value in sample_values if clean_text(value))
+
+    return sample_values, sample_values_text
+
+
+def normalize_record(record: dict[str, Any], source_path: Path | None = None) -> dict[str, Any]:
+    meta = record.get("meta_data") or {}
+    sample_values, sample_values_text = normalize_sample_values(record)
+
+    return {
+        "column_id": clean_text(record.get("column_id")),
+        "column_name": clean_text(record.get("column_name")),
+        "column_description": clean_text(record.get("column_description")),
+        "column_data_type": clean_text(record.get("column_data_type") or record.get("normalized_type")),
+        "sample_values": sample_values,
+        "sample_values_text": sample_values_text,
+        "is_primary_key": record.get("is_primary_key"),
+        "is_foreign_key": record.get("is_foreign_key"),
+        "value_descriptions": clean_text(record.get("value_descriptions")),
+        "references": record.get("references"),
+        "db_id": clean_text(record.get("db_id") or meta.get("db_id")),
+        "table_name": clean_text(record.get("table_name") or meta.get("table_name")),
+        "source_path": str(source_path or record.get("source_path") or ""),
+    }
+def load_db_counts(db_info_path: Path) -> dict[str, int]:
+    with db_info_path.open("r", encoding="utf-8") as file:
+        db_infos = json.load(file)
+
+    if not isinstance(db_infos, list):
+        raise TypeError(f"Expected db_info.json to contain a list, got {type(db_infos)!r}")
+
+    db_counts: dict[str, int] = {}
+    for entry in db_infos:
+        if not isinstance(entry, dict):
+            continue
+        db_id = clean_text(entry.get("db_id"))
+        if not db_id:
+            continue
+        raw_count = entry.get("db_counts", 0)
+        try:
+            db_counts[db_id] = int(raw_count)
+        except (TypeError, ValueError):
+            db_counts[db_id] = 0
+
+    return db_counts
+
+
+def resolve_top_kd(column_count: int) -> int:
+    if column_count <= 20:
+        return 4
+    if column_count <= 50:
+        return 5
+    if column_count <= 100:
+        return 6
+    if column_count <= 200:
+        return 6
+    if column_count <= 500:
+        return 7
+    if column_count <= 1000:
+        return 8
+    if column_count <= 5000:
+        return 10
+    return 12
+
+
+def resolve_top_k(
+    db_counts: dict[str, int],
+    candidate_db_ids: list[str] | None = None,
+    global_cap: int = TOP_KD_CAP,
+) -> int:
     if candidate_db_ids is None:
-        return None
+        target_db_ids = list(db_counts.keys())
+    else:
+        target_db_ids = [db_id for db_id in candidate_db_ids if db_id]
 
-    normalized_db_ids = [db_id for db_id in candidate_db_ids if db_id]
-    if not normalized_db_ids:
-        return None
-
-    try:
-        from qdrant_client.http import models
-    except ImportError as exc:
-        raise ImportError("Please install `qdrant-client` before building Qdrant filters.") from exc
-
-    return models.Filter(
-        should=[
-            models.FieldCondition(
-                key="db_id",
-                match=models.MatchValue(value=db_id),
-            )
-            for db_id in normalized_db_ids
-        ]
-    )
-
-
-def count_points(client:QdrantClient, collection_name: str, query_filter=None) -> int:
-    try:
-        from qdrant_client.http import models
-    except ImportError as exc:
-        raise ImportError("Please install `qdrant-client` before counting Qdrant points.") from exc
-
-    result = client.count(
-        collection_name=collection_name,
-        count_filter=query_filter,
-        exact=True,
-    )
-    if hasattr(result, "count"):
-        return int(result.count)
-    if isinstance(result, models.CountResult):
-        return int(result.count)
-    raise TypeError(f"Unsupported Qdrant count result type: {type(result)!r}")
-
-
-def resolve_top_k(client:QdrantClient, collection_name: str, top_ratio: float, query_filter=None) -> int:
-    if not 0 < top_ratio <= 1:
-        raise ValueError("--top-ratio must be within (0, 1]")
-
-    total_points = count_points(client, collection_name, query_filter=query_filter)
-    if total_points <= 0:
+    if not target_db_ids:
         return 0
 
-    return max(1, math.ceil(total_points * top_ratio))
+    resolved_top_k = sum(resolve_top_kd(max(0, db_counts.get(db_id, 0))) for db_id in target_db_ids)
+    return max(1, min(resolved_top_k, global_cap))
 
 
 def parse_args() -> argparse.Namespace:
@@ -78,6 +136,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-name", dest="dataset_name", type=str, default=None)
     parser.add_argument("--answer-llm-name", dest="answer_llm_name", type=str, default=None)
     parser.add_argument("--provider", dest="provider", type=str, default=None)
+    parser.add_argument("--input-path", dest="input_path", type=Path, default=None)
+    parser.add_argument("--output-path", dest="output_path", type=Path, default=None)
     parser.add_argument(
         "--max-input-length",
         dest="max_input_length",
@@ -90,26 +150,8 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
     )
-    parser.add_argument("--hrc-top-p", dest="hrc_top_p", type=float, default=None)
     parser.add_argument("--candidate-db-top-k", dest="candidate_db_top_k", type=int, default=None)
     return parser.parse_args()
-
-def query_qdrant(client:QdrantClient, collection_name: str, query_vector: list[float], top_k: int, with_vector: bool, query_filter=None):
-    response = client.query_points(
-        collection_name=collection_name,
-        query=query_vector,
-        limit=top_k,
-        query_filter=query_filter,
-        with_payload=True,
-        with_vectors=with_vector,
-    )
-
-    if hasattr(response, "points"):
-        return list(response.points)
-    if isinstance(response, list):
-        return response
-
-    raise TypeError(f"Unsupported Qdrant query result type: {type(response)!r}")
 
 def point_to_dict(point: Any) -> dict[str, Any]:
     if isinstance(point, tuple) and len(point) == 2:
@@ -138,52 +180,251 @@ def point_to_dict(point: Any) -> dict[str, Any]:
         "vector": vector,
     }
 
-def print_text_results(query: str, results: list[dict[str, Any]]) -> None:
-    print(f"Query: {query}")
-    print(f"Hits: {len(results)}")
-
-    for index, result in enumerate(results, start=1):
-        payload = result["payload"]
-        print("-" * 80)
-        print(f"Rank: {index}")
-        print(f"Score: {result['score']:.6f}" if result["score"] is not None else "Score: None")
-        print(f"db_id: {payload.get('db_id')}")
-        print(f"table_name: {payload.get('table_name')}")
-        print(f"column_name: {payload.get('column_name')}")
-        print(f"column_type: {payload.get('column_type')}")
-        print(f"normalized_type: {payload.get('normalized_type')}")
-        print(f"column_id: {payload.get('column_id')}")
-        print(f"description: {payload.get('column_description')}")
-        print(f"sample_values_text: {payload.get('sample_values_text')}")
-        print(f"source_path: {payload.get('source_path')}")
 
 def iter_column_files(schema_dir: Path) -> Iterable[Path]:
-    yield from sorted(schema_dir.glob("*.json"))
+    yield from sorted(schema_dir.rglob("*.json"))
 
 
 def build_document(record: dict[str, Any]) -> str:
-    meta = record["meta_data"]
+    normalized_record = normalize_record(record)
     lines = [
-        f"Database Name: {meta['db_id']}",
-        f"Table Name: {meta['table_name']}",
-        f"Column Name: {record['column_name']}",
-        f"Data Type: {record['normalized_type']}",
-        f"Column Description: {record['column_description']}",
+        f"Database: {normalized_record['db_id']}",
+        f"Table: {normalized_record['table_name']}",
+        f"Column: {normalized_record['column_name']}",
+        f"Data type: {normalized_record['column_data_type']}",
     ]
-    sample_values_text = record.get("sample_values_text", "").strip()
+
+    column_description = normalized_record["column_description"]
+    if column_description:
+        lines.append(f"Description: {column_description}")
+
+    value_descriptions = normalized_record["value_descriptions"]
+    if value_descriptions:
+        lines.append(f"Value meanings: {value_descriptions}")
+
+    sample_values_text = normalized_record["sample_values_text"]
     if sample_values_text:
         lines.append(f"Sample values: {sample_values_text}")
     return "\n".join(lines)
 
+
+def build_schema_text(documents: list[str]) -> str:
+    return SCHEMA_SPLIT_LINE.join(documents)
+
+
+def count_prompt_tokens(
+    ranking_llm: LLM,
+    prompt_template: str,
+    documents: list[str],
+    query: str,
+    hint_text: str,
+) -> int:
+    prompt = render_prompt(
+        prompt_template,
+        DATABASE_SCHEMAS=build_schema_text(documents),
+        QUESTION=query,
+        HINT=hint_text,
+    )
+    return ranking_llm.count_input_tokens(prompt)
+
+
 def load_column_record(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as file:
         return json.load(file)
-    
+
+
+def load_db_documents(schema_dir: Path, db_id: str) -> list[str]:
+    documents: list[str] = []
+    for column_file in iter_column_files(schema_dir / db_id):
+        record = load_column_record(column_file)
+        documents.append(build_document(record))
+    return documents
+
+
+def get_ranked_db_documents(
+    query_vector: list[float],
+    qdrant_client: QdrantClient,
+    collection_name: str,
+    db_id: str,
+    db_counts: dict[str, int],
+) -> list[dict[str, Any]]:
+    query_filter = build_db_id_filter([db_id])
+    if query_filter is None:
+        return []
+
+    ranked_points = query_qdrant(
+        client=qdrant_client,
+        collection_name=collection_name,
+        query_vector=query_vector,
+        top_k=max(1, db_counts.get(db_id, 0)),
+        query_filter=query_filter,
+        with_vectors=False,
+    )
+
+    ranked_documents: list[dict[str, Any]] = []
+    seen_column_ids: set[str] = set()
+    for point in ranked_points:
+        point_dict = point_to_dict(point)
+        payload = point_dict["payload"]
+        column_id = clean_text(payload.get("column_id"))
+        if not column_id:
+            column_id = f"{clean_text(payload.get('table_name'))}::{clean_text(payload.get('column_name'))}"
+        if column_id in seen_column_ids:
+            continue
+
+        seen_column_ids.add(column_id)
+        ranked_documents.append(
+            {
+                "column_id": column_id,
+                "table_name": clean_text(payload.get("table_name")),
+                "score": float(point_dict["score"]) if point_dict["score"] is not None else float("-inf"),
+                "document": build_document(payload),
+            }
+        )
+
+    return ranked_documents
+
+
+def append_documents_until_budget(
+    selected_documents: list[str],
+    selected_column_ids: set[str],
+    candidate_documents: list[dict[str, Any]],
+    ranking_llm: LLM,
+    prompt_template: str,
+    query: str,
+    hint_text: str,
+    target_prompt_cap: int,
+) -> tuple[list[str], set[str]]:
+    documents = list(selected_documents)
+    column_ids = set(selected_column_ids)
+
+    for candidate in candidate_documents:
+        column_id = candidate["column_id"]
+        if column_id in column_ids:
+            continue
+
+        proposed_documents = documents + [candidate["document"]]
+        proposed_tokens = count_prompt_tokens(
+            ranking_llm=ranking_llm,
+            prompt_template=prompt_template,
+            documents=proposed_documents,
+            query=query,
+            hint_text=hint_text,
+        )
+        if proposed_tokens <= target_prompt_cap or not documents:
+            documents.append(candidate["document"])
+            column_ids.add(column_id)
+
+    return documents, column_ids
+
+
+def select_relevant_documents_for_db(
+    query: str,
+    query_vector: list[float],
+    db_id: str,
+    ranking_llm: LLM,
+    prompt_template: str,
+    hint_text: str,
+    qdrant_client: QdrantClient,
+    collection_name: str,
+    db_counts: dict[str, int],
+) -> list[str]:
+    ranked_documents = get_ranked_db_documents(
+        query_vector=query_vector,
+        qdrant_client=qdrant_client,
+        collection_name=collection_name,
+        db_id=db_id,
+        db_counts=db_counts,
+    )
+    if not ranked_documents:
+        return []
+
+    target_prompt_cap = resolve_prompt_token_cap(ranking_llm.max_input_length)
+
+    table_representatives: list[dict[str, Any]] = []
+    remaining_documents: list[dict[str, Any]] = []
+    seen_tables: set[str] = set()
+    for candidate in ranked_documents:
+        table_name = candidate["table_name"]
+        if table_name not in seen_tables:
+            table_representatives.append(candidate)
+            seen_tables.add(table_name)
+        else:
+            remaining_documents.append(candidate)
+
+    selected_documents, selected_column_ids = append_documents_until_budget(
+        selected_documents=[],
+        selected_column_ids=set(),
+        candidate_documents=table_representatives,
+        ranking_llm=ranking_llm,
+        prompt_template=prompt_template,
+        query=query,
+        hint_text=hint_text,
+        target_prompt_cap=target_prompt_cap,
+    )
+    selected_documents, _ = append_documents_until_budget(
+        selected_documents=selected_documents,
+        selected_column_ids=selected_column_ids,
+        candidate_documents=remaining_documents,
+        ranking_llm=ranking_llm,
+        prompt_template=prompt_template,
+        query=query,
+        hint_text=hint_text,
+        target_prompt_cap=target_prompt_cap,
+    )
+    return selected_documents
+
+
+def resolve_schema_documents_for_db(
+    query: str,
+    query_vector: list[float],
+    db_id: str,
+    ranking_llm: LLM,
+    prompt_template: str,
+    hint_text: str,
+    schema_dir: Path,
+    qdrant_client: QdrantClient,
+    collection_name: str,
+    db_counts: dict[str, int],
+) -> list[str]:
+    column_count = max(0, db_counts.get(db_id, 0))
+    target_prompt_cap = resolve_prompt_token_cap(ranking_llm.max_input_length)
+
+    if column_count <= FULL_SCHEMA_COLUMN_THRESHOLD:
+        full_documents = load_db_documents(schema_dir=schema_dir, db_id=db_id)
+        if full_documents:
+            full_prompt_tokens = count_prompt_tokens(
+                ranking_llm=ranking_llm,
+                prompt_template=prompt_template,
+                documents=full_documents,
+                query=query,
+                hint_text=hint_text,
+            )
+            if full_prompt_tokens <= target_prompt_cap:
+                return full_documents
+
+    relevant_documents = select_relevant_documents_for_db(
+        query=query,
+        query_vector=query_vector,
+        db_id=db_id,
+        ranking_llm=ranking_llm,
+        prompt_template=prompt_template,
+        hint_text=hint_text,
+        qdrant_client=qdrant_client,
+        collection_name=collection_name,
+        db_counts=db_counts,
+    )
+    if relevant_documents:
+        return relevant_documents
+
+    return load_db_documents(schema_dir=schema_dir, db_id=db_id)
+
 
 def get_Highly_Relevant_Columns(query_vector:list[float], 
                                 qdrant_client:QdrantClient, 
-                                top_p:float,
-                                candidate_db_ids:list[str]=None
+                                db_counts: dict[str, int],
+                                collection_name:str,
+                                candidate_db_ids:list[str]=None,  
                                 ) -> list[ScoredPoint]:
     
     query_filter = build_db_id_filter(candidate_db_ids)
@@ -192,10 +433,8 @@ def get_Highly_Relevant_Columns(query_vector:list[float],
         return []
     
     resolved_top_k = resolve_top_k(
-        client=qdrant_client,
-        collection_name="mmqa_column_level",
-        top_ratio=top_p,
-        query_filter=query_filter,
+        db_counts=db_counts,
+        candidate_db_ids=candidate_db_ids,
     )
 
     if resolved_top_k <= 0:
@@ -203,11 +442,11 @@ def get_Highly_Relevant_Columns(query_vector:list[float],
 
     Highly_Relevant_Columns = query_qdrant(
         client=qdrant_client,
-        collection_name="mmqa_column_level",
+        collection_name=collection_name,
         query_vector=query_vector,
         top_k=resolved_top_k,
-        with_vector=False,
         query_filter=query_filter,
+        with_vectors=False,
     )
     return Highly_Relevant_Columns
 
@@ -216,6 +455,9 @@ def database_pruning(HRC_points:list[ScoredPoint],
                       min_hit_count:int, 
                       min_sim_ratio: float
                     ) -> list[str]:
+    if not HRC_points:
+        return []
+
     results = [point_to_dict(point) for point in HRC_points]
     results_df = pd.DataFrame(
         {
@@ -238,7 +480,7 @@ def database_pruning(HRC_points:list[ScoredPoint],
     filtered_db_stats = candidate_db_stats[
         (candidate_db_stats["hit_count"] >= min_hit_count) | (candidate_db_stats["max_score"] >= candidate_db_stats["max_score"].quantile(min_sim_ratio))
     ]
-    return list(set(filtered_db_stats["db_id"]))
+    return filtered_db_stats["db_id"].tolist()
 
 
 def collect_single_token_candidates(tokenizer, target_text: str):
@@ -274,26 +516,41 @@ def compute_yes_probability(next_token_logits:torch.tensor, tokenizer):
     return yes_prob_binary
 
 
-def CFCD_rerank_select(query:str, ranking_llm:LLM, 
+def CFCD_rerank_select(query:str, query_vector: list[float], ranking_llm:LLM, 
                        CFCD_db_ids: list[str], prompt_template:str, top_k:float,
-                       schema_dir: Path):
-    split_line = '\n'+ '-'*80 + '\n'
-    yes_scores = []
-    for db_id in CFCD_db_ids:
-        documents: list[str] = []
-        column_files = list(iter_column_files(schema_dir / db_id))
-        for column_file in column_files:
-            record = load_column_record(column_file)
-            document = build_document(record)
-            documents.append(document)
+                       external_knowledge: Any,
+                       schema_dir: Path,
+                       qdrant_client: QdrantClient,
+                       collection_name: str,
+                       db_counts: dict[str, int]):
+    if not CFCD_db_ids:
+        return []
 
-        schema_text = split_line.join(documents)
-        prompt = (
-                prompt_template
-                .replace('{DATABASE_SCHEMAS}', schema_text)
-                .replace('{QUESTION}', query)
-                .replace('{HINT}', 'No hint')
-                )
+    yes_scores = []
+    hint_text = resolve_hint(external_knowledge)
+    for db_id in CFCD_db_ids:
+        documents = resolve_schema_documents_for_db(
+            query=query,
+            query_vector=query_vector,
+            db_id=db_id,
+            ranking_llm=ranking_llm,
+            prompt_template=prompt_template,
+            hint_text=hint_text,
+            schema_dir=schema_dir,
+            qdrant_client=qdrant_client,
+            collection_name=collection_name,
+            db_counts=db_counts,
+        )
+        if not documents:
+            yes_scores.append(float("-inf"))
+            continue
+
+        prompt = render_prompt(
+            prompt_template,
+            DATABASE_SCHEMAS=build_schema_text(documents),
+            QUESTION=query,
+            HINT=hint_text,
+        )
         # prompt_token_count = ranking_llm.count_input_tokens(prompt)
         # print(f"[GlobalCoarse] db_id={db_id} prompt_tokens={prompt_token_count}")
         next_token_logits = ranking_llm._query_transformers(prompt, output_hidden_states=True)
@@ -327,22 +584,30 @@ def main() -> None:
     provider = args.provider or PROVIDER
     max_input_length = args.max_input_length or MAX_INPUT_LENGTH
     max_generation_num = args.max_generation_num or MAX_GENERATEION_NUM
-    hrc_top_p = args.hrc_top_p if args.hrc_top_p is not None else HRC_TOP_P
     candidate_db_top_k = args.candidate_db_top_k if args.candidate_db_top_k is not None else CANDIDATE_DB_TOP_K
     
     run_id = datetime.now().strftime('%Y%m%d_%H%M%S')
     dataset_root = PROJECT_ROOT / "Data" / dataset_name
     qdrant_path = dataset_root / "qdrant_column_index"
     schema_dir = dataset_root / "Column_level_schema"
+    dataset_path = args.input_path or (dataset_root / "gold_sl.json")
 
-    dataset_df = pd.read_json(dataset_root / "preprocessed_data.json")
+    dataset_df = pd.read_json(dataset_path)
+    db_counts = load_db_counts(dataset_root / "db_info.json")
     prompt_path = PROJECT_ROOT / "Templates" / "zero_shot" / "binary_classification_database.txt"
     prompt_template = prompt_path.read_text(encoding='utf-8').strip()
     
-    logs_dir = PROJECT_ROOT / 'Logs' / answer_llm_name / "Database_Retrival"
-    logs_dir.mkdir(parents=True,exist_ok=True)
-    log_path = logs_dir / f'iterative_database_retrival_{dataset_name}_{run_id}.json'
+    if args.output_path is None:
+        logs_dir = PROJECT_ROOT / 'Logs' / answer_llm_name / "Database_Retrival"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        log_path = logs_dir / f'iterative_database_retrival_{dataset_name}_{run_id}.json'
+    else:
+        log_path = args.output_path
+        log_path.parent.mkdir(parents=True, exist_ok=True)
     logger, logger_path = setup_task_logger("iterative_database_retrival", log_path)
+
+    client = get_qdrant_client(qdrant_path)
+    collection_name = dataset_name
 
     log_run_configuration(
         logger,
@@ -354,10 +619,16 @@ def main() -> None:
         result_path=log_path,
         extra_fields={
             "Embedding model": EMBEDDING_MODEL_NAME,
+            "Input path": dataset_path,
             "Prompt template": prompt_path,
             "Qdrant path": qdrant_path,
+            "Qdrant collection": collection_name,
             "Schema dir": schema_dir,
-            "HRC top p": hrc_top_p,
+            "Top-k cap": TOP_KD_CAP,
+            "Top-k schedule": "<=20:4, <=50:5, <=100:6, <=200:6, <=500:7, <=1000:8, <=5000:10, >5000:12",
+            "Full schema threshold": FULL_SCHEMA_COLUMN_THRESHOLD,
+            "Prompt budget ratio": PROMPT_BUDGET_RATIO,
+            "Prompt budget buffer": PROMPT_BUDGET_BUFFER,
             "Candidate db top k": candidate_db_top_k,
             "Max input length": max_input_length,
             "Max generation num": max_generation_num,
@@ -368,7 +639,6 @@ def main() -> None:
     embedder = EmbeddingModelLoader(
         model_name=EMBEDDING_MODEL_NAME,
     )
-    client = get_qdrant_client(qdrant_path)
     
     ranking_llm = LLM(
         model_name=answer_llm_name,
@@ -384,19 +654,29 @@ def main() -> None:
         # First Round for all databases
         # step 1: Global Highly Relevant columns (HRC) Retrival
         query_embedding = embedder.encode(row['question'], convert_to_list=True)
-        HRC_points = get_Highly_Relevant_Columns(query_embedding, client, top_p=hrc_top_p)
+        HRC_points = get_Highly_Relevant_Columns(
+            query_embedding,
+            client,
+            db_counts=db_counts,
+            collection_name=collection_name,
+        )
 
         # step 2: Support-Based Database Pruning, resulting Coarsely_Filtered Candidate Databases (CFCD)
-        CFCD_db_ids  = database_pruning(HRC_points, min_hit_count=2, min_sim_ratio=0.9)
+        CFCD_db_ids  = database_pruning(HRC_points, min_hit_count=2, min_sim_ratio=0.8)
 
         # step 3：CFCD Reranking & Selection Top-K, resulting in Final Candidate Databases (FCD)
         FCD_db_ids = CFCD_rerank_select(
             row['question'],
+            query_embedding,
             ranking_llm,
             CFCD_db_ids,
             prompt_template,
             top_k=candidate_db_top_k,
+            external_knowledge=row.get('external_knowledge'),
             schema_dir=schema_dir,
+            qdrant_client=client,
+            collection_name=collection_name,
+            db_counts=db_counts,
         )
 
         # Second Round for Final Candidate Databases
@@ -404,31 +684,37 @@ def main() -> None:
         Last_HRC_points = get_Highly_Relevant_Columns(
             query_embedding,
             client,
-            top_p=hrc_top_p,
+            db_counts=db_counts,
+            collection_name=collection_name,
             candidate_db_ids=FCD_db_ids,
         )
         # step 2: Support-Based Database Pruning, resulting Coarsely_Filtered Candidate Databases (CFCD)
-        CFCD_db_ids  = database_pruning(Last_HRC_points, min_hit_count=2, min_sim_ratio=0.9)
+        CFCD_db_ids  = database_pruning(Last_HRC_points, min_hit_count=2, min_sim_ratio=0.8)
         # step 3：CFCD Reranking & Selection Top-1, resulting in Target Database
         target_db_id = CFCD_rerank_select(
             row['question'],
+            query_embedding,
             ranking_llm,
             CFCD_db_ids,
             prompt_template,
             top_k=1,
+            external_knowledge=row.get('external_knowledge'),
             schema_dir=schema_dir,
+            qdrant_client=client,
+            collection_name=collection_name,
+            db_counts=db_counts,
         )
         # save the predict results
         log_records.append(
             {
                 'model': answer_llm_name,
                 'provider': provider,
-                'id': f"{row['instance_id']}",
+                'id': f"{row['id']}",
                 'spider_db_id': row['db_id'],
                 'question': row['question'],
                 'FCD_ids': ",".join(FCD_db_ids),
                 'CFCD_db_ids': ",".join(CFCD_db_ids),
-                'predict_db_id': target_db_id[0]
+                'predict_db_id': target_db_id[0] if target_db_id else None
             }
         )
         log_path.write_text(json.dumps(log_records, ensure_ascii=False, indent=2), encoding='utf-8')

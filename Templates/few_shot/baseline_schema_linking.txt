@@ -1,16 +1,28 @@
 ### Instructions:
-You are an expert data analyst specializing in database querying. 
+You are an expert data analyst specializing in database querying.
 
 Your task is to identify the minimal set of tables and columns used to write a correct SQL query that answers the question.
 
 Only include columns that are necessary for the SQL query.
 Do not include irrelevant columns.
 Tables should only be included if at least one of their columns is required.
+Include join keys only when they are needed to connect tables in the SQL query.
 
 ### Database Schema:
-The schema describes the structure of the database, including tables, columns, primary keys, foreign keys, and other relevant information.
-Primary keys uniquely identify rows in a table.
-Foreign keys represent relationships between tables and may indicate how tables should be joined.
+The schema is organized into sections such as [DATABASE_ID], [FOREIGN_KEY_RELATIONSHIPS], and [TABLE].
+
+Each column line provides:
+column_name | data_type | key_type | referenced_column | column_description | example_values
+
+Important notes:
+- key_type is one of: PRIMARY KEY, FOREIGN KEY, NONE, NOT_AVAILABLE
+- referenced_column is a full column path such as TableName.ColumnName
+- referenced_column is NONE when the source data shows the column is not a foreign key
+- referenced_column is NOT_AVAILABLE when foreign key information is not provided in the source data
+- the foreign key relationship section is NONE when the source data shows no relationships
+- column_description may be NOT_AVAILABLE
+- example_values may be NOT_AVAILABLE
+- Table names and column names must be used exactly as provided in the schema
 
 ### Hint:
 The hint (if provided) may highlight tables, columns, or relationships that are relevant to the question.
@@ -30,7 +42,7 @@ Format:
 }
 
 Rules (STRICT):
-- Keys must be table names from the database schema.
+- Keys must be table names from the provided database schema.
 - Values must be lists of column names from the schema.
 - Use double quotes for all keys and strings.
 - Do NOT invent tables or columns that do not exist in the schema.
@@ -38,6 +50,8 @@ Rules (STRICT):
 - Do NOT include reasoning.
 - Do NOT include markdown or code blocks.
 - Do NOT include any text before or after the JSON.
+- Only include columns required for writing the SQL query.
+- If a table has no required columns, do NOT include that table.
 
 If no columns can be confidently identified, return:
 {}
@@ -46,146 +60,138 @@ You may reason internally to determine the correct tables and columns, but do NO
 Only output the final JSON object.
 
 ### Example 1:
-Database Schema (table name | column name | data type | is primary key (0: False, 1: True)| foreign key (0: False)):
-| table_name   | column_name        | data_type   |   is_primary_key | foreign_key              |
-|:-------------|:-------------------|:------------|-----------------:|:-------------------------|
-| department   | Department_ID      | INT         |                1 | 0                        |
-| department   | Name               | TEXT        |                0 | 0                        |
-| department   | Creation           | TEXT        |                0 | 0                        |
-| department   | Ranking            | INT         |                0 | 0                        |
-| department   | Budget_in_Billions | REAL        |                0 | 0                        |
-| department   | Num_Employees      | REAL        |                0 | 0                        |
-| head         | head_ID            | INT         |                1 | 0                        |
-| head         | name               | TEXT        |                0 | 0                        |
-| head         | born_state         | TEXT        |                0 | 0                        |
-| head         | age                | REAL        |                0 | 0                        |
-| management   | department_ID      | INT         |                1 | department.Department_ID |
-| management   | head_ID            | INT         |                1 | head.head_ID             |
-| management   | temporary_acting   | TEXT        |                0 | 0                        |
+[DATABASE_ID]
+department_management
 
-Question: 
+[FOREIGN_KEY_RELATIONSHIPS]
+- management.department_ID -> department.Department_ID
+- management.head_ID -> head.head_ID
+
+[TABLE] department
+- Department_ID | INT | PRIMARY KEY | NONE | Unique identifier for a department. | NOT_AVAILABLE
+- Name | TEXT | NONE | NONE | Department name. | NOT_AVAILABLE
+- Creation | TEXT | NONE | NONE | Creation date or period. | NOT_AVAILABLE
+- Ranking | INT | NONE | NONE | Department ranking. | NOT_AVAILABLE
+- Budget_in_Billions | REAL | NONE | NONE | Department budget. | NOT_AVAILABLE
+- Num_Employees | REAL | NONE | NONE | Number of employees. | NOT_AVAILABLE
+
+[TABLE] head
+- head_ID | INT | PRIMARY KEY | NONE | Unique identifier for a department head. | NOT_AVAILABLE
+- name | TEXT | NONE | NONE | Head name. | NOT_AVAILABLE
+- born_state | TEXT | NONE | NONE | State where the head was born. | NOT_AVAILABLE
+- age | REAL | NONE | NONE | Head age. | NOT_AVAILABLE
+
+[TABLE] management
+- department_ID | INT | FOREIGN KEY | department.Department_ID | Department managed by a head. | NOT_AVAILABLE
+- head_ID | INT | FOREIGN KEY | head.head_ID | Head managing the department. | NOT_AVAILABLE
+- temporary_acting | TEXT | NONE | NONE | Whether the head is temporary acting. | NOT_AVAILABLE
+
+Question:
 Which department currently headed by a temporary acting manager has the largest number of employees, and how many employees does it have?
 
-Hint (may be empty): 
+Hint (may be empty):
 No hint
 
-response: 
+response:
 {
   "relevant_columns": {
-    "department": ["Name", "Num_Employees", "Department_ID"],
+    "department": ["Department_ID", "Name", "Num_Employees"],
     "management": ["department_ID", "temporary_acting"]
   }
 }
 
 ### Example 2:
-Database Schema (table name | column name | data type | is primary key (0: False, 1: True)| foreign key (0: False)):
-| table_name   | column_name        | data_type   |   is_primary_key | foreign_key       |
-|:-------------|:-------------------|:------------|-----------------:|:------------------|
-| matches      | best_of            | INT         |                0 | 0                 |
-| matches      | draw_size          | INT         |                0 | 0                 |
-| matches      | loser_age          | FLOAT       |                0 | 0                 |
-| matches      | loser_entry        | TEXT        |                0 | 0                 |
-| matches      | loser_hand         | TEXT        |                0 | 0                 |
-| matches      | loser_ht           | INT         |                0 | 0                 |
-| matches      | loser_id           | INT         |                0 | players.player_id |
-| matches      | loser_ioc          | TEXT        |                0 | 0                 |
-| matches      | loser_name         | TEXT        |                0 | 0                 |
-| matches      | loser_rank         | INT         |                0 | 0                 |
-| matches      | loser_rank_points  | INT         |                0 | 0                 |
-| matches      | loser_seed         | INT         |                0 | 0                 |
-| matches      | match_num          | INT         |                0 | 0                 |
-| matches      | minutes            | INT         |                0 | 0                 |
-| matches      | round              | TEXT        |                0 | 0                 |
-| matches      | score              | TEXT        |                0 | 0                 |
-| matches      | surface            | TEXT        |                0 | 0                 |
-| matches      | tourney_date       | DATE        |                0 | 0                 |
-| matches      | tourney_id         | TEXT        |                0 | 0                 |
-| matches      | tourney_level      | TEXT        |                0 | 0                 |
-| matches      | tourney_name       | TEXT        |                0 | 0                 |
-| matches      | winner_age         | FLOAT       |                0 | 0                 |
-| matches      | winner_entry       | TEXT        |                0 | 0                 |
-| matches      | winner_hand        | TEXT        |                0 | 0                 |
-| matches      | winner_ht          | INT         |                0 | 0                 |
-| matches      | winner_id          | INT         |                0 | players.player_id |
-| matches      | winner_ioc         | TEXT        |                0 | 0                 |
-| matches      | winner_name        | TEXT        |                0 | 0                 |
-| matches      | winner_rank        | INT         |                0 | 0                 |
-| matches      | winner_rank_points | INT         |                0 | 0                 |
-| matches      | winner_seed        | INT         |                0 | 0                 |
-| matches      | year               | INT         |                0 | 0                 |
-| players      | player_id          | INT         |                1 | 0                 |
-| players      | first_name         | TEXT        |                0 | 0                 |
-| players      | last_name          | TEXT        |                0 | 0                 |
-| players      | hand               | TEXT        |                0 | 0                 |
-| players      | birth_date         | DATE        |                0 | 0                 |
-| players      | country_code       | TEXT        |                0 | 0                 |
-| rankings     | ranking_date       | DATE        |                0 | 0                 |
-| rankings     | ranking            | INT         |                0 | 0                 |
-| rankings     | player_id          | INT         |                0 | players.player_id |
-| rankings     | ranking_points     | INT         |                0 | 0                 |
-| rankings     | tours              | INT         |                0 | 0                 |
+[DATABASE_ID]
+tennis_matches
+
+[FOREIGN_KEY_RELATIONSHIPS]
+- matches.loser_id -> players.player_id
+- matches.winner_id -> players.player_id
+- rankings.player_id -> players.player_id
+
+[TABLE] matches
+- best_of | INT | NONE | NONE | Number of sets required to win the match. | 3, 5
+- loser_id | INT | FOREIGN KEY | players.player_id | Player ID of the loser. | 101, 205
+- winner_id | INT | FOREIGN KEY | players.player_id | Player ID of the winner. | 33, 101
+- winner_rank_points | INT | NONE | NONE | Winner ranking points recorded for the match. | 1200, 980
+- winner_name | TEXT | NONE | NONE | Winner player name. | Roger Federer, Rafael Nadal
+
+[TABLE] players
+- player_id | INT | PRIMARY KEY | NONE | Unique identifier for a player. | 33, 101, 205
+- first_name | TEXT | NONE | NONE | Player first name. | Roger, Rafael, Novak
+- last_name | TEXT | NONE | NONE | Player last name. | Federer, Nadal, Djokovic
+- birth_date | DATE | NONE | NONE | Player birth date. | 1981-08-08, 1986-06-03
+- country_code | TEXT | NONE | NONE | Country code for the player. | SUI, ESP, SRB
+
+[TABLE] rankings
+- ranking_date | DATE | NONE | NONE | Ranking date. | 2018-01-01, 2018-01-08
+- ranking | INT | NONE | NONE | Player ranking on the ranking date. | 1, 2, 3
+- player_id | INT | FOREIGN KEY | players.player_id | Player ID for the ranking row. | 33, 101, 205
+- ranking_points | INT | NONE | NONE | Ranking points for the player. | 9605, 8940
 
 Question:
 What is the first name, country code, and birth date of the player with the most winner rank points across all matches?
 
-Hint (may be empty): 
+Hint (may be empty):
 No hint
 
 response:
 {
   "relevant_columns": {
-    "players": ["first_name", "country_code", "birth_date", "player_id"],
+    "players": ["player_id", "first_name", "birth_date", "country_code"],
     "matches": ["winner_id", "winner_rank_points"]
   }
 }
 
 ### Example 3:
-Database Schema (table name | column name | data type | is primary key (0: False, 1: True)| foreign key (0: False)):
-| table_name   | column_name   | data_type   |   is_primary_key | foreign_key   |
-|:-------------|:--------------|:------------|-----------------:|:--------------|
-| event        | ID            | INT         |                1 | 0             |
-| event        | Name          | TEXT        |                0 | 0             |
-| event        | Stadium_ID    | INT         |                0 | stadium.ID    |
-| event        | Year          | TEXT        |                0 | 0             |
-| record       | ID            | INT         |                0 | 0             |
-| record       | Result        | TEXT        |                0 | 0             |
-| record       | Swimmer_ID    | INT         |                1 | swimmer.ID    |
-| record       | Event_ID      | INT         |                1 | event.ID      |
-| stadium      | ID            | INT         |                1 | 0             |
-| stadium      | name          | TEXT        |                0 | 0             |
-| stadium      | Capacity      | INT         |                0 | 0             |
-| stadium      | City          | TEXT        |                0 | 0             |
-| stadium      | Country       | TEXT        |                0 | 0             |
-| stadium      | Opening_year  | INT         |                0 | 0             |
-| swimmer      | ID            | INT         |                1 | 0             |
-| swimmer      | name          | TEXT        |                0 | 0             |
-| swimmer      | Nationality   | TEXT        |                0 | 0             |
-| swimmer      | meter_100     | REAL        |                0 | 0             |
-| swimmer      | meter_200     | TEXT        |                0 | 0             |
-| swimmer      | meter_300     | TEXT        |                0 | 0             |
-| swimmer      | meter_400     | TEXT        |                0 | 0             |
-| swimmer      | meter_500     | TEXT        |                0 | 0             |
-| swimmer      | meter_600     | TEXT        |                0 | 0             |
-| swimmer      | meter_700     | TEXT        |                0 | 0             |
-| swimmer      | Time          | TEXT        |                0 | 0             |
+[DATABASE_ID]
+swimming_records
 
-Question: 
+[FOREIGN_KEY_RELATIONSHIPS]
+- event.Stadium_ID -> stadium.ID
+- record.Event_ID -> event.ID
+- record.Swimmer_ID -> swimmer.ID
+
+[TABLE] event
+- ID | INT | PRIMARY KEY | NONE | Unique identifier for an event. | 1, 2, 3
+- Name | TEXT | NONE | NONE | Event name. | 100m freestyle, 200m butterfly
+- Stadium_ID | INT | FOREIGN KEY | stadium.ID | Stadium where the event is held. | 1, 5
+- Year | TEXT | NONE | NONE | Year of the event. | 2012, 2016
+
+[TABLE] record
+- ID | INT | NONE | NONE | Record identifier. | 10, 11
+- Result | TEXT | NONE | NONE | Result of the swimmer in the event. | loss, win
+- Swimmer_ID | INT | FOREIGN KEY | swimmer.ID | Swimmer involved in the record. | 1, 2
+- Event_ID | INT | FOREIGN KEY | event.ID | Event for the record. | 1, 3
+
+[TABLE] stadium
+- ID | INT | PRIMARY KEY | NONE | Unique identifier for a stadium. | 1, 5
+- name | TEXT | NONE | NONE | Stadium name. | National Aquatics Center, Olympic Pool
+- Capacity | INT | NONE | NONE | Stadium capacity. | 17000, 12000
+- City | TEXT | NONE | NONE | City of the stadium. | Beijing, London
+- Country | TEXT | NONE | NONE | Country of the stadium. | China, UK
+
+[TABLE] swimmer
+- ID | INT | PRIMARY KEY | NONE | Unique identifier for a swimmer. | 1, 2, 3
+- name | TEXT | NONE | NONE | Swimmer name. | Alice, Bob
+- Nationality | TEXT | NONE | NONE | Swimmer nationality. | USA, AUS
+
+Question:
 Which stadium hosted events where the swimmer with ID 1 had a loss?
 
-Hint (may be empty): 
+Hint (may be empty):
 No hint
 
 response:
 {
   "relevant_columns": {
-    "stadium": ["name", "ID"],
-    "event": ["Stadium_ID", "ID"],
+    "stadium": ["ID", "name"],
+    "event": ["ID", "Stadium_ID"],
     "record": ["Event_ID", "Result", "Swimmer_ID"]
   }
 }
 
 ### INPUT:
-Database Schema (table name | column name | data type | is primary key (0: False, 1: True)| foreign key (0: False)):
 {DATABASE_SCHEMA}
 
 Question:

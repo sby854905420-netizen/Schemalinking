@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 import pandas as pd
@@ -11,6 +9,23 @@ import pandas as pd
 from config import *
 from Llm.llm_loader import LLM
 from Run.logging_utils import log_run_configuration, setup_task_logger
+from Utils.tools import (
+    build_column_key,
+    build_db_id_filter,
+    build_db_schema_text,
+    get_key_columns,
+    get_qdrant_client,
+    get_row_value,
+    load_db_info_index,
+    load_schema_dataframe_from_db_info,
+    normalize_response_text,
+    query_qdrant,
+    render_prompt,
+    resolve_hint,
+    resolve_input_path,
+    resolve_output_path,
+    resolve_prompt_token_cap,
+)
 
 SUPPORTED_METHODS = {"zero_shot", "few_shot"}
 INPUT_FILE_PATTERNS = (
@@ -33,7 +48,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-generation-num", dest="max_generation_num", type=int, default=None)
     parser.add_argument("--input-path", dest="input_path", type=Path, default=None)
     parser.add_argument("--logs-dir", dest="logs_dir", type=Path, default=None)
-    parser.add_argument("--table-schema-dir", dest="table_schema_dir", type=Path, default=None)
+    parser.add_argument("--db-info-path", dest="db_info_path", type=Path, default=None)
+    parser.add_argument("--qdrant-path", dest="qdrant_path", type=Path, default=None)
     parser.add_argument("--output-path", dest="output_path", type=Path, default=None)
     return parser.parse_args()
 
@@ -58,121 +74,118 @@ def load_prompt_templates(method_name: str) -> dict[str, str]:
     }
 
 
-def extract_timestamp(path: Path, dataset_name: str) -> str | None:
-    timestamp_pattern = re.compile(
-        TIMESTAMP_PATTERN_TEMPLATE.format(dataset_name=re.escape(dataset_name))
-    )
-    match = timestamp_pattern.search(path.name)
-    if match is None:
-        return None
-    return match.group(1)
+def load_qdrant_collection_name(qdrant_path: Path) -> str:
+    meta_path = qdrant_path / "meta.json"
+    if not meta_path.is_file():
+        raise FileNotFoundError(f"Could not find Qdrant metadata file at {meta_path}.")
+
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    collections = meta.get("collections")
+    if not isinstance(collections, dict) or not collections:
+        raise ValueError(f"Could not resolve a collection name from {meta_path}.")
+
+    return next(iter(collections))
 
 
-def find_model_dir(logs_dir: Path, model_name: str) -> Path:
-    direct_path = logs_dir / model_name / "Database_Retrival"
-    if direct_path.is_dir():
-        return direct_path
-
-    model_leaf_name = Path(model_name).name
-    matching_dirs = sorted(
-        path
-        for path in logs_dir.rglob("Database_Retrival")
-        if path.is_dir() and path.parent.name == model_leaf_name
-    )
-    if not matching_dirs:
-        raise FileNotFoundError(
-            f"Could not find a Database_Retrival directory for model '{model_name}' under {logs_dir}."
-        )
-    if len(matching_dirs) > 1:
-        matched_paths = "\n".join(str(path) for path in matching_dirs)
-        raise ValueError(
-            f"Found multiple Database_Retrival directories for model '{model_name}'. Please disambiguate:\n{matched_paths}"
-        )
-    return matching_dirs[0]
+def get_point_payload(point: Any) -> dict[str, Any]:
+    payload = getattr(point, "payload", None)
+    if payload is None and isinstance(point, dict):
+        payload = point.get("payload")
+    return dict(payload or {})
 
 
-def find_result_file(model_dir: Path, dataset_name: str) -> Path:
-    candidate_files: list[tuple[str, Path]] = []
-
-    for pattern_template in INPUT_FILE_PATTERNS:
-        pattern = pattern_template.format(dataset_name=dataset_name, timestamp="*")
-        for path in model_dir.glob(pattern):
-            file_timestamp = extract_timestamp(path, dataset_name)
-            if file_timestamp is None:
-                continue
-            candidate_files.append((file_timestamp, path))
-
-    if not candidate_files:
-        expected_patterns = ", ".join(
-            pattern_template.format(dataset_name=dataset_name, timestamp="*")
-            for pattern_template in INPUT_FILE_PATTERNS
-        )
-        raise FileNotFoundError(f"Could not find any of [{expected_patterns}] under {model_dir}.")
-
-    candidate_files.sort(key=lambda item: item[0], reverse=True)
-    return candidate_files[0][1]
+def count_prompt_tokens(answer_llm: Any, prompt: str) -> int:
+    try:
+        return answer_llm.count_input_tokens(prompt)
+    except (NotImplementedError, AttributeError):
+        return max(1, len(prompt) // 4)
 
 
-def resolve_input_path(
-    input_path: Path | None,
-    logs_dir: Path,
-    answer_llm_name: str,
-    dataset_name: str,
-) -> Path:
-    if input_path is not None:
-        return input_path
-
-    model_dir = find_model_dir(logs_dir=logs_dir, model_name=answer_llm_name)
-    return find_result_file(model_dir=model_dir, dataset_name=dataset_name)
-
-
-def resolve_output_path(
-    output_path: Path | None,
-    answer_llm_name: str,
-    dataset_name: str,
-    method_name: str,
-) -> Path:
-    if output_path is not None:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        return output_path
-
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_dir = PROJECT_ROOT / "Logs" / answer_llm_name
-    save_dir.mkdir(parents=True, exist_ok=True)
-    return save_dir / f"{method_name}_table2column_{dataset_name}_{run_id}.json"
-
-
-def get_row_value(row: pd.Series, *keys: str) -> Any:
-    for key in keys:
-        value = row.get(key)
-        if pd.notna(value):
-            return value
-    return None
-
-
-def load_database_schema(table_schema_dir: Path, predict_db_id: str) -> pd.DataFrame:
-    schema_path = table_schema_dir / f"{predict_db_id}.csv"
-    return pd.read_csv(schema_path)
-
-
-def build_prompt(prompt_template: str, database_schema: str, question: str) -> str:
-    return (
-        prompt_template
-        .replace("{DATABASE_SCHEMA}", database_schema)
-        .replace("{QUESTION}", question)
-        .replace("{HINT}", "No hint")
+def score_relevant_columns_for_db(
+    question: str,
+    predict_db_id: str,
+    schema_df: pd.DataFrame,
+    embedder: Any,
+    qdrant_client: Any,
+    qdrant_collection_name: str,
+) -> list[tuple[str, str]]:
+    query_vector = embedder.encode(question, convert_to_list=True)
+    ranked_points = query_qdrant(
+        client=qdrant_client,
+        collection_name=qdrant_collection_name,
+        query_vector=query_vector,
+        top_k=max(1, len(schema_df)),
+        query_filter=build_db_id_filter([predict_db_id]),
     )
 
+    valid_column_keys = {build_column_key(row) for _, row in schema_df.iterrows()}
+    ranked_column_keys: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for point in ranked_points:
+        payload = get_point_payload(point)
+        column_key = (
+            str(payload.get("table_name", "")).strip(),
+            str(payload.get("column_name", "")).strip(),
+        )
+        if column_key in seen or column_key not in valid_column_keys:
+            continue
+        seen.add(column_key)
+        ranked_column_keys.append(column_key)
 
-def normalize_response(response_text: str) -> str:
-    normalized_response = response_text.replace("```", "").replace("json", "").strip()
-    if "</think>" in normalized_response:
-        normalized_response = normalized_response.split("</think>")[-1].strip()
-    return normalized_response
+    return ranked_column_keys
+
+
+def select_table_prompt_columns(
+    schema_df: pd.DataFrame,
+    predict_db_id: str,
+    question: str,
+    hint: str,
+    prompt_template: str,
+    answer_llm: Any,
+    embedder: Any,
+    qdrant_client: Any,
+    qdrant_collection_name: str,
+) -> set[tuple[str, str]]:
+    selected_column_keys = get_key_columns(schema_df)
+    prompt_token_cap = resolve_prompt_token_cap(answer_llm.max_input_length)
+
+    ranked_column_keys = score_relevant_columns_for_db(
+        question=question,
+        predict_db_id=predict_db_id,
+        schema_df=schema_df,
+        embedder=embedder,
+        qdrant_client=qdrant_client,
+        qdrant_collection_name=qdrant_collection_name,
+    )
+
+    for column_key in ranked_column_keys:
+        if column_key in selected_column_keys:
+            continue
+
+        proposed_column_keys = set(selected_column_keys)
+        proposed_column_keys.add(column_key)
+        proposed_schema = build_db_schema_text(
+            schema_df=schema_df,
+            db_id=predict_db_id,
+            include_selected_tables=False,
+            selected_column_keys=proposed_column_keys,
+            include_empty_tables=True,
+        )
+        proposed_prompt = render_prompt(
+            prompt_template,
+            DATABASE_SCHEMA=proposed_schema,
+            QUESTION=question,
+            HINT=hint,
+        )
+        proposed_tokens = count_prompt_tokens(answer_llm, proposed_prompt)
+        if proposed_tokens <= prompt_token_cap:
+            selected_column_keys = proposed_column_keys
+
+    return selected_column_keys
 
 
 def parse_table_response(response_text: str) -> list:
-    nor_response_text = normalize_response(response_text)
+    nor_response_text = normalize_response_text(response_text)
     try:
         response_json = json.loads(nor_response_text)
     except json.JSONDecodeError:
@@ -192,7 +205,7 @@ def parse_table_response(response_text: str) -> list:
     return relevant_table_list
 
 def parse_column_response(response_text: str) -> dict:
-    nor_response_text = normalize_response(response_text)
+    nor_response_text = normalize_response_text(response_text)
     try:
         response_json = json.loads(nor_response_text)
     except json.JSONDecodeError:
@@ -245,7 +258,11 @@ def run_table2column(
     dataset_df: pd.DataFrame,
     prompt_templates: dict[str, str],
     output_path: Path,
-    table_schema_dir: Path,
+    dataset_name: str,
+    db_info_index: dict[str, dict[str, Any]],
+    embedder: Any,
+    qdrant_client: Any,
+    qdrant_collection_name: str,
     answer_llm: Any,
     answer_llm_name: str,
     provider: str,
@@ -270,8 +287,13 @@ def run_table2column(
             )
             continue
         predict_db_id = str(predict_db_id)
+        hint = resolve_hint(row)
         try:
-            total_schema_df = load_database_schema(table_schema_dir, predict_db_id)
+            total_schema_df = load_schema_dataframe_from_db_info(
+                predict_db_id=predict_db_id,
+                dataset_name=dataset_name,
+                db_info_index=db_info_index,
+            )
         except FileNotFoundError:
             append_log_entry(
                 log_records=log_records,
@@ -286,10 +308,28 @@ def run_table2column(
             )
             continue
 
-        table_prompt = build_prompt(
+        table_prompt_column_keys = select_table_prompt_columns(
+            schema_df=total_schema_df,
+            predict_db_id=predict_db_id,
+            question=row["question"],
+            hint=hint,
+            prompt_template=prompt_templates["table"],
+            answer_llm=answer_llm,
+            embedder=embedder,
+            qdrant_client=qdrant_client,
+            qdrant_collection_name=qdrant_collection_name,
+        )
+        table_prompt = render_prompt(
             prompt_templates["table"],
-            total_schema_df.to_markdown(index=False),
-            row["question"],
+            DATABASE_SCHEMA=build_db_schema_text(
+                schema_df=total_schema_df,
+                db_id=predict_db_id,
+                include_selected_tables=False,
+                selected_column_keys=table_prompt_column_keys,
+                include_empty_tables=True,
+            ),
+            QUESTION=row["question"],
+            HINT=hint,
         )
         table_response_text = answer_llm.query(table_prompt)
         relevant_table_list = parse_table_response(table_response_text)
@@ -299,10 +339,15 @@ def run_table2column(
         else:
             relevant_schema_df = total_schema_df
 
-        column_prompt = build_prompt(
+        column_prompt = render_prompt(
             prompt_templates["column"],
-            relevant_schema_df.to_markdown(index=False),
-            row["question"],
+            DATABASE_SCHEMA=build_db_schema_text(
+                schema_df=relevant_schema_df,
+                db_id=predict_db_id,
+                include_selected_tables=True,
+            ),
+            QUESTION=row["question"],
+            HINT=hint,
         )
         column_response_text = answer_llm.query(column_prompt)
         predict_columns = parse_column_response(column_response_text)
@@ -333,18 +378,24 @@ def main() -> None:
 
     dataset_root = PROJECT_ROOT / "Data" / dataset_name
     logs_dir = args.logs_dir or (PROJECT_ROOT / "Logs")
-    table_schema_dir = args.table_schema_dir or (dataset_root / "Table_schema_csv")
+    db_info_path = args.db_info_path or (dataset_root / "db_info.json")
+    qdrant_path = args.qdrant_path or (dataset_root / "qdrant_column_index")
+    db_info_index = load_db_info_index(db_info_path)
+    qdrant_collection_name = load_qdrant_collection_name(qdrant_path)
     input_path = resolve_input_path(
         input_path=args.input_path,
         logs_dir=logs_dir,
         answer_llm_name=answer_llm_name,
         dataset_name=dataset_name,
+        input_file_patterns=INPUT_FILE_PATTERNS,
+        timestamp_pattern_template=TIMESTAMP_PATTERN_TEMPLATE,
     )
     output_path = resolve_output_path(
         output_path=args.output_path,
         answer_llm_name=answer_llm_name,
         dataset_name=dataset_name,
-        method_name=method_name,
+        output_stem=f"{method_name}_table2column",
+        project_root=PROJECT_ROOT,
     )
     logger, logger_path = setup_task_logger("table2column", output_path)
 
@@ -364,7 +415,9 @@ def main() -> None:
             "Input path": input_path,
             "Table prompt template": PROJECT_ROOT / "Templates" / method_name / "extract_relevant_tables.txt",
             "Column prompt template": PROJECT_ROOT / "Templates" / method_name / "extract_relevant_columns.txt",
-            "Table schema dir": table_schema_dir,
+            "DB info path": db_info_path,
+            "Qdrant path": qdrant_path,
+            "Qdrant collection": qdrant_collection_name,
             "Max input length": max_input_length,
             "Max generation num": max_generation_num,
             "Logger path": logger_path,
@@ -378,12 +431,20 @@ def main() -> None:
         max_generation_num=max_generation_num,
         query_settings=BASELINE_SCHEMA_LINKING_QUERY_SETTINGS,
     )
+    from Llm.embedding_model_loader import EmbeddingModelLoader
+
+    embedder = EmbeddingModelLoader()
+    qdrant_client = get_qdrant_client(qdrant_path)
 
     processed_count = run_table2column(
         dataset_df=dataset_df,
         prompt_templates=prompt_templates,
         output_path=output_path,
-        table_schema_dir=table_schema_dir,
+        dataset_name=dataset_name,
+        db_info_index=db_info_index,
+        embedder=embedder,
+        qdrant_client=qdrant_client,
+        qdrant_collection_name=qdrant_collection_name,
         answer_llm=answer_llm,
         answer_llm_name=answer_llm_name,
         provider=provider,
