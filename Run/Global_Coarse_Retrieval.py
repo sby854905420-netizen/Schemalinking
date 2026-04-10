@@ -131,6 +131,28 @@ def resolve_top_k(
     return max(1, min(resolved_top_k, global_cap))
 
 
+def resolve_external_knowledge_for_prompt(
+    dataset_name: str,
+    external_knowledge: Any,
+    documents_dir: Path | None = None,
+) -> Any:
+    if dataset_name.lower() != "spider2":
+        return external_knowledge
+
+    if not isinstance(external_knowledge, str):
+        return external_knowledge
+
+    document_name = external_knowledge.strip()
+    if not document_name or documents_dir is None:
+        return external_knowledge
+
+    document_path = documents_dir / document_name
+    if not document_path.is_file():
+        return external_knowledge
+
+    return document_path.read_text(encoding="utf-8").strip()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Iterative coarse database retrieval.")
     parser.add_argument("--dataset-name", dest="dataset_name", type=str, default=None)
@@ -590,6 +612,7 @@ def main() -> None:
     dataset_root = PROJECT_ROOT / "Data" / dataset_name
     qdrant_path = dataset_root / "qdrant_column_index"
     schema_dir = dataset_root / "Column_level_schema"
+    documents_dir = dataset_root / "documents"
     dataset_path = args.input_path or (dataset_root / "gold_sl.json")
 
     dataset_df = pd.read_json(dataset_path)
@@ -624,6 +647,7 @@ def main() -> None:
             "Qdrant path": qdrant_path,
             "Qdrant collection": collection_name,
             "Schema dir": schema_dir,
+            "Documents dir": documents_dir,
             "Top-k cap": TOP_KD_CAP,
             "Top-k schedule": "<=20:4, <=50:5, <=100:6, <=200:6, <=500:7, <=1000:8, <=5000:10, >5000:12",
             "Full schema threshold": FULL_SCHEMA_COLUMN_THRESHOLD,
@@ -651,6 +675,11 @@ def main() -> None:
 
 
     for _,row in tqdm(dataset_df.iterrows(),total=len(dataset_df)):
+        external_knowledge = resolve_external_knowledge_for_prompt(
+            dataset_name=dataset_name,
+            external_knowledge=row.get('external_knowledge'),
+            documents_dir=documents_dir,
+        )
         # First Round for all databases
         # step 1: Global Highly Relevant columns (HRC) Retrival
         query_embedding = embedder.encode(row['question'], convert_to_list=True)
@@ -672,7 +701,7 @@ def main() -> None:
             CFCD_db_ids,
             prompt_template,
             top_k=candidate_db_top_k,
-            external_knowledge=row.get('external_knowledge'),
+            external_knowledge=external_knowledge,
             schema_dir=schema_dir,
             qdrant_client=client,
             collection_name=collection_name,
@@ -698,7 +727,7 @@ def main() -> None:
             CFCD_db_ids,
             prompt_template,
             top_k=1,
-            external_knowledge=row.get('external_knowledge'),
+            external_knowledge=external_knowledge,
             schema_dir=schema_dir,
             qdrant_client=client,
             collection_name=collection_name,

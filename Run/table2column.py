@@ -87,6 +87,46 @@ def load_qdrant_collection_name(qdrant_path: Path) -> str:
     return next(iter(collections))
 
 
+def resolve_external_knowledge_for_prompt(
+    dataset_name: str,
+    source: Any,
+    documents_dir: Path | None = None,
+    key: str = "external_knowledge",
+) -> Any:
+    if dataset_name.lower() != "spider2":
+        return source
+
+    if hasattr(source, "get"):
+        external_knowledge = source.get(key)
+        if external_knowledge is None:
+            return source
+    else:
+        external_knowledge = source
+
+    if not isinstance(external_knowledge, str):
+        return source
+
+    document_name = external_knowledge.strip()
+    if not document_name or documents_dir is None:
+        return source
+
+    document_path = documents_dir / document_name
+    if not document_path.is_file():
+        return source
+
+    document_text = document_path.read_text(encoding="utf-8").strip()
+
+    if hasattr(source, "copy"):
+        resolved_source = source.copy()
+        if hasattr(resolved_source, "loc"):
+            resolved_source.loc[key] = document_text
+        else:
+            resolved_source[key] = document_text
+        return resolved_source
+
+    return document_text
+
+
 def get_point_payload(point: Any) -> dict[str, Any]:
     payload = getattr(point, "payload", None)
     if payload is None and isinstance(point, dict):
@@ -259,6 +299,7 @@ def run_table2column(
     prompt_templates: dict[str, str],
     output_path: Path,
     dataset_name: str,
+    documents_dir: Path,
     db_info_index: dict[str, dict[str, Any]],
     embedder: Any,
     qdrant_client: Any,
@@ -287,7 +328,12 @@ def run_table2column(
             )
             continue
         predict_db_id = str(predict_db_id)
-        hint = resolve_hint(row)
+        hint_source = resolve_external_knowledge_for_prompt(
+            dataset_name=dataset_name,
+            source=row,
+            documents_dir=documents_dir,
+        )
+        hint = resolve_hint(hint_source)
         try:
             total_schema_df = load_schema_dataframe_from_db_info(
                 predict_db_id=predict_db_id,
@@ -377,6 +423,7 @@ def main() -> None:
     max_generation_num = args.max_generation_num or MAX_GENERATEION_NUM
 
     dataset_root = PROJECT_ROOT / "Data" / dataset_name
+    documents_dir = dataset_root / "documents"
     logs_dir = args.logs_dir or (PROJECT_ROOT / "Logs")
     db_info_path = args.db_info_path or (dataset_root / "db_info.json")
     qdrant_path = args.qdrant_path or (dataset_root / "qdrant_column_index")
@@ -418,6 +465,7 @@ def main() -> None:
             "DB info path": db_info_path,
             "Qdrant path": qdrant_path,
             "Qdrant collection": qdrant_collection_name,
+            "Documents dir": documents_dir,
             "Max input length": max_input_length,
             "Max generation num": max_generation_num,
             "Logger path": logger_path,
@@ -441,6 +489,7 @@ def main() -> None:
         prompt_templates=prompt_templates,
         output_path=output_path,
         dataset_name=dataset_name,
+        documents_dir=documents_dir,
         db_info_index=db_info_index,
         embedder=embedder,
         qdrant_client=qdrant_client,
