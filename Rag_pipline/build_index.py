@@ -222,6 +222,26 @@ def batched(values: list[Any], batch_size: int) -> Iterable[list[Any]]:
         yield values[start : start + batch_size]
 
 
+def resolve_embedding_tokenizer(embedder: EmbeddingModelLoader):
+    if getattr(embedder, "tokenizer", None) is not None:
+        return embedder.tokenizer
+
+    model = getattr(embedder, "model", None)
+    return getattr(model, "tokenizer", None)
+
+
+def truncate_text_by_tokens(text: str, tokenizer, max_tokens: int) -> tuple[str, bool]:
+    if tokenizer is None or max_tokens <= 0 or not text:
+        return text, False
+
+    token_ids = tokenizer.encode(text, add_special_tokens=False, truncation=False)
+    if len(token_ids) <= max_tokens:
+        return text, False
+
+    truncated_text = tokenizer.decode(token_ids[:max_tokens], skip_special_tokens=True)
+    return truncated_text, True
+
+
 def build_index(args: argparse.Namespace) -> None:
     schema_dir = args.schema_dir.resolve()
     if not schema_dir.exists():
@@ -240,19 +260,30 @@ def build_index(args: argparse.Namespace) -> None:
         device=args.device,
         trust_remote_code=True,
     )
+    tokenizer = resolve_embedding_tokenizer(embedder)
     client = get_qdrant_client(qdrant_path)
 
     from qdrant_client.http import models
 
     vector_size: int | None = None
     total_points = 0
+    truncated_documents = 0
     with tqdm(total=len(column_files), desc="Indexing columns", unit="column") as progress_bar:
         for batch_files in batched(column_files, args.upsert_batch_size):
             normalized_records = [
                 normalize_record(load_column_record(column_file), column_file)
                 for column_file in batch_files
             ]
-            documents = [build_document(record) for record in normalized_records]
+            documents = []
+            for record in normalized_records:
+                document, was_truncated = truncate_text_by_tokens(
+                    build_document(record),
+                    tokenizer=tokenizer,
+                    max_tokens=MAX_INPUT_LENGTH,
+                )
+                documents.append(document)
+                if was_truncated:
+                    truncated_documents += 1
             payloads = [build_payload(record) for record in normalized_records]
             embeddings = embedder.batch_encode(documents, batch_size=args.batch_size)
 
@@ -276,7 +307,7 @@ def build_index(args: argparse.Namespace) -> None:
             client.upsert(collection_name=collection_name, points=points, wait=True)
             total_points += len(points)
             progress_bar.update(len(batch_files))
-            progress_bar.set_postfix(indexed=total_points)
+            progress_bar.set_postfix(indexed=total_points, truncated=truncated_documents)
 
     if vector_size is None:
         raise RuntimeError(f"Failed to create embeddings from {schema_dir}")
@@ -286,6 +317,7 @@ def build_index(args: argparse.Namespace) -> None:
     print(f"Indexed columns: {total_points}")
     print(f"Vector size: {vector_size}")
     print(f"Embedding model: {args.model_name}")
+    print(f"Truncated documents: {truncated_documents}")
     print(f"Schema dir: {schema_dir}")
     print(f"Qdrant path: {qdrant_path}")
 
