@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import json
 from pathlib import Path
 from typing import Any
@@ -19,7 +20,6 @@ from Utils.tools import (
     render_prompt,
     resolve_hint,
     resolve_input_path,
-    resolve_output_path,
 )
 
 SUPPORTED_METHODS = {"zero_shot", "few_shot"}
@@ -179,7 +179,7 @@ def main() -> None:
     max_generation_num = args.max_generation_num or MAX_GENERATEION_NUM
 
     dataset_root = PROJECT_ROOT / "Data" / dataset_name
-    logs_dir = args.logs_dir or (PROJECT_ROOT / "Logs")
+    logs_dir = args.logs_dir or (PROJECT_ROOT / "Logs" / dataset_name)
     prompt_path = PROJECT_ROOT / "Templates" / method_name / "baseline_schema_linking.txt"
     db_info_path = args.db_info_path or (dataset_root / "db_info.json")
     input_path = resolve_input_path(
@@ -190,13 +190,14 @@ def main() -> None:
         input_file_patterns=INPUT_FILE_PATTERNS,
         timestamp_pattern_template=TIMESTAMP_PATTERN_TEMPLATE,
     )
-    output_path = resolve_output_path(
-        output_path=args.output_path,
-        answer_llm_name=answer_llm_name,
-        dataset_name=dataset_name,
-        output_stem=f"{method_name}_baseline_schema_linking",
-        project_root=PROJECT_ROOT,
-    )
+    if args.output_path is not None:
+        output_path = args.output_path
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = PROJECT_ROOT / "Logs" / dataset_name / answer_llm_name
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / f"{method_name}_baseline_schema_linking_{dataset_name}_{run_id}.json"
     logger, logger_path = setup_task_logger("baseline_schema_linking", output_path)
 
     dataset_df = load_dataset(input_path)

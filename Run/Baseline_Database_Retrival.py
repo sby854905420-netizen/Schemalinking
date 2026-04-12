@@ -157,7 +157,7 @@ def main() -> None:
     )
 
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    logs_dir = PROJECT_ROOT / "Logs" / answer_llm_name / "Database_Retrival"
+    logs_dir = PROJECT_ROOT / "Logs" / dataset_name / answer_llm_name / "Database_Retrival"
     logs_dir.mkdir(parents=True, exist_ok=True)
     log_path = logs_dir / f"baseline_database_retrival_{dataset_name}_{run_id}.json"
     logger, logger_path = setup_task_logger("baseline_database_retrival", log_path)

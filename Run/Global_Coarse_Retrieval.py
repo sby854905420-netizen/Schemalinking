@@ -698,7 +698,7 @@ def main() -> None:
     prompt_template = prompt_path.read_text(encoding='utf-8').strip()
     
     if args.output_path is None:
-        logs_dir = PROJECT_ROOT / 'Logs' / answer_llm_name / "Database_Retrival"
+        logs_dir = PROJECT_ROOT / 'Logs' / dataset_name / answer_llm_name / "Database_Retrival"
         logs_dir.mkdir(parents=True, exist_ok=True)
         log_path = logs_dir / f'iterative_database_retrival_{dataset_name}_{run_id}.json'
     else:

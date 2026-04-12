@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import json
 from pathlib import Path
 from typing import Any
@@ -23,7 +24,6 @@ from Utils.tools import (
     render_prompt,
     resolve_hint,
     resolve_input_path,
-    resolve_output_path,
     resolve_prompt_token_cap,
 )
 
@@ -424,7 +424,7 @@ def main() -> None:
 
     dataset_root = PROJECT_ROOT / "Data" / dataset_name
     documents_dir = dataset_root / "documents"
-    logs_dir = args.logs_dir or (PROJECT_ROOT / "Logs")
+    logs_dir = args.logs_dir or (PROJECT_ROOT / "Logs" / dataset_name)
     db_info_path = args.db_info_path or (dataset_root / "db_info.json")
     qdrant_path = args.qdrant_path or (dataset_root / "qdrant_column_index")
     db_info_index = load_db_info_index(db_info_path)
@@ -437,13 +437,14 @@ def main() -> None:
         input_file_patterns=INPUT_FILE_PATTERNS,
         timestamp_pattern_template=TIMESTAMP_PATTERN_TEMPLATE,
     )
-    output_path = resolve_output_path(
-        output_path=args.output_path,
-        answer_llm_name=answer_llm_name,
-        dataset_name=dataset_name,
-        output_stem=f"{method_name}_table2column",
-        project_root=PROJECT_ROOT,
-    )
+    if args.output_path is not None:
+        output_path = args.output_path
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = PROJECT_ROOT / "Logs" / dataset_name / answer_llm_name
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / f"{method_name}_table2column_{dataset_name}_{run_id}.json"
     logger, logger_path = setup_task_logger("table2column", output_path)
 
     dataset_df = load_dataset(input_path)
