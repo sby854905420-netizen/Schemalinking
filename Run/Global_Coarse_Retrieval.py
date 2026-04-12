@@ -25,6 +25,7 @@ from Utils.tools import (
 )
 
 MAX_COLUMN_DOCUMENT_TOKENS = 2048
+MAX_RANKED_SCHEMA_CANDIDATES = 256
 PROMPT_BUDGET_BUFFER = 512
 PROMPT_BUDGET_RATIO = 0.85
 SCHEMA_SPLIT_LINE = "\n" + "-" * 80 + "\n"
@@ -39,7 +40,7 @@ def clean_text(value: Any) -> str:
     return str(value).strip()
 
 
-def normalize_sample_values(record: dict[str, Any]) -> tuple[list[Any], str]:
+def normalize_sample_values(record: dict[str, Any]) -> str:
     raw_values = record.get("sample_values", [])
     if isinstance(raw_values, list):
         sample_values = raw_values
@@ -52,28 +53,24 @@ def normalize_sample_values(record: dict[str, Any]) -> tuple[list[Any], str]:
     if not sample_values_text and sample_values:
         sample_values_text = ", ".join(clean_text(value) for value in sample_values if clean_text(value))
 
-    return sample_values, sample_values_text
+    return sample_values_text
 
 
-def normalize_record(record: dict[str, Any], source_path: Path | None = None) -> dict[str, Any]:
+def normalize_record(record: dict[str, Any]) -> dict[str, Any]:
     meta = record.get("meta_data") or {}
-    sample_values, sample_values_text = normalize_sample_values(record)
+    sample_values_text = normalize_sample_values(record)
 
     return {
-        "column_id": clean_text(record.get("column_id")),
         "column_name": clean_text(record.get("column_name")),
         "column_description": clean_text(record.get("column_description")),
         "column_data_type": clean_text(record.get("column_data_type") or record.get("normalized_type")),
-        "sample_values": sample_values,
         "sample_values_text": sample_values_text,
-        "is_primary_key": record.get("is_primary_key"),
-        "is_foreign_key": record.get("is_foreign_key"),
         "value_descriptions": clean_text(record.get("value_descriptions")),
-        "references": record.get("references"),
         "db_id": clean_text(record.get("db_id") or meta.get("db_id")),
         "table_name": clean_text(record.get("table_name") or meta.get("table_name")),
-        "source_path": str(source_path or record.get("source_path") or ""),
     }
+
+
 def load_db_counts(db_info_path: Path) -> dict[str, int]:
     with db_info_path.open("r", encoding="utf-8") as file:
         db_infos = json.load(file)
@@ -200,6 +197,7 @@ def log_progress(
     if not enabled or logger is None:
         return
     logger.info("[%s] [%s] " + message, sample_tag, step, *args)
+
 
 def point_to_dict(point: Any) -> dict[str, Any]:
     if isinstance(point, tuple) and len(point) == 2:
@@ -351,11 +349,17 @@ def get_ranked_db_documents(
     if query_filter is None:
         return []
 
+    db_column_count = db_counts.get(db_id, 0)
+    if db_column_count > 0:
+        ranked_top_k = min(MAX_RANKED_SCHEMA_CANDIDATES, db_column_count)
+    else:
+        ranked_top_k = MAX_RANKED_SCHEMA_CANDIDATES
+
     ranked_points = query_qdrant(
         client=qdrant_client,
         collection_name=collection_name,
         query_vector=query_vector,
-        top_k=max(1, db_counts.get(db_id, 0)),
+        top_k=max(1, ranked_top_k),
         query_filter=query_filter,
         with_vectors=False,
     )
@@ -487,6 +491,23 @@ def resolve_schema_documents_for_db(
     collection_name: str,
     db_counts: dict[str, int],
 ) -> list[str]:
+    target_prompt_cap = resolve_prompt_token_cap(ranking_llm.max_input_length)
+    full_documents = load_db_documents(
+        schema_dir=schema_dir,
+        db_id=db_id,
+        ranking_llm=ranking_llm,
+    )
+    if full_documents:
+        full_prompt_tokens = count_prompt_tokens(
+            ranking_llm=ranking_llm,
+            prompt_template=prompt_template,
+            documents=full_documents,
+            query=query,
+            hint_text=hint_text,
+        )
+        if full_prompt_tokens <= target_prompt_cap:
+            return full_documents
+
     return select_relevant_documents_for_db(
         query=query,
         query_vector=query_vector,
@@ -736,9 +757,7 @@ def CFCD_rerank_select(query:str, query_vector: list[float], ranking_llm:LLM,
         ",".join(ranked_db_ids) if ranked_db_ids else "NONE",
     )
     return ranked_db_ids
-    
 
-    
 
 def main() -> None:
     args = parse_args()
@@ -832,14 +851,13 @@ def main() -> None:
             external_knowledge=row.get('external_knowledge'),
             documents_dir=documents_dir,
         )
-        external_knowledge_text = resolve_hint(external_knowledge)
         log_progress(
             logger,
             enable_progress_log,
             sample_tag,
             "prepare",
             "Resolved external knowledge. hint_available=%s",
-            external_knowledge_text != "No hint",
+            resolve_hint(external_knowledge) != "No hint",
         )
         # First Round for all databases
         # step 1: Global Highly Relevant columns (HRC) Retrival
@@ -874,126 +892,164 @@ def main() -> None:
             "round1.step2",
             "Pruning databases from first-round HRC results.",
         )
-        CFCD_db_ids  = database_pruning(HRC_points, min_hit_count=2, min_sim_ratio=0.8)
+        first_round_cfcd_db_ids = database_pruning(HRC_points, min_hit_count=2, min_sim_ratio=0.8)
         log_progress(
             logger,
             enable_progress_log,
             sample_tag,
             "round1.step2",
             "First-round pruning kept %s candidate databases: %s",
-            len(CFCD_db_ids),
-            ",".join(CFCD_db_ids) if CFCD_db_ids else "NONE",
+            len(first_round_cfcd_db_ids),
+            ",".join(first_round_cfcd_db_ids) if first_round_cfcd_db_ids else "NONE",
         )
 
-        # step 3：CFCD Reranking & Selection Top-K, resulting in Final Candidate Databases (FCD)
-        log_progress(
-            logger,
-            enable_progress_log,
-            sample_tag,
-            "round1.step3",
-            "Starting first-round rerank to select top %s databases.",
-            candidate_db_top_k,
-        )
-        FCD_db_ids = CFCD_rerank_select(
-            row['question'],
-            query_embedding,
-            ranking_llm,
-            CFCD_db_ids,
-            prompt_template,
-            top_k=candidate_db_top_k,
-            external_knowledge=external_knowledge,
-            schema_dir=schema_dir,
-            qdrant_client=client,
-            collection_name=collection_name,
-            db_counts=db_counts,
-            logger=logger,
-            enable_progress_log=enable_progress_log,
-            sample_tag=sample_tag,
-        )
-        log_progress(
-            logger,
-            enable_progress_log,
-            sample_tag,
-            "round1.step3",
-            "First-round rerank selected %s final candidate databases: %s",
-            len(FCD_db_ids),
-            ",".join(FCD_db_ids) if FCD_db_ids else "NONE",
-        )
+        final_cfcd_db_ids = list(first_round_cfcd_db_ids)
+        if len(first_round_cfcd_db_ids) <= candidate_db_top_k:
+            log_progress(
+                logger,
+                enable_progress_log,
+                sample_tag,
+                "round1.step3",
+                "Skipping second round because first-round pruning count=%s does not exceed top_k=%s; selecting target database directly.",
+                len(first_round_cfcd_db_ids),
+                candidate_db_top_k,
+            )
+            FCD_db_ids = CFCD_rerank_select(
+                row['question'],
+                query_embedding,
+                ranking_llm,
+                first_round_cfcd_db_ids,
+                prompt_template,
+                top_k=1,
+                external_knowledge=external_knowledge,
+                schema_dir=schema_dir,
+                qdrant_client=client,
+                collection_name=collection_name,
+                db_counts=db_counts,
+                logger=logger,
+                enable_progress_log=enable_progress_log,
+                sample_tag=sample_tag,
+            )
+            target_db_id = FCD_db_ids
+            log_progress(
+                logger,
+                enable_progress_log,
+                sample_tag,
+                "round1.step3",
+                "First-round rerank directly selected target database: %s",
+                target_db_id[0] if target_db_id else "NONE",
+            )
+        else:
+            # step 3：CFCD Reranking & Selection Top-K, resulting in Final Candidate Databases (FCD)
+            log_progress(
+                logger,
+                enable_progress_log,
+                sample_tag,
+                "round1.step3",
+                "Starting first-round rerank to select top %s databases.",
+                candidate_db_top_k,
+            )
+            FCD_db_ids = CFCD_rerank_select(
+                row['question'],
+                query_embedding,
+                ranking_llm,
+                first_round_cfcd_db_ids,
+                prompt_template,
+                top_k=candidate_db_top_k,
+                external_knowledge=external_knowledge,
+                schema_dir=schema_dir,
+                qdrant_client=client,
+                collection_name=collection_name,
+                db_counts=db_counts,
+                logger=logger,
+                enable_progress_log=enable_progress_log,
+                sample_tag=sample_tag,
+            )
+            log_progress(
+                logger,
+                enable_progress_log,
+                sample_tag,
+                "round1.step3",
+                "First-round rerank selected %s final candidate databases: %s",
+                len(FCD_db_ids),
+                ",".join(FCD_db_ids) if FCD_db_ids else "NONE",
+            )
 
-        # Second Round for Final Candidate Databases
-        # step 1: Global Highly Relevant columns (HRC) Retrival for Final Candidate Databases
-        log_progress(
-            logger,
-            enable_progress_log,
-            sample_tag,
-            "round2.step1",
-            "Retrieving highly relevant columns within first-round selected databases.",
-        )
-        Last_HRC_points = get_Highly_Relevant_Columns(
-            query_embedding,
-            client,
-            db_counts=db_counts,
-            collection_name=collection_name,
-            candidate_db_ids=FCD_db_ids,
-        )
-        log_progress(
-            logger,
-            enable_progress_log,
-            sample_tag,
-            "round2.step1",
-            "Retrieved %s second-round highly relevant column points.",
-            len(Last_HRC_points),
-        )
-        # step 2: Support-Based Database Pruning, resulting Coarsely_Filtered Candidate Databases (CFCD)
-        log_progress(
-            logger,
-            enable_progress_log,
-            sample_tag,
-            "round2.step2",
-            "Pruning databases from second-round HRC results.",
-        )
-        CFCD_db_ids  = database_pruning(Last_HRC_points, min_hit_count=2, min_sim_ratio=0.8)
-        log_progress(
-            logger,
-            enable_progress_log,
-            sample_tag,
-            "round2.step2",
-            "Second-round pruning kept %s candidate databases: %s",
-            len(CFCD_db_ids),
-            ",".join(CFCD_db_ids) if CFCD_db_ids else "NONE",
-        )
-        # step 3：CFCD Reranking & Selection Top-1, resulting in Target Database
-        log_progress(
-            logger,
-            enable_progress_log,
-            sample_tag,
-            "round2.step3",
-            "Starting second-round rerank to select the target database.",
-        )
-        target_db_id = CFCD_rerank_select(
-            row['question'],
-            query_embedding,
-            ranking_llm,
-            CFCD_db_ids,
-            prompt_template,
-            top_k=1,
-            external_knowledge=external_knowledge,
-            schema_dir=schema_dir,
-            qdrant_client=client,
-            collection_name=collection_name,
-            db_counts=db_counts,
-            logger=logger,
-            enable_progress_log=enable_progress_log,
-            sample_tag=sample_tag,
-        )
-        log_progress(
-            logger,
-            enable_progress_log,
-            sample_tag,
-            "round2.step3",
-            "Second-round rerank selected target database: %s",
-            target_db_id[0] if target_db_id else "NONE",
-        )
+            # Second Round for Final Candidate Databases
+            # step 1: Global Highly Relevant columns (HRC) Retrival for Final Candidate Databases
+            log_progress(
+                logger,
+                enable_progress_log,
+                sample_tag,
+                "round2.step1",
+                "Retrieving highly relevant columns within first-round selected databases.",
+            )
+            last_hrc_points = get_Highly_Relevant_Columns(
+                query_embedding,
+                client,
+                db_counts=db_counts,
+                collection_name=collection_name,
+                candidate_db_ids=FCD_db_ids,
+            )
+            log_progress(
+                logger,
+                enable_progress_log,
+                sample_tag,
+                "round2.step1",
+                "Retrieved %s second-round highly relevant column points.",
+                len(last_hrc_points),
+            )
+            # step 2: Support-Based Database Pruning, resulting Coarsely_Filtered Candidate Databases (CFCD)
+            log_progress(
+                logger,
+                enable_progress_log,
+                sample_tag,
+                "round2.step2",
+                "Pruning databases from second-round HRC results.",
+            )
+            second_round_cfcd_db_ids = database_pruning(last_hrc_points, min_hit_count=2, min_sim_ratio=0.8)
+            final_cfcd_db_ids = list(second_round_cfcd_db_ids)
+            log_progress(
+                logger,
+                enable_progress_log,
+                sample_tag,
+                "round2.step2",
+                "Second-round pruning kept %s candidate databases: %s",
+                len(second_round_cfcd_db_ids),
+                ",".join(second_round_cfcd_db_ids) if second_round_cfcd_db_ids else "NONE",
+            )
+            # step 3：CFCD Reranking & Selection Top-1, resulting in Target Database
+            log_progress(
+                logger,
+                enable_progress_log,
+                sample_tag,
+                "round2.step3",
+                "Starting second-round rerank to select the target database.",
+            )
+            target_db_id = CFCD_rerank_select(
+                row['question'],
+                query_embedding,
+                ranking_llm,
+                second_round_cfcd_db_ids,
+                prompt_template,
+                top_k=1,
+                external_knowledge=external_knowledge,
+                schema_dir=schema_dir,
+                qdrant_client=client,
+                collection_name=collection_name,
+                db_counts=db_counts,
+                logger=logger,
+                enable_progress_log=enable_progress_log,
+                sample_tag=sample_tag,
+            )
+            log_progress(
+                logger,
+                enable_progress_log,
+                sample_tag,
+                "round2.step3",
+                "Second-round rerank selected target database: %s",
+                target_db_id[0] if target_db_id else "NONE",
+            )
         # save the predict results
         log_records.append(
             {
@@ -1003,7 +1059,7 @@ def main() -> None:
                 'spider_db_id': row['db_id'],
                 'question': row['question'],
                 'FCD_ids': ",".join(FCD_db_ids),
-                'CFCD_db_ids': ",".join(CFCD_db_ids),
+                'CFCD_db_ids': ",".join(final_cfcd_db_ids),
                 'predict_db_id': target_db_id[0] if target_db_id else None
             }
         )
