@@ -18,6 +18,8 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from Llm.embedding_model_loader import EmbeddingModelLoader
 
+MAX_EMBEDDING_INPUT_TOKENS = 8096
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -279,7 +281,7 @@ def build_index(args: argparse.Namespace) -> None:
                 document, was_truncated = truncate_text_by_tokens(
                     build_document(record),
                     tokenizer=tokenizer,
-                    max_tokens=MAX_INPUT_LENGTH,
+                    max_tokens=MAX_EMBEDDING_INPUT_TOKENS,
                 )
                 documents.append(document)
                 if was_truncated:
