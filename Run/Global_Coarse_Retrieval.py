@@ -8,6 +8,7 @@ from tqdm import tqdm
 import json
 import torch
 from datetime import datetime
+import logging
 
 
 from Llm.embedding_model_loader import EmbeddingModelLoader
@@ -23,7 +24,6 @@ from Utils.tools import (
     resolve_prompt_token_cap,
 )
 
-FULL_SCHEMA_COLUMN_THRESHOLD = 300
 MAX_COLUMN_DOCUMENT_TOKENS = 2048
 # Step 3 in CFCD reranking: cap how many top-ranked columns we retrieve per DB
 # before building schema documents and assembling the rerank prompt.
@@ -177,7 +177,32 @@ def parse_args() -> argparse.Namespace:
         default=None,
     )
     parser.add_argument("--candidate-db-top-k", dest="candidate_db_top_k", type=int, default=None)
+    parser.add_argument(
+        "--enable-progress-log",
+        dest="enable_progress_log",
+        action="store_true",
+        help="Enable verbose per-sample progress logs for retrieval steps.",
+    )
     return parser.parse_args()
+
+
+def build_sample_tag(row: pd.Series, sample_index: int, total_samples: int) -> str:
+    sample_id = clean_text(row.get("id")) or str(sample_index + 1)
+    db_id = clean_text(row.get("db_id")) or "UNKNOWN"
+    return f"sample {sample_index + 1}/{total_samples} id={sample_id} gold_db={db_id}"
+
+
+def log_progress(
+    logger: logging.Logger | None,
+    enabled: bool,
+    sample_tag: str,
+    step: str,
+    message: str,
+    *args: Any,
+) -> None:
+    if not enabled or logger is None:
+        return
+    logger.info("[%s] [%s] " + message, sample_tag, step, *args)
 
 def point_to_dict(point: Any) -> dict[str, Any]:
     if isinstance(point, tuple) and len(point) == 2:
@@ -603,8 +628,18 @@ def CFCD_rerank_select(query:str, query_vector: list[float], ranking_llm:LLM,
                        schema_dir: Path,
                        qdrant_client: QdrantClient,
                        collection_name: str,
-                       db_counts: dict[str, int]):
+                       db_counts: dict[str, int],
+                       logger: logging.Logger | None = None,
+                       enable_progress_log: bool = False,
+                       sample_tag: str = ""):
     if not CFCD_db_ids:
+        log_progress(
+            logger,
+            enable_progress_log,
+            sample_tag,
+            "rerank",
+            "Skipped reranking because there are no candidate databases.",
+        )
         return []
 
     yes_scores = []
@@ -616,8 +651,28 @@ def CFCD_rerank_select(query:str, query_vector: list[float], ranking_llm:LLM,
         raw_hint_text=resolve_hint(external_knowledge),
         target_prompt_cap=target_prompt_cap,
     )
-    for db_id in CFCD_db_ids:
+    log_progress(
+        logger,
+        enable_progress_log,
+        sample_tag,
+        "rerank",
+        "Starting rerank for %s candidate databases with top_k=%s and prompt cap=%s.",
+        len(CFCD_db_ids),
+        top_k,
+        target_prompt_cap,
+    )
+    for db_index, db_id in enumerate(CFCD_db_ids, start=1):
         hint_text = base_hint_text
+        log_progress(
+            logger,
+            enable_progress_log,
+            sample_tag,
+            "rerank",
+            "Evaluating candidate db %s/%s: %s",
+            db_index,
+            len(CFCD_db_ids),
+            db_id,
+        )
         documents = resolve_schema_documents_for_db(
             query=query,
             query_vector=query_vector,
@@ -629,6 +684,15 @@ def CFCD_rerank_select(query:str, query_vector: list[float], ranking_llm:LLM,
             qdrant_client=qdrant_client,
             collection_name=collection_name,
             db_counts=db_counts,
+        )
+        log_progress(
+            logger,
+            enable_progress_log,
+            sample_tag,
+            "rerank",
+            "Collected %s schema documents for db=%s.",
+            len(documents),
+            db_id,
         )
 
         prompt = render_prompt(
@@ -649,12 +713,30 @@ def CFCD_rerank_select(query:str, query_vector: list[float], ranking_llm:LLM,
             prompt_token_count = ranking_llm.count_input_tokens(prompt)
         if prompt_token_count > target_prompt_cap:
             yes_scores.append(float("-inf"))
+            log_progress(
+                logger,
+                enable_progress_log,
+                sample_tag,
+                "rerank",
+                "Skipped db=%s because prompt tokens=%s still exceed cap=%s after fallback hint handling.",
+                db_id,
+                prompt_token_count,
+                target_prompt_cap,
+            )
             continue
-        # prompt_token_count = ranking_llm.count_input_tokens(prompt)
-        # print(f"[GlobalCoarse] db_id={db_id} prompt_tokens={prompt_token_count}")
         next_token_logits = ranking_llm._query_transformers(prompt, output_hidden_states=True)
         yes_prob_binary = compute_yes_probability(next_token_logits,ranking_llm.tokenizer)
         yes_scores.append(float(yes_prob_binary.detach()))
+        log_progress(
+            logger,
+            enable_progress_log,
+            sample_tag,
+            "rerank",
+            "Finished db=%s with prompt tokens=%s and yes_score=%.6f.",
+            db_id,
+            prompt_token_count,
+            yes_scores[-1],
+        )
 
         del next_token_logits
         del yes_prob_binary
@@ -670,6 +752,15 @@ def CFCD_rerank_select(query:str, query_vector: list[float], ranking_llm:LLM,
         .head(top_k)
         .tolist()
     )
+    log_progress(
+        logger,
+        enable_progress_log,
+        sample_tag,
+        "rerank",
+        "Rerank completed. Selected %s databases: %s",
+        len(ranked_db_ids),
+        ",".join(ranked_db_ids) if ranked_db_ids else "NONE",
+    )
     return ranked_db_ids
     
 
@@ -684,6 +775,7 @@ def main() -> None:
     max_input_length = args.max_input_length or MAX_INPUT_LENGTH
     max_generation_num = args.max_generation_num or MAX_GENERATEION_NUM
     candidate_db_top_k = args.candidate_db_top_k if args.candidate_db_top_k is not None else CANDIDATE_DB_TOP_K
+    enable_progress_log = args.enable_progress_log
     
     run_id = datetime.now().strftime('%Y%m%d_%H%M%S')
     dataset_root = PROJECT_ROOT / "Data" / dataset_name
@@ -727,12 +819,12 @@ def main() -> None:
             "Documents dir": documents_dir,
             "Top-k cap": TOP_KD_CAP,
             "Top-k schedule": "<=20:4, <=50:5, <=100:6, <=200:6, <=500:7, <=1000:8, <=5000:10, >5000:12",
-            "Full schema threshold": FULL_SCHEMA_COLUMN_THRESHOLD,
             "Prompt budget ratio": PROMPT_BUDGET_RATIO,
             "Prompt budget buffer": PROMPT_BUDGET_BUFFER,
             "Candidate db top k": candidate_db_top_k,
             "Max input length": max_input_length,
             "Max generation num": max_generation_num,
+            "Enable progress log": enable_progress_log,
             "Logger path": logger_path,
         },
     )
@@ -751,14 +843,39 @@ def main() -> None:
     log_records = []
 
 
-    for _,row in tqdm(dataset_df.iterrows(),total=len(dataset_df)):
+    total_samples = len(dataset_df)
+    for sample_index, (_, row) in enumerate(tqdm(dataset_df.iterrows(), total=total_samples)):
+        sample_tag = build_sample_tag(row, sample_index, total_samples)
+        log_progress(
+            logger,
+            enable_progress_log,
+            sample_tag,
+            "start",
+            "Starting sample processing.",
+        )
         external_knowledge = resolve_external_knowledge_for_prompt(
             dataset_name=dataset_name,
             external_knowledge=row.get('external_knowledge'),
             documents_dir=documents_dir,
         )
+        external_knowledge_text = resolve_hint(external_knowledge)
+        log_progress(
+            logger,
+            enable_progress_log,
+            sample_tag,
+            "prepare",
+            "Resolved external knowledge. hint_available=%s",
+            external_knowledge_text != "No hint",
+        )
         # First Round for all databases
         # step 1: Global Highly Relevant columns (HRC) Retrival
+        log_progress(
+            logger,
+            enable_progress_log,
+            sample_tag,
+            "round1.step1",
+            "Encoding question and retrieving global highly relevant columns.",
+        )
         query_embedding = embedder.encode(row['question'], convert_to_list=True)
         HRC_points = get_Highly_Relevant_Columns(
             query_embedding,
@@ -766,11 +883,43 @@ def main() -> None:
             db_counts=db_counts,
             collection_name=collection_name,
         )
+        log_progress(
+            logger,
+            enable_progress_log,
+            sample_tag,
+            "round1.step1",
+            "Retrieved %s highly relevant column points.",
+            len(HRC_points),
+        )
 
         # step 2: Support-Based Database Pruning, resulting Coarsely_Filtered Candidate Databases (CFCD)
+        log_progress(
+            logger,
+            enable_progress_log,
+            sample_tag,
+            "round1.step2",
+            "Pruning databases from first-round HRC results.",
+        )
         CFCD_db_ids  = database_pruning(HRC_points, min_hit_count=2, min_sim_ratio=0.8)
+        log_progress(
+            logger,
+            enable_progress_log,
+            sample_tag,
+            "round1.step2",
+            "First-round pruning kept %s candidate databases: %s",
+            len(CFCD_db_ids),
+            ",".join(CFCD_db_ids) if CFCD_db_ids else "NONE",
+        )
 
         # step 3：CFCD Reranking & Selection Top-K, resulting in Final Candidate Databases (FCD)
+        log_progress(
+            logger,
+            enable_progress_log,
+            sample_tag,
+            "round1.step3",
+            "Starting first-round rerank to select top %s databases.",
+            candidate_db_top_k,
+        )
         FCD_db_ids = CFCD_rerank_select(
             row['question'],
             query_embedding,
@@ -783,10 +932,29 @@ def main() -> None:
             qdrant_client=client,
             collection_name=collection_name,
             db_counts=db_counts,
+            logger=logger,
+            enable_progress_log=enable_progress_log,
+            sample_tag=sample_tag,
+        )
+        log_progress(
+            logger,
+            enable_progress_log,
+            sample_tag,
+            "round1.step3",
+            "First-round rerank selected %s final candidate databases: %s",
+            len(FCD_db_ids),
+            ",".join(FCD_db_ids) if FCD_db_ids else "NONE",
         )
 
         # Second Round for Final Candidate Databases
         # step 1: Global Highly Relevant columns (HRC) Retrival for Final Candidate Databases
+        log_progress(
+            logger,
+            enable_progress_log,
+            sample_tag,
+            "round2.step1",
+            "Retrieving highly relevant columns within first-round selected databases.",
+        )
         Last_HRC_points = get_Highly_Relevant_Columns(
             query_embedding,
             client,
@@ -794,9 +962,40 @@ def main() -> None:
             collection_name=collection_name,
             candidate_db_ids=FCD_db_ids,
         )
+        log_progress(
+            logger,
+            enable_progress_log,
+            sample_tag,
+            "round2.step1",
+            "Retrieved %s second-round highly relevant column points.",
+            len(Last_HRC_points),
+        )
         # step 2: Support-Based Database Pruning, resulting Coarsely_Filtered Candidate Databases (CFCD)
+        log_progress(
+            logger,
+            enable_progress_log,
+            sample_tag,
+            "round2.step2",
+            "Pruning databases from second-round HRC results.",
+        )
         CFCD_db_ids  = database_pruning(Last_HRC_points, min_hit_count=2, min_sim_ratio=0.8)
+        log_progress(
+            logger,
+            enable_progress_log,
+            sample_tag,
+            "round2.step2",
+            "Second-round pruning kept %s candidate databases: %s",
+            len(CFCD_db_ids),
+            ",".join(CFCD_db_ids) if CFCD_db_ids else "NONE",
+        )
         # step 3：CFCD Reranking & Selection Top-1, resulting in Target Database
+        log_progress(
+            logger,
+            enable_progress_log,
+            sample_tag,
+            "round2.step3",
+            "Starting second-round rerank to select the target database.",
+        )
         target_db_id = CFCD_rerank_select(
             row['question'],
             query_embedding,
@@ -809,6 +1008,17 @@ def main() -> None:
             qdrant_client=client,
             collection_name=collection_name,
             db_counts=db_counts,
+            logger=logger,
+            enable_progress_log=enable_progress_log,
+            sample_tag=sample_tag,
+        )
+        log_progress(
+            logger,
+            enable_progress_log,
+            sample_tag,
+            "round2.step3",
+            "Second-round rerank selected target database: %s",
+            target_db_id[0] if target_db_id else "NONE",
         )
         # save the predict results
         log_records.append(
@@ -824,6 +1034,15 @@ def main() -> None:
             }
         )
         log_path.write_text(json.dumps(log_records, ensure_ascii=False, indent=2), encoding='utf-8')
+        log_progress(
+            logger,
+            enable_progress_log,
+            sample_tag,
+            "finish",
+            "Saved sample result to %s. processed_records=%s",
+            log_path,
+            len(log_records),
+        )
 
     logger.info("Completed %s records.", len(log_records))
     
