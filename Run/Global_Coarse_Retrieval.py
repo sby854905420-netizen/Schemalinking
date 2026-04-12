@@ -25,6 +25,9 @@ from Utils.tools import (
 
 FULL_SCHEMA_COLUMN_THRESHOLD = 300
 MAX_COLUMN_DOCUMENT_TOKENS = 2048
+# Step 3 in CFCD reranking: cap how many top-ranked columns we retrieve per DB
+# before building schema documents and assembling the rerank prompt.
+MAX_RERANK_COLUMNS_PER_DB = 200
 PROMPT_BUDGET_BUFFER = 512
 PROMPT_BUDGET_RATIO = 0.85
 SCHEMA_SPLIT_LINE = "\n" + "-" * 80 + "\n"
@@ -326,11 +329,15 @@ def get_ranked_db_documents(
     if query_filter is None:
         return []
 
+    resolved_top_k = min(
+        MAX_RERANK_COLUMNS_PER_DB,
+        max(1, db_counts.get(db_id, 0)),
+    )
     ranked_points = query_qdrant(
         client=qdrant_client,
         collection_name=collection_name,
         query_vector=query_vector,
-        top_k=max(1, db_counts.get(db_id, 0)),
+        top_k=resolved_top_k,
         query_filter=query_filter,
         with_vectors=False,
     )
@@ -371,6 +378,25 @@ def append_documents_until_budget(
 ) -> tuple[list[str], set[str]]:
     documents = list(selected_documents)
     column_ids = set(selected_column_ids)
+
+    remaining_candidates = [
+        candidate
+        for candidate in candidate_documents
+        if candidate["column_id"] not in column_ids
+    ]
+    if remaining_candidates:
+        proposed_documents = documents + [candidate["document"] for candidate in remaining_candidates]
+        proposed_tokens = count_prompt_tokens(
+            ranking_llm=ranking_llm,
+            prompt_template=prompt_template,
+            documents=proposed_documents,
+            query=query,
+            hint_text=hint_text,
+        )
+        if proposed_tokens <= target_prompt_cap:
+            documents.extend(candidate["document"] for candidate in remaining_candidates)
+            column_ids.update(candidate["column_id"] for candidate in remaining_candidates)
+            return documents, column_ids
 
     for candidate in candidate_documents:
         column_id = candidate["column_id"]
