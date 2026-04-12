@@ -24,6 +24,7 @@ from Utils.tools import (
 )
 
 FULL_SCHEMA_COLUMN_THRESHOLD = 300
+MAX_COLUMN_DOCUMENT_TOKENS = 2048
 PROMPT_BUDGET_BUFFER = 512
 PROMPT_BUDGET_RATIO = 0.85
 SCHEMA_SPLIT_LINE = "\n" + "-" * 80 + "\n"
@@ -207,27 +208,57 @@ def iter_column_files(schema_dir: Path) -> Iterable[Path]:
     yield from sorted(schema_dir.rglob("*.json"))
 
 
-def build_document(record: dict[str, Any]) -> str:
+def build_document(
+    record: dict[str, Any],
+    ranking_llm: LLM | None = None,
+    max_document_tokens: int = MAX_COLUMN_DOCUMENT_TOKENS,
+) -> str:
     normalized_record = normalize_record(record)
-    lines = [
+    base_lines = [
         f"Database: {normalized_record['db_id']}",
         f"Table: {normalized_record['table_name']}",
         f"Column: {normalized_record['column_name']}",
         f"Data type: {normalized_record['column_data_type']}",
     ]
 
+    optional_lines: list[tuple[str, str]] = []
+
     column_description = normalized_record["column_description"]
     if column_description:
-        lines.append(f"Description: {column_description}")
+        optional_lines.append(("description", f"Description: {column_description}"))
 
     value_descriptions = normalized_record["value_descriptions"]
     if value_descriptions:
-        lines.append(f"Value meanings: {value_descriptions}")
+        optional_lines.append(("value_meanings", f"Value meanings: {value_descriptions}"))
 
     sample_values_text = normalized_record["sample_values_text"]
     if sample_values_text:
-        lines.append(f"Sample values: {sample_values_text}")
-    return "\n".join(lines)
+        optional_lines.append(("sample_values", f"Sample values: {sample_values_text}"))
+
+    def render_document(lines: list[str]) -> str:
+        return "\n".join(lines)
+
+    document_lines = base_lines + [line for _, line in optional_lines]
+    document = render_document(document_lines)
+    if ranking_llm is None:
+        return document
+
+    if ranking_llm.count_input_tokens(document) <= max_document_tokens:
+        return document
+
+    sections_to_drop = ["sample_values", "value_meanings", "description"]
+    remaining_optional_lines = list(optional_lines)
+    for section_name in sections_to_drop:
+        remaining_optional_lines = [
+            (name, line)
+            for name, line in remaining_optional_lines
+            if name != section_name
+        ]
+        document = render_document(base_lines + [line for _, line in remaining_optional_lines])
+        if ranking_llm.count_input_tokens(document) <= max_document_tokens:
+            return document
+
+    return document
 
 
 def build_schema_text(documents: list[str]) -> str:
@@ -250,16 +281,36 @@ def count_prompt_tokens(
     return ranking_llm.count_input_tokens(prompt)
 
 
+def resolve_base_prompt_hint(
+    ranking_llm: LLM,
+    prompt_template: str,
+    query: str,
+    raw_hint_text: str,
+    target_prompt_cap: int,
+) -> str:
+    prompt_tokens_with_hint = count_prompt_tokens(
+        ranking_llm=ranking_llm,
+        prompt_template=prompt_template,
+        documents=[],
+        query=query,
+        hint_text=raw_hint_text,
+    )
+    if prompt_tokens_with_hint <= target_prompt_cap:
+        return raw_hint_text
+
+    return "No hint"
+
+
 def load_column_record(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as file:
         return json.load(file)
 
 
-def load_db_documents(schema_dir: Path, db_id: str) -> list[str]:
+def load_db_documents(schema_dir: Path, db_id: str, ranking_llm: LLM | None = None) -> list[str]:
     documents: list[str] = []
     for column_file in iter_column_files(schema_dir / db_id):
         record = load_column_record(column_file)
-        documents.append(build_document(record))
+        documents.append(build_document(record, ranking_llm=ranking_llm))
     return documents
 
 
@@ -269,6 +320,7 @@ def get_ranked_db_documents(
     collection_name: str,
     db_id: str,
     db_counts: dict[str, int],
+    ranking_llm: LLM,
 ) -> list[dict[str, Any]]:
     query_filter = build_db_id_filter([db_id])
     if query_filter is None:
@@ -300,7 +352,7 @@ def get_ranked_db_documents(
                 "column_id": column_id,
                 "table_name": clean_text(payload.get("table_name")),
                 "score": float(point_dict["score"]) if point_dict["score"] is not None else float("-inf"),
-                "document": build_document(payload),
+                "document": build_document(payload, ranking_llm=ranking_llm),
             }
         )
 
@@ -333,7 +385,7 @@ def append_documents_until_budget(
             query=query,
             hint_text=hint_text,
         )
-        if proposed_tokens <= target_prompt_cap or not documents:
+        if proposed_tokens <= target_prompt_cap:
             documents.append(candidate["document"])
             column_ids.add(column_id)
 
@@ -357,6 +409,7 @@ def select_relevant_documents_for_db(
         collection_name=collection_name,
         db_id=db_id,
         db_counts=db_counts,
+        ranking_llm=ranking_llm,
     )
     if not ranked_documents:
         return []
@@ -409,23 +462,7 @@ def resolve_schema_documents_for_db(
     collection_name: str,
     db_counts: dict[str, int],
 ) -> list[str]:
-    column_count = max(0, db_counts.get(db_id, 0))
-    target_prompt_cap = resolve_prompt_token_cap(ranking_llm.max_input_length)
-
-    if column_count <= FULL_SCHEMA_COLUMN_THRESHOLD:
-        full_documents = load_db_documents(schema_dir=schema_dir, db_id=db_id)
-        if full_documents:
-            full_prompt_tokens = count_prompt_tokens(
-                ranking_llm=ranking_llm,
-                prompt_template=prompt_template,
-                documents=full_documents,
-                query=query,
-                hint_text=hint_text,
-            )
-            if full_prompt_tokens <= target_prompt_cap:
-                return full_documents
-
-    relevant_documents = select_relevant_documents_for_db(
+    return select_relevant_documents_for_db(
         query=query,
         query_vector=query_vector,
         db_id=db_id,
@@ -436,10 +473,6 @@ def resolve_schema_documents_for_db(
         collection_name=collection_name,
         db_counts=db_counts,
     )
-    if relevant_documents:
-        return relevant_documents
-
-    return load_db_documents(schema_dir=schema_dir, db_id=db_id)
 
 
 def get_Highly_Relevant_Columns(query_vector:list[float], 
@@ -549,8 +582,16 @@ def CFCD_rerank_select(query:str, query_vector: list[float], ranking_llm:LLM,
         return []
 
     yes_scores = []
-    hint_text = resolve_hint(external_knowledge)
+    target_prompt_cap = resolve_prompt_token_cap(ranking_llm.max_input_length)
+    base_hint_text = resolve_base_prompt_hint(
+        ranking_llm=ranking_llm,
+        prompt_template=prompt_template,
+        query=query,
+        raw_hint_text=resolve_hint(external_knowledge),
+        target_prompt_cap=target_prompt_cap,
+    )
     for db_id in CFCD_db_ids:
+        hint_text = base_hint_text
         documents = resolve_schema_documents_for_db(
             query=query,
             query_vector=query_vector,
@@ -563,9 +604,6 @@ def CFCD_rerank_select(query:str, query_vector: list[float], ranking_llm:LLM,
             collection_name=collection_name,
             db_counts=db_counts,
         )
-        if not documents:
-            yes_scores.append(float("-inf"))
-            continue
 
         prompt = render_prompt(
             prompt_template,
@@ -573,6 +611,19 @@ def CFCD_rerank_select(query:str, query_vector: list[float], ranking_llm:LLM,
             QUESTION=query,
             HINT=hint_text,
         )
+        prompt_token_count = ranking_llm.count_input_tokens(prompt)
+        if prompt_token_count > target_prompt_cap:
+            hint_text = "No hint"
+            prompt = render_prompt(
+                prompt_template,
+                DATABASE_SCHEMAS=build_schema_text(documents),
+                QUESTION=query,
+                HINT=hint_text,
+            )
+            prompt_token_count = ranking_llm.count_input_tokens(prompt)
+        if prompt_token_count > target_prompt_cap:
+            yes_scores.append(float("-inf"))
+            continue
         # prompt_token_count = ranking_llm.count_input_tokens(prompt)
         # print(f"[GlobalCoarse] db_id={db_id} prompt_tokens={prompt_token_count}")
         next_token_logits = ranking_llm._query_transformers(prompt, output_hidden_states=True)
