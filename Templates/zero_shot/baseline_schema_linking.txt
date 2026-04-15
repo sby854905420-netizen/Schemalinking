@@ -1,32 +1,22 @@
 ### Instructions:
 You are an expert data analyst specializing in database querying.
 
-Your task is to identify the minimal set of tables and columns used to write a correct SQL query that answers the question.
-
-Only include columns that are necessary for the SQL query.
-Do not include irrelevant columns.
-Tables should only be included if at least one of their columns is required.
-Include join keys only when they are needed to connect tables in the SQL query.
-
-### Database Schema:
-The schema is organized into sections such as [DATABASE_ID], [FOREIGN_KEY_RELATIONSHIPS], and [TABLE].
-
-Each column line provides:
-column_name | data_type | key_type | referenced_column | column_description | example_values
+Your task is to identify the minimal set of columns used to write a correct SQL query that answers the question.
+The input schema uses a rendered database format shared across the schema-linking pipeline: it begins with the database name, may include primary keys and foreign key relationships, and then lists each table with per-column fields such as column name, data type, description, sample values, and value descriptions. Use only tables and columns that are explicitly shown in the rendered schema. Only include columns that are necessary for the SQL query. Do not include irrelevant columns. Do not include extra columns just because they appear in the same table. Include join keys only when they are needed to connect tables in the SQL query.
 
 Important notes:
-- key_type is one of: PRIMARY KEY, FOREIGN KEY, NONE, NOT_AVAILABLE
-- referenced_column is a full column path such as TableName.ColumnName
-- referenced_column is NONE when the source data shows the column is not a foreign key
-- referenced_column is NOT_AVAILABLE when foreign key information is not provided in the source data
-- the foreign key relationship section is NONE when the source data shows no relationships
-- column_description may be NOT_AVAILABLE
-- example_values may be NOT_AVAILABLE
-- Table names and column names must be used exactly as provided in the schema
+- The schema begins with `Database: ...`, followed by `Primary keys:` and `Foreign key relationships:` sections, and then one or more `Table: ...` blocks.
+- Each column is rendered as a block containing `Column`, `Data type`, `Description`, `Sample values`, and `Value descriptions`.
+- Primary keys are listed by table in the `Primary keys:` section. If key metadata is unavailable, the section is `NOT_AVAILABLE`. If the source data explicitly indicates there are no primary-key items to show, the section is `NONE`.
+- Foreign key relationships are listed as `source_table.source_column -> target_table.target_column`. If relationship metadata is unavailable, the section is `NOT_AVAILABLE`. If the source data explicitly indicates there are no relationships to show, the section is `NONE`.
+- `Sample values` are separated by semicolons when multiple values are shown.
+- `NOT_AVAILABLE` means the source data does not provide that metadata.
+- `NONE` means the source data explicitly indicates there are no items in that section.
+- Table names and column names must be used exactly as provided in the rendered schema.
 
 ### Hint:
-The hint (if provided) may highlight tables, columns, or relationships that are relevant to the question.
-Use the hint as additional guidance, but rely primarily on the schema and the question.
+The hint (if provided) may highlight columns, conditions, or relationships that are relevant to the question.
+Use the hint as additional guidance, but rely primarily on the rendered schema and the question.
 
 ### Output Requirements (STRICT):
 
@@ -42,10 +32,10 @@ Format:
 }
 
 Rules (STRICT):
-- Keys must be table names from the provided database schema.
-- Values must be lists of column names from the schema.
+- Keys must be table names from the provided rendered schema.
+- Values must be lists of column names from the rendered schema.
 - Use double quotes for all keys and strings.
-- Do NOT invent tables or columns that do not exist in the schema.
+- Do NOT invent tables or columns that do not exist in the rendered schema.
 - Do NOT include explanations.
 - Do NOT include reasoning.
 - Do NOT include markdown or code blocks.
@@ -56,11 +46,11 @@ Rules (STRICT):
 If no columns can be confidently identified, return:
 {}
 
-You may reason internally to determine the correct tables and columns, but do NOT output the reasoning content.
+You may reason internally to determine the correct columns, but do NOT output the reasoning content.
 Only output the final JSON object.
 
 ### INPUT:
-{DATABASE_SCHEMA}
+{DATABASE_SCHEMAS}
 
 Question:
 {QUESTION}

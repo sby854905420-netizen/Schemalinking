@@ -3,23 +3,25 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
+
 import pandas as pd
 
 from config import *
 from Llm.llm_loader import LLM
 from Run.logging_utils import log_run_configuration, setup_task_logger
+from Utils.render_tools import SchemaTextRenderer
+from Utils.schema_selection import (
+    DbInfoSchemaStore,
+    count_prompt_tokens as count_schema_prompt_tokens,
+    load_db_counts,
+    resolve_schema_text_for_db,
+)
 from Utils.tools import (
-    build_column_key,
-    build_db_id_filter,
-    build_db_schema_text,
-    get_key_columns,
     get_qdrant_client,
     get_row_value,
     load_db_info_index,
-    load_schema_dataframe_from_db_info,
     normalize_response_text,
-    query_qdrant,
     render_prompt,
     resolve_hint,
     resolve_input_path,
@@ -87,141 +89,125 @@ def load_qdrant_collection_name(qdrant_path: Path) -> str:
     return next(iter(collections))
 
 
-def resolve_external_knowledge_for_prompt(
-    dataset_name: str,
-    source: Any,
-    documents_dir: Path | None = None,
-    key: str = "external_knowledge",
-) -> Any:
-    if dataset_name.lower() != "spider2":
-        return source
+def normalize_table_names(table_names: Sequence[Any]) -> list[str]:
+    normalized_table_names: list[str] = []
+    seen: set[str] = set()
 
-    if hasattr(source, "get"):
-        external_knowledge = source.get(key)
-        if external_knowledge is None:
-            return source
-    else:
-        external_knowledge = source
+    for table_name in table_names:
+        normalized_table_name = str(table_name).strip()
+        if not normalized_table_name or normalized_table_name in seen:
+            continue
+        seen.add(normalized_table_name)
+        normalized_table_names.append(normalized_table_name)
 
-    if not isinstance(external_knowledge, str):
-        return source
-
-    document_name = external_knowledge.strip()
-    if not document_name or documents_dir is None:
-        return source
-
-    document_path = documents_dir / document_name
-    if not document_path.is_file():
-        return source
-
-    document_text = document_path.read_text(encoding="utf-8").strip()
-
-    if hasattr(source, "copy"):
-        resolved_source = source.copy()
-        if hasattr(resolved_source, "loc"):
-            resolved_source.loc[key] = document_text
-        else:
-            resolved_source[key] = document_text
-        return resolved_source
-
-    return document_text
+    return normalized_table_names
 
 
-def get_point_payload(point: Any) -> dict[str, Any]:
-    payload = getattr(point, "payload", None)
-    if payload is None and isinstance(point, dict):
-        payload = point.get("payload")
-    return dict(payload or {})
+def filter_column_records_by_tables(
+    column_records: Sequence[dict[str, Any]],
+    table_names: Sequence[str],
+) -> list[dict[str, Any]]:
+    selected_table_names = set(normalize_table_names(table_names))
+    if not selected_table_names:
+        return []
+
+    return [
+        record
+        for record in column_records
+        if str(record.get("table_name", "")).strip() in selected_table_names
+    ]
 
 
-def count_prompt_tokens(answer_llm: Any, prompt: str) -> int:
-    try:
-        return answer_llm.count_input_tokens(prompt)
-    except (NotImplementedError, AttributeError):
-        return max(1, len(prompt) // 4)
+def normalize_relevant_tables(
+    relevant_table_list: Sequence[Any],
+    available_records: Sequence[dict[str, Any]],
+) -> list[str]:
+    available_table_names = {
+        str(record.get("table_name", "")).strip()
+        for record in available_records
+        if str(record.get("table_name", "")).strip()
+    }
+
+    return [
+        table_name
+        for table_name in normalize_table_names(relevant_table_list)
+        if table_name in available_table_names
+    ]
 
 
-def score_relevant_columns_for_db(
+def render_schema_prompt(
+    prompt_template: str,
+    schema_text: str,
     question: str,
-    predict_db_id: str,
-    schema_df: pd.DataFrame,
-    embedder: Any,
-    qdrant_client: Any,
-    qdrant_collection_name: str,
-) -> list[tuple[str, str]]:
-    query_vector = embedder.encode(question, convert_to_list=True)
-    ranked_points = query_qdrant(
-        client=qdrant_client,
-        collection_name=qdrant_collection_name,
-        query_vector=query_vector,
-        top_k=max(1, len(schema_df)),
-        query_filter=build_db_id_filter([predict_db_id]),
+    hint: str,
+) -> str:
+    return render_prompt(
+        prompt_template,
+        DATABASE_SCHEMAS=schema_text,
+        QUESTION=question,
+        HINT=hint,
     )
 
-    valid_column_keys = {build_column_key(row) for _, row in schema_df.iterrows()}
-    ranked_column_keys: list[tuple[str, str]] = []
-    seen: set[tuple[str, str]] = set()
-    for point in ranked_points:
-        payload = get_point_payload(point)
-        column_key = (
-            str(payload.get("table_name", "")).strip(),
-            str(payload.get("column_name", "")).strip(),
-        )
-        if column_key in seen or column_key not in valid_column_keys:
-            continue
-        seen.add(column_key)
-        ranked_column_keys.append(column_key)
 
-    return ranked_column_keys
-
-
-def select_table_prompt_columns(
-    schema_df: pd.DataFrame,
+def resolve_table_prompt_schema(
     predict_db_id: str,
     question: str,
     hint: str,
     prompt_template: str,
     answer_llm: Any,
     embedder: Any,
+    schema_store: DbInfoSchemaStore,
     qdrant_client: Any,
     qdrant_collection_name: str,
-) -> set[tuple[str, str]]:
-    selected_column_keys = get_key_columns(schema_df)
-    prompt_token_cap = resolve_prompt_token_cap(answer_llm.max_input_length)
-
-    ranked_column_keys = score_relevant_columns_for_db(
-        question=question,
-        predict_db_id=predict_db_id,
-        schema_df=schema_df,
-        embedder=embedder,
+    db_counts: dict[str, int],
+) -> tuple[str, list[dict[str, Any]]]:
+    query_vector = embedder.encode(question, convert_to_list=True)
+    return resolve_schema_text_for_db(
+        query=question,
+        query_vector=query_vector,
+        db_id=predict_db_id,
+        ranking_llm=answer_llm,
+        prompt_template=prompt_template,
+        hint_text=hint,
+        schema_store=schema_store,
         qdrant_client=qdrant_client,
-        qdrant_collection_name=qdrant_collection_name,
+        collection_name=qdrant_collection_name,
+        db_counts=db_counts,
     )
 
-    for column_key in ranked_column_keys:
-        if column_key in selected_column_keys:
-            continue
 
-        proposed_column_keys = set(selected_column_keys)
-        proposed_column_keys.add(column_key)
-        proposed_schema = build_db_schema_text(
-            schema_df=schema_df,
-            db_id=predict_db_id,
-            include_selected_tables=False,
-            selected_column_keys=proposed_column_keys,
-            include_empty_tables=True,
-        )
-        proposed_prompt = render_prompt(
-            prompt_template,
-            DATABASE_SCHEMA=proposed_schema,
-            QUESTION=question,
-            HINT=hint,
-        )
-        proposed_tokens = count_prompt_tokens(answer_llm, proposed_prompt)
-        if proposed_tokens <= prompt_token_cap:
-            selected_column_keys = proposed_column_keys
+def resolve_column_prompt_records(
+    predict_db_id: str,
+    question: str,
+    hint: str,
+    relevant_table_list: Sequence[str],
+    table_prompt_records: Sequence[dict[str, Any]],
+    schema_store: DbInfoSchemaStore,
+    answer_llm: Any,
+    prompt_template: str,
+) -> list[dict[str, Any]]:
+    if not relevant_table_list:
+        return list(table_prompt_records)
 
-    return selected_column_keys
+    full_db_records = schema_store.get_column_records(predict_db_id)
+    selected_table_records = filter_column_records_by_tables(full_db_records, relevant_table_list)
+    if not selected_table_records:
+        fallback_records = filter_column_records_by_tables(table_prompt_records, relevant_table_list)
+        return fallback_records or list(table_prompt_records)
+
+    full_schema_text = schema_store.render_schema_text(predict_db_id, selected_table_records)
+    prompt_tokens = count_schema_prompt_tokens(
+        ranking_llm=answer_llm,
+        prompt_template=prompt_template,
+        schema_text=full_schema_text,
+        query=question,
+        hint_text=hint,
+    )
+    if prompt_tokens <= resolve_prompt_token_cap(answer_llm.max_input_length):
+        return selected_table_records
+
+    fallback_records = filter_column_records_by_tables(table_prompt_records, relevant_table_list)
+    return fallback_records or list(table_prompt_records) or selected_table_records
 
 
 def parse_table_response(response_text: str) -> list:
@@ -300,7 +286,8 @@ def run_table2column(
     output_path: Path,
     dataset_name: str,
     documents_dir: Path,
-    db_info_index: dict[str, dict[str, Any]],
+    schema_store: DbInfoSchemaStore,
+    db_counts: dict[str, int],
     embedder: Any,
     qdrant_client: Any,
     qdrant_collection_name: str,
@@ -319,89 +306,88 @@ def run_table2column(
                 log_records=log_records,
                 row=row,
                 predict_tables=[],
-                predict_columns= {},
-                table_response_text="No Vaild Database.",
-                column_response_text="No Vaild Database.",
-                answer_llm_name=answer_llm_name,
-                provider=provider,
-                output_path=output_path,
-            )
-            continue
-        predict_db_id = str(predict_db_id)
-        hint_source = resolve_external_knowledge_for_prompt(
-            dataset_name=dataset_name,
-            source=row,
-            documents_dir=documents_dir,
-        )
-        hint = resolve_hint(hint_source)
-        try:
-            total_schema_df = load_schema_dataframe_from_db_info(
-                predict_db_id=predict_db_id,
-                dataset_name=dataset_name,
-                db_info_index=db_info_index,
-            )
-        except FileNotFoundError:
-            append_log_entry(
-                log_records=log_records,
-                row=row,
-                predict_tables= [],
-                predict_columns= {},
-                table_response_text="No Vaild Database.",
-                column_response_text="No Vaild Database.",
+                predict_columns={},
+                table_response_text="No Valid Database.",
+                column_response_text="No Valid Database.",
                 answer_llm_name=answer_llm_name,
                 provider=provider,
                 output_path=output_path,
             )
             continue
 
-        table_prompt_column_keys = select_table_prompt_columns(
-            schema_df=total_schema_df,
+        predict_db_id = str(predict_db_id)
+        question = str(row["question"])
+        hint = resolve_hint(
+            row,
+            dataset_name=dataset_name,
+            documents_dir=documents_dir,
+        )
+        full_db_records = schema_store.get_column_records(predict_db_id)
+        if not full_db_records:
+            append_log_entry(
+                log_records=log_records,
+                row=row,
+                predict_tables=[],
+                predict_columns={},
+                table_response_text="No Valid Database.",
+                column_response_text="No Valid Database.",
+                answer_llm_name=answer_llm_name,
+                provider=provider,
+                output_path=output_path,
+            )
+            continue
+
+        table_schema_text, table_prompt_records = resolve_table_prompt_schema(
             predict_db_id=predict_db_id,
-            question=row["question"],
+            question=question,
             hint=hint,
             prompt_template=prompt_templates["table"],
             answer_llm=answer_llm,
             embedder=embedder,
+            schema_store=schema_store,
             qdrant_client=qdrant_client,
             qdrant_collection_name=qdrant_collection_name,
+            db_counts=db_counts,
         )
-        table_prompt = render_prompt(
-            prompt_templates["table"],
-            DATABASE_SCHEMA=build_db_schema_text(
-                schema_df=total_schema_df,
-                db_id=predict_db_id,
-                include_selected_tables=False,
-                selected_column_keys=table_prompt_column_keys,
-                include_empty_tables=True,
-            ),
-            QUESTION=row["question"],
-            HINT=hint,
+        table_prompt = render_schema_prompt(
+            prompt_template=prompt_templates["table"],
+            schema_text=table_schema_text,
+            question=question,
+            hint=hint,
         )
         table_response_text = answer_llm.query(table_prompt)
-        relevant_table_list = parse_table_response(table_response_text)
+        relevant_table_list = normalize_relevant_tables(
+            parse_table_response(table_response_text),
+            full_db_records,
+        )
 
-        if relevant_table_list:
-            relevant_schema_df = total_schema_df[total_schema_df["table_name"].isin(relevant_table_list)]
-        else:
-            relevant_schema_df = total_schema_df
-
-        column_prompt = render_prompt(
-            prompt_templates["column"],
-            DATABASE_SCHEMA=build_db_schema_text(
-                schema_df=relevant_schema_df,
-                db_id=predict_db_id,
-                include_selected_tables=True,
-            ),
-            QUESTION=row["question"],
-            HINT=hint,
+        column_prompt_records = resolve_column_prompt_records(
+            predict_db_id=predict_db_id,
+            question=question,
+            hint=hint,
+            relevant_table_list=relevant_table_list,
+            table_prompt_records=table_prompt_records,
+            schema_store=schema_store,
+            answer_llm=answer_llm,
+            prompt_template=prompt_templates["column"],
+        )
+        column_schema_text = schema_store.render_schema_text(
+            predict_db_id,
+            column_prompt_records,
+        )
+        column_prompt = render_schema_prompt(
+            prompt_template=prompt_templates["column"],
+            schema_text=column_schema_text,
+            question=question,
+            hint=hint,
         )
         column_response_text = answer_llm.query(column_prompt)
         predict_columns = parse_column_response(column_response_text)
         append_log_entry(
             log_records=log_records,
             row=row,
-            predict_tables= relevant_table_list,
-            predict_columns= predict_columns,
+            predict_tables=relevant_table_list,
+            predict_columns=predict_columns,
             table_response_text=table_response_text,
             column_response_text=column_response_text,
             answer_llm_name=answer_llm_name,
@@ -428,6 +414,7 @@ def main() -> None:
     db_info_path = args.db_info_path or (dataset_root / "db_info.json")
     qdrant_path = args.qdrant_path or (dataset_root / "qdrant_column_index")
     db_info_index = load_db_info_index(db_info_path)
+    db_counts = load_db_counts(db_info_index)
     qdrant_collection_name = load_qdrant_collection_name(qdrant_path)
     input_path = resolve_input_path(
         input_path=args.input_path,
@@ -483,6 +470,11 @@ def main() -> None:
 
     embedder = EmbeddingModelLoader()
     qdrant_client = get_qdrant_client(qdrant_path)
+    renderer = SchemaTextRenderer(tokenizer=answer_llm.tokenizer)
+    schema_store = DbInfoSchemaStore(
+        db_info_index=db_info_index,
+        renderer=renderer,
+    )
 
     processed_count = run_table2column(
         dataset_df=dataset_df,
@@ -490,7 +482,8 @@ def main() -> None:
         output_path=output_path,
         dataset_name=dataset_name,
         documents_dir=documents_dir,
-        db_info_index=db_info_index,
+        schema_store=schema_store,
+        db_counts=db_counts,
         embedder=embedder,
         qdrant_client=qdrant_client,
         qdrant_collection_name=qdrant_collection_name,

@@ -2,35 +2,20 @@
 You are an expert data analyst specializing in database querying.
 
 Your task is to identify the minimal set of columns used to write a correct SQL query that answers the question.
-
-The database schema provided to you has already been filtered to contain only relevant tables.
-Do NOT decide which tables are relevant.
-Your job is only to identify which columns from these provided tables are necessary for the SQL query.
-
-Only include columns that are necessary for the SQL query.
-Do not include irrelevant columns.
-Do not include extra columns just because they appear in the same table.
-Include join keys only when they are needed to connect tables in the SQL query.
-
-### Database Schema:
-The schema is organized into sections such as [DATABASE_ID], [SELECTED_TABLES], [FOREIGN_KEY_RELATIONSHIPS_WITHIN_SELECTED_TABLES], and [TABLE].
-
-Each column line provides:
-column_name | data_type | key_type | referenced_column | column_description | example_values
+The database schema provided to you has already been filtered to contain candidate tables for this question. The input schema is a rendered database excerpt: it begins with the database name, may include primary keys and foreign key relationships, and then lists each table with per-column fields such as column name, data type, description, sample values, and value descriptions. The excerpt may be filtered or truncated for prompt budget, so only use tables and columns that are explicitly shown. Do NOT decide which additional tables are relevant. Your job is to identify which visible columns from the provided tables are necessary for the SQL query. Only include columns that are necessary for the SQL query. Do not include irrelevant columns. Do not include extra columns just because they appear in the same table. Do not guess hidden columns that do not appear in the schema excerpt. Include join keys only when they are needed to connect tables in the SQL query and are visible in the schema excerpt.
 
 Important notes:
-- key_type is one of: PRIMARY KEY, FOREIGN KEY, NONE, NOT_AVAILABLE
-- referenced_column is a full column path such as TableName.ColumnName
-- referenced_column is NONE when the source data shows the column is not a foreign key
-- referenced_column is NOT_AVAILABLE when foreign key information is not provided in the source data
-- the foreign key relationship section is NONE when the source data shows no relationships in scope
-- column_description may be NOT_AVAILABLE
-- example_values may be NOT_AVAILABLE
-- Table names and column names must be used exactly as provided in the schema
+- The schema excerpt has already been filtered to candidate tables, and it may still include only a subset of columns because of prompt-budget filtering.
+- Primary keys are listed only for key columns that appear in the current schema excerpt.
+- Foreign key relationships are listed only when both linked columns appear in the current schema excerpt.
+- `Sample values` are separated by semicolons when multiple values are shown.
+- `NOT_AVAILABLE` means the source data does not provide that metadata.
+- `NONE` means the source data explicitly indicates there are no items in that section.
+- Table names and column names must be used exactly as provided in the schema excerpt.
 
 ### Hint:
 The hint (if provided) may highlight columns, conditions, or relationships that are relevant to the question.
-Use the hint as additional guidance, but rely primarily on the schema and the question.
+Use the hint as additional guidance, but rely primarily on the schema excerpt and the question.
 
 ### Output Requirements (STRICT):
 
@@ -46,15 +31,16 @@ Format:
 }
 
 Rules (STRICT):
-- Keys must be table names from the provided database schema.
-- Values must be lists of column names from the schema.
+- Keys must be table names from the provided schema excerpt.
+- Values must be lists of column names from the provided schema excerpt.
 - Use double quotes for all keys and strings.
-- Do NOT invent tables or columns that do not exist in the schema.
+- Do NOT invent tables or columns that do not exist in the schema excerpt.
 - Do NOT include explanations.
 - Do NOT include reasoning.
 - Do NOT include markdown or code blocks.
 - Do NOT include any text before or after the JSON.
 - Only include columns required for writing the SQL query.
+- If a required column is not visible in the schema excerpt, do NOT guess it.
 - If a table has no required columns, do NOT include that table.
 
 If no columns can be confidently identified, return:
@@ -64,28 +50,59 @@ You may reason internally to determine the correct columns, but do NOT output th
 Only output the final JSON object.
 
 ### Example 1:
-[DATABASE_ID]
-department_management
+Database: department_management
 
-[SELECTED_TABLES]
-- department
-- management
+Primary keys:
+- department: Department_ID
 
-[FOREIGN_KEY_RELATIONSHIPS_WITHIN_SELECTED_TABLES]
+Foreign key relationships:
 - management.department_ID -> department.Department_ID
 
-[TABLE] department
-- Department_ID | INT | PRIMARY KEY | NONE | Unique identifier for a department. | NOT_AVAILABLE
-- Name | TEXT | NONE | NONE | Department name. | NOT_AVAILABLE
-- Creation | TEXT | NONE | NONE | Creation date or period. | NOT_AVAILABLE
-- Ranking | INT | NONE | NONE | Department ranking. | NOT_AVAILABLE
-- Budget_in_Billions | REAL | NONE | NONE | Department budget. | NOT_AVAILABLE
-- Num_Employees | REAL | NONE | NONE | Number of employees. | NOT_AVAILABLE
+Table: department
 
-[TABLE] management
-- department_ID | INT | FOREIGN KEY | department.Department_ID | Department managed by a head. | NOT_AVAILABLE
-- head_ID | INT | NONE | NONE | Head managing the department. | NOT_AVAILABLE
-- temporary_acting | TEXT | NONE | NONE | Whether the head is temporary acting. | NOT_AVAILABLE
+Column: Department_ID
+Data type: INT
+Description: Unique identifier for a department.
+Sample values: NOT_AVAILABLE
+Value descriptions: NOT_AVAILABLE
+
+Column: Name
+Data type: TEXT
+Description: Department name.
+Sample values: NOT_AVAILABLE
+Value descriptions: NOT_AVAILABLE
+
+Column: Budget_in_Billions
+Data type: REAL
+Description: Department budget.
+Sample values: NOT_AVAILABLE
+Value descriptions: NOT_AVAILABLE
+
+Column: Num_Employees
+Data type: REAL
+Description: Number of employees.
+Sample values: NOT_AVAILABLE
+Value descriptions: NOT_AVAILABLE
+
+Table: management
+
+Column: department_ID
+Data type: INT
+Description: Department managed by a head.
+Sample values: NOT_AVAILABLE
+Value descriptions: NOT_AVAILABLE
+
+Column: head_ID
+Data type: INT
+Description: Head managing the department.
+Sample values: NOT_AVAILABLE
+Value descriptions: NOT_AVAILABLE
+
+Column: temporary_acting
+Data type: TEXT
+Description: Whether the head is temporary acting.
+Sample values: NOT_AVAILABLE
+Value descriptions: NOT_AVAILABLE
 
 Question:
 Which department currently headed by a temporary acting manager has the largest number of employees, and how many employees does it have?
@@ -102,35 +119,69 @@ response:
 }
 
 ### Example 2:
-[DATABASE_ID]
-activity_1
+Database: activity_1
 
-[SELECTED_TABLES]
-- Student
-- Participates_in
-- Activity
+Primary keys:
+- Student: StuID
+- Activity: actid
 
-[FOREIGN_KEY_RELATIONSHIPS_WITHIN_SELECTED_TABLES]
+Foreign key relationships:
 - Participates_in.stuid -> Student.StuID
 - Participates_in.actid -> Activity.actid
 
-[TABLE] Student
-- StuID | integer | PRIMARY KEY | NONE | Unique identifier for a student. | 1001, 1002, 1003
-- LName | text | NONE | NONE | Last name of the student. | Smith, Kim, Jones
-- Fname | text | NONE | NONE | First name of the student. | Linda, Tracy, Shiela
-- Age | integer | NONE | NONE | Age of the student. | 18, 19, 21
-- Sex | text | NONE | NONE | Gender of the student. | F, M
-- Major | integer | NONE | NONE | Major code of the student. | 600
-- Advisor | integer | NONE | NONE | Faculty ID of the student's advisor. | 1121, 7712, 7792
-- city_code | text | NONE | NONE | City code associated with the student. | BAL, HKG, WAS
+Table: Student
 
-[TABLE] Participates_in
-- stuid | integer | FOREIGN KEY | Student.StuID | Foreign key referencing the Student table, indicating the student participating. | 1001, 1002
-- actid | integer | FOREIGN KEY | Activity.actid | Foreign key referencing the Activity table, indicating the activity the student participates in. | 770, 771, 777
+Column: StuID
+Data type: integer
+Description: Unique identifier for a student.
+Sample values: 1001; 1002; 1003
+Value descriptions: NOT_AVAILABLE
 
-[TABLE] Activity
-- actid | integer | PRIMARY KEY | NONE | Unique identifier for an activity. | 770, 771, 772
-- activity_name | text | NONE | NONE | Name of the activity. | Mountain Climbing, Canoeing, Kayaking
+Column: LName
+Data type: text
+Description: Last name of the student.
+Sample values: Smith; Kim; Jones
+Value descriptions: NOT_AVAILABLE
+
+Column: Fname
+Data type: text
+Description: First name of the student.
+Sample values: Linda; Tracy; Shiela
+Value descriptions: NOT_AVAILABLE
+
+Column: Age
+Data type: integer
+Description: Age of the student.
+Sample values: 18; 19; 21
+Value descriptions: NOT_AVAILABLE
+
+Table: Participates_in
+
+Column: stuid
+Data type: integer
+Description: Student participating in an activity.
+Sample values: 1001; 1002
+Value descriptions: NOT_AVAILABLE
+
+Column: actid
+Data type: integer
+Description: Activity joined by the student.
+Sample values: 770; 771; 777
+Value descriptions: NOT_AVAILABLE
+
+Table: Activity
+
+Column: actid
+Data type: integer
+Description: Unique identifier for an activity.
+Sample values: 770; 771; 772
+Value descriptions: NOT_AVAILABLE
+
+Column: activity_name
+Data type: text
+Description: Name of the activity.
+Sample values: Mountain Climbing; Canoeing; Kayaking
+Value descriptions: NOT_AVAILABLE
 
 Question:
 Which activities does student Linda Smith participate in?
@@ -148,23 +199,45 @@ response:
 }
 
 ### Example 3:
-[DATABASE_ID]
-ADVENTUREWORKS
+Database: ADVENTUREWORKS
 
-[SELECTED_TABLES]
-- ADVENTUREWORKS.ADVENTUREWORKS.CURRENCYRATE
-
-[FOREIGN_KEY_RELATIONSHIPS_WITHIN_SELECTED_TABLES]
+Primary keys:
 NOT_AVAILABLE
 
-[TABLE] ADVENTUREWORKS.ADVENTUREWORKS.CURRENCYRATE
-- currencyrateid | INT | NOT_AVAILABLE | NOT_AVAILABLE | NOT_AVAILABLE | 2, 4, 5
-- tocurrencycode | STRING | NOT_AVAILABLE | NOT_AVAILABLE | NOT_AVAILABLE | AUD, CAD, CNY
-- endofdayrate | FLOAT | NOT_AVAILABLE | NOT_AVAILABLE | NOT_AVAILABLE | 1.55, 1.4683, 8.2784
-- modifieddate | TIMESTAMP | NOT_AVAILABLE | NOT_AVAILABLE | NOT_AVAILABLE | 2011-05-31 00:00:00
-- currencyratedate | TIMESTAMP | NOT_AVAILABLE | NOT_AVAILABLE | NOT_AVAILABLE | 2011-05-31 00:00:00
-- fromcurrencycode | STRING | NOT_AVAILABLE | NOT_AVAILABLE | NOT_AVAILABLE | USD
-- averagerate | FLOAT | NOT_AVAILABLE | NOT_AVAILABLE | NOT_AVAILABLE | 1.5491, 1.4641, 8.2781
+Foreign key relationships:
+NOT_AVAILABLE
+
+Table: ADVENTUREWORKS.ADVENTUREWORKS.CURRENCYRATE
+
+Column: currencyrateid
+Data type: INT
+Description: NOT_AVAILABLE
+Sample values: 2; 4; 5
+Value descriptions: NOT_AVAILABLE
+
+Column: tocurrencycode
+Data type: STRING
+Description: NOT_AVAILABLE
+Sample values: AUD; CAD; CNY
+Value descriptions: NOT_AVAILABLE
+
+Column: endofdayrate
+Data type: FLOAT
+Description: NOT_AVAILABLE
+Sample values: 1.55; 1.4683; 8.2784
+Value descriptions: NOT_AVAILABLE
+
+Column: fromcurrencycode
+Data type: STRING
+Description: NOT_AVAILABLE
+Sample values: USD
+Value descriptions: NOT_AVAILABLE
+
+Column: averagerate
+Data type: FLOAT
+Description: NOT_AVAILABLE
+Sample values: 1.5491; 1.4641; 8.2781
+Value descriptions: NOT_AVAILABLE
 
 Question:
 What are the average and end-of-day exchange rates from USD to CAD?
@@ -180,7 +253,7 @@ response:
 }
 
 ### INPUT:
-{DATABASE_SCHEMA}
+{DATABASE_SCHEMAS}
 
 Question:
 {QUESTION}

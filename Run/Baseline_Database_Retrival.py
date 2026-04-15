@@ -98,6 +98,8 @@ def database_schema_to_string(
 
 def run_baseline_retrieval(
     dataset_df: pd.DataFrame,
+    dataset_name: str,
+    documents_dir: Path,
     prompt_template: str,
     log_path: Path,
     database_schema_path: Path,
@@ -115,7 +117,11 @@ def run_baseline_retrieval(
             prompt_template,
             DATABASE_SCHEMAS=schemas_string,
             QUESTION=row["question"],
-            HINT=resolve_hint(row),
+            HINT=resolve_hint(
+                row,
+                dataset_name=dataset_name,
+                documents_dir=documents_dir,
+            ),
         )
         # prompt_token_count = ranking_llm.count_input_tokens(prompt)
         # print(f"[Baseline] instance_id={row['instance_id']} prompt_tokens={prompt_token_count}")
@@ -142,6 +148,7 @@ def main() -> None:
     max_generation_num = args.max_generation_num or MAX_GENERATEION_NUM
 
     dataset_root = PROJECT_ROOT / "Data" / dataset_name
+    documents_dir = dataset_root / "documents"
     dataset_df = load_dataset(dataset_root)
     database_schema_path = args.database_schema_path or (dataset_root / "Database_schemas_summary.json")
 
@@ -173,6 +180,7 @@ def main() -> None:
         extra_fields={
             "Prompt template": prompt_path,
             "Database schema path": database_schema_path,
+            "Documents dir": documents_dir,
             "Max input length": max_input_length,
             "Max generation num": max_generation_num,
             "Logger path": logger_path,
@@ -181,6 +189,8 @@ def main() -> None:
 
     database_count = run_baseline_retrieval(
         dataset_df=dataset_df,
+        dataset_name=dataset_name,
+        documents_dir=documents_dir,
         prompt_template=prompt_template,
         log_path=log_path,
         database_schema_path=database_schema_path,

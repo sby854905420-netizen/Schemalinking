@@ -4,7 +4,7 @@ import json
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import pandas as pd
 
@@ -20,6 +20,199 @@ SCHEMA_DF_COLUMNS = [
 ]
 
 
+def clean_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return str(value).strip()
+
+
+def get_indexed_value(values: Any, index: int, default: Any = None) -> Any:
+    if not isinstance(values, list):
+        return default
+    if index < 0 or index >= len(values):
+        return default
+    return values[index]
+
+
+def build_sample_values(
+    sample_rows: Any,
+    table_name: str,
+    column_name: str,
+    limit: int | None = None,
+    deduplicate: bool = False,
+) -> list[Any]:
+    values: list[Any] = []
+    seen: set[str] = set()
+    if not isinstance(sample_rows, dict):
+        return values
+
+    table_rows = sample_rows.get(table_name, [])
+    if not isinstance(table_rows, list):
+        return values
+
+    for row in table_rows:
+        if not isinstance(row, dict) or column_name not in row:
+            continue
+
+        value = row[column_name]
+        if value is None:
+            continue
+        if isinstance(value, str) and value.strip() == "":
+            continue
+
+        if deduplicate:
+            key = json.dumps(value, ensure_ascii=False, sort_keys=True)
+            if key in seen:
+                continue
+            seen.add(key)
+
+        values.append(value)
+        if limit is not None and len(values) >= limit:
+            break
+
+    return values
+
+
+def build_sample_values_text(sample_values: list[Any]) -> str:
+    safe_values: list[str] = []
+    for value in sample_values:
+        normalized_value = clean_text(value)
+        if normalized_value:
+            safe_values.append(normalized_value)
+    return ", ".join(safe_values)
+
+
+def flatten_primary_keys(primary_keys: Any) -> set[int]:
+    primary_key_indices: set[int] = set()
+    if not isinstance(primary_keys, list):
+        return primary_key_indices
+
+    for entry in primary_keys:
+        if isinstance(entry, list):
+            for index in entry:
+                if isinstance(index, int):
+                    primary_key_indices.add(index)
+            continue
+        if isinstance(entry, int):
+            primary_key_indices.add(entry)
+
+    return primary_key_indices
+
+
+def build_foreign_key_map(foreign_keys: Any) -> dict[int, int]:
+    foreign_key_map: dict[int, int] = {}
+    if not isinstance(foreign_keys, list):
+        return foreign_key_map
+
+    for entry in foreign_keys:
+        if not isinstance(entry, list) or len(entry) != 2:
+            continue
+        source_idx, target_idx = entry
+        if not isinstance(source_idx, int) or not isinstance(target_idx, int):
+            continue
+        foreign_key_map[source_idx] = target_idx
+
+    return foreign_key_map
+
+
+def build_foreign_key_text(
+    db_entry: dict[str, Any],
+    column_idx: int,
+    foreign_key_map: dict[int, int],
+) -> str:
+    target_idx = foreign_key_map.get(column_idx)
+    if target_idx is None:
+        return ""
+
+    target_entry = get_indexed_value(db_entry.get("column_names"), target_idx)
+    if not isinstance(target_entry, list) or len(target_entry) != 2:
+        return ""
+
+    target_table_idx, target_column_name = target_entry
+    if target_table_idx == -1 or target_column_name == "*":
+        return ""
+
+    target_table_name = clean_text(get_indexed_value(db_entry.get("table_names"), target_table_idx, ""))
+    if not target_table_name:
+        return ""
+
+    return f"{target_table_name}.{target_column_name}"
+
+
+def build_value_descriptions(db_entry: dict[str, Any], column_idx: int) -> str:
+    return clean_text(get_indexed_value(db_entry.get("value_descriptions"), column_idx, ""))
+
+
+def build_column_record_from_db_info(
+    db_entry: dict[str, Any],
+    column_idx: int,
+    primary_key_indices: set[int] | None = None,
+    foreign_key_map: dict[int, int] | None = None,
+) -> dict[str, Any] | None:
+    column_entry = get_indexed_value(db_entry.get("column_names"), column_idx)
+    if not isinstance(column_entry, list) or len(column_entry) != 2:
+        return None
+
+    table_idx, column_name = column_entry
+    if table_idx == -1 or column_name == "*":
+        return None
+
+    table_name = clean_text(get_indexed_value(db_entry.get("table_names"), table_idx, ""))
+    db_id = clean_text(db_entry.get("db_id"))
+    normalized_column_name = clean_text(column_name)
+    if not db_id or not table_name or not normalized_column_name:
+        return None
+
+    resolved_primary_key_indices = primary_key_indices or set()
+    resolved_foreign_key_map = foreign_key_map or {}
+    sample_values = build_sample_values(
+        sample_rows=db_entry.get("sample_rows", {}),
+        table_name=table_name,
+        column_name=normalized_column_name,
+    )
+
+    return {
+        "column_id": f"{db_id}.{table_name}.{normalized_column_name}",
+        "column_name": normalized_column_name,
+        "column_description": clean_text(get_indexed_value(db_entry.get("column_descriptions"), column_idx, "")),
+        "column_data_type": clean_text(get_indexed_value(db_entry.get("column_types"), column_idx, "")),
+        "sample_values": sample_values,
+        "sample_values_text": build_sample_values_text(sample_values),
+        "is_primary_key": column_idx in resolved_primary_key_indices,
+        "is_foreign_key": column_idx in resolved_foreign_key_map,
+        "value_descriptions": build_value_descriptions(db_entry, column_idx),
+        "foreign_key": clean_text(build_foreign_key_text(db_entry, column_idx, resolved_foreign_key_map)),
+        "db_id": db_id,
+        "table_name": table_name,
+        "meta_data": {
+            "db_id": db_id,
+            "table_name": table_name,
+        },
+    }
+
+
+def iter_column_records_from_db_info(db_entry: dict[str, Any]) -> Iterable[dict[str, Any]]:
+    primary_key_indices = flatten_primary_keys(db_entry.get("primary_keys", []))
+    foreign_key_map = build_foreign_key_map(db_entry.get("foreign_keys", []))
+    column_names = db_entry.get("column_names", [])
+    if not isinstance(column_names, list):
+        return
+
+    for column_idx in range(len(column_names)):
+        record = build_column_record_from_db_info(
+            db_entry=db_entry,
+            column_idx=column_idx,
+            primary_key_indices=primary_key_indices,
+            foreign_key_map=foreign_key_map,
+        )
+        if record is not None:
+            yield record
+
+
 def load_db_info_index(db_info_path: Path) -> dict[str, dict[str, Any]]:
     if not db_info_path.is_file():
         raise FileNotFoundError(f"Could not find db_info.json at {db_info_path}.")
@@ -32,10 +225,20 @@ def load_db_info_index(db_info_path: Path) -> dict[str, dict[str, Any]]:
     for entry in db_info:
         if not isinstance(entry, dict):
             continue
-        db_id = entry.get("db_id")
-        if isinstance(db_id, str) and db_id.strip():
+        db_id = clean_text(entry.get("db_id"))
+        if db_id:
             index[db_id] = entry
     return index
+
+
+def load_column_records_from_db_info(
+    predict_db_id: str,
+    db_info_index: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    db_entry = db_info_index.get(predict_db_id)
+    if db_entry is None:
+        raise FileNotFoundError(f"Could not find schema for database '{predict_db_id}' in db_info.json.")
+    return list(iter_column_records_from_db_info(db_entry))
 
 
 def extract_timestamp(path: Path, dataset_name: str, timestamp_pattern_template: str) -> str | None:
@@ -144,11 +347,60 @@ def get_row_value(row: pd.Series, *keys: str) -> Any:
     return None
 
 
-def resolve_hint(source: Any, key: str = "external_knowledge") -> str:
+def resolve_hint_source_value(source: Any, key: str = "external_knowledge") -> Any:
     if hasattr(source, "get"):
-        value = source.get(key)
-    else:
-        value = source
+        return source.get(key)
+    return source
+
+
+def resolve_document_backed_hint(
+    value: Any,
+    dataset_name: str | None = None,
+    documents_dir: Path | None = None,
+) -> Any:
+    """Resolve dataset-specific hint storage into prompt-ready content.
+
+    Convention:
+    - Spider2 stores `external_knowledge` as a document filename under
+      `Data/Spider2/documents/`.
+    - Other datasets store `external_knowledge` as direct prompt text, so the
+      value should pass through unchanged.
+    """
+    if not dataset_name or dataset_name.lower() != "spider2":
+        return value
+
+    if not isinstance(value, str):
+        return value
+
+    document_name = value.strip()
+    if not document_name or documents_dir is None:
+        return value
+
+    document_path = documents_dir / document_name
+    if not document_path.is_file():
+        return value
+
+    return document_path.read_text(encoding="utf-8").strip()
+
+
+def resolve_hint(
+    source: Any,
+    key: str = "external_knowledge",
+    dataset_name: str | None = None,
+    documents_dir: Path | None = None,
+) -> str:
+    """Load and normalize hint text for prompting.
+
+    The default `external_knowledge` field is used across datasets, but its
+    storage differs by dataset. This helper centralizes the convention so call
+    sites can always request final prompt text from one place.
+    """
+    value = resolve_hint_source_value(source, key=key)
+    value = resolve_document_backed_hint(
+        value,
+        dataset_name=dataset_name,
+        documents_dir=documents_dir,
+    )
 
     if value is None:
         return "No hint"
@@ -184,57 +436,6 @@ def normalize_response_text(response_text: str) -> str:
     return normalized_response
 
 
-def build_sample_values(
-    sample_rows: dict[str, list[dict[str, Any]]],
-    table_name: str,
-    column_name: str,
-    limit: int = 5,
-) -> list[Any]:
-    values: list[Any] = []
-    seen: set[str] = set()
-
-    for row in sample_rows.get(table_name, []):
-        if column_name not in row:
-            continue
-
-        value = row[column_name]
-        if value is None:
-            continue
-        if isinstance(value, str) and value.strip() == "":
-            continue
-
-        key = json.dumps(value, ensure_ascii=False, sort_keys=True)
-        if key in seen:
-            continue
-
-        seen.add(key)
-        values.append(value)
-        if len(values) >= limit:
-            break
-
-    return values
-
-
-def flatten_primary_keys(primary_keys: list[Any]) -> set[int]:
-    primary_key_indices: set[int] = set()
-    for entry in primary_keys:
-        if isinstance(entry, list):
-            primary_key_indices.update(entry)
-        else:
-            primary_key_indices.add(entry)
-    return primary_key_indices
-
-
-def build_foreign_key_map(foreign_keys: list[list[int]]) -> dict[int, int]:
-    foreign_key_map: dict[int, int] = {}
-    for entry in foreign_keys:
-        if not isinstance(entry, list) or len(entry) != 2:
-            continue
-        source_idx, target_idx = entry
-        foreign_key_map[source_idx] = target_idx
-    return foreign_key_map
-
-
 def has_explicit_key_metadata(dataset_name: str, db_entry: dict[str, Any]) -> bool:
     if dataset_name.lower() == "spider2":
         return False
@@ -266,15 +467,21 @@ def build_schema_dataframe_from_db_info(db_entry: dict[str, Any], dataset_name: 
         if table_idx == -1 or column_name == "*":
             continue
 
-        table_name = table_names[table_idx]
-        data_type = column_types[column_idx] if column_idx < len(column_types) else "NOT_AVAILABLE"
-        description = (
-            column_descriptions[column_idx]
-            if column_idx < len(column_descriptions) and column_descriptions[column_idx]
-            else "NOT_AVAILABLE"
-        )
+        table_name = clean_text(get_indexed_value(table_names, table_idx, ""))
+        normalized_column_name = clean_text(column_name)
+        if not table_name or not normalized_column_name:
+            continue
+
+        data_type = clean_text(get_indexed_value(column_types, column_idx, "")) or "NOT_AVAILABLE"
+        description = clean_text(get_indexed_value(column_descriptions, column_idx, "")) or "NOT_AVAILABLE"
         example_values = format_example_values(
-            build_sample_values(sample_rows=sample_rows, table_name=table_name, column_name=column_name)
+            build_sample_values(
+                sample_rows=sample_rows,
+                table_name=table_name,
+                column_name=normalized_column_name,
+                limit=5,
+                deduplicate=True,
+            )
         )
 
         if key_metadata_available:
@@ -282,10 +489,8 @@ def build_schema_dataframe_from_db_info(db_entry: dict[str, Any], dataset_name: 
                 key_type = "PRIMARY KEY"
                 referenced_column = "NONE"
             elif column_idx in foreign_key_map:
-                target_idx = foreign_key_map[column_idx]
-                target_table_idx, target_column_name = column_names[target_idx]
                 key_type = "FOREIGN KEY"
-                referenced_column = f"{table_names[target_table_idx]}.{target_column_name}"
+                referenced_column = build_foreign_key_text(db_entry, column_idx, foreign_key_map) or "NONE"
             else:
                 key_type = "NONE"
                 referenced_column = "NONE"
@@ -296,7 +501,7 @@ def build_schema_dataframe_from_db_info(db_entry: dict[str, Any], dataset_name: 
         records.append(
             {
                 "table_name": table_name,
-                "column_name": column_name,
+                "column_name": normalized_column_name,
                 "data_type": data_type,
                 "key_type": key_type,
                 "referenced_column": referenced_column,

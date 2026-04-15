@@ -34,7 +34,7 @@
 - `Data/MMQA/Database_schemas_summary.json`
 - `Data/MMQA/Table_schema_csv/`
 - `Data/MMQA/qdrant_column_index/`
-- `Data/MMQA/Column_level_schema/`
+- `Data/MMQA/db_info.json`
 
 默认配置位于 [`config.py`](/home/xubeiyu/projects/Schemalinking/config.py)。
 
@@ -181,5 +181,5 @@ python -m Run.table2column \
 
 - `Baseline_Schema_Linking.py` 和 `table2column.py` 的输入文件中必须包含 `predict_db_id`。
 - 如果不传 `--input-path`，这两个脚本会自动从 `Logs/<model>/Database_Retrival/` 中查找最新结果文件。
-- `Global_Coarse_Retrieval.py` 依赖本地向量索引、`qdrant-client`、`torch` 和 embedding 模型。
+- `Global_Coarse_Retrieval.py` 依赖 `db_info.json`、本地向量索引、`qdrant-client`、`torch` 和 embedding 模型。
 - 仓库中的文件名使用的是 `Retrival` 这一拼写，运行脚本时请按实际文件名输入。

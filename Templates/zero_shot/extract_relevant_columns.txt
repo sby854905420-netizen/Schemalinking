@@ -2,35 +2,20 @@
 You are an expert data analyst specializing in database querying.
 
 Your task is to identify the minimal set of columns used to write a correct SQL query that answers the question.
-
-The database schema provided to you has already been filtered to contain only relevant tables.
-Do NOT decide which tables are relevant.
-Your job is only to identify which columns from these provided tables are necessary for the SQL query.
-
-Only include columns that are necessary for the SQL query.
-Do not include irrelevant columns.
-Do not include extra columns just because they appear in the same table.
-Include join keys only when they are needed to connect tables in the SQL query.
-
-### Database Schema:
-The schema is organized into sections such as [DATABASE_ID], [SELECTED_TABLES], [FOREIGN_KEY_RELATIONSHIPS_WITHIN_SELECTED_TABLES], and [TABLE].
-
-Each column line provides:
-column_name | data_type | key_type | referenced_column | column_description | example_values
+The database schema provided to you has already been filtered to contain candidate tables for this question. The input schema is a rendered database excerpt: it begins with the database name, may include primary keys and foreign key relationships, and then lists each table with per-column fields such as column name, data type, description, sample values, and value descriptions. The excerpt may be filtered or truncated for prompt budget, so only use tables and columns that are explicitly shown. Do NOT decide which additional tables are relevant. Your job is to identify which visible columns from the provided tables are necessary for the SQL query. Only include columns that are necessary for the SQL query. Do not include irrelevant columns. Do not include extra columns just because they appear in the same table. Do not guess hidden columns that do not appear in the schema excerpt. Include join keys only when they are needed to connect tables in the SQL query and are visible in the schema excerpt.
 
 Important notes:
-- key_type is one of: PRIMARY KEY, FOREIGN KEY, NONE, NOT_AVAILABLE
-- referenced_column is a full column path such as TableName.ColumnName
-- referenced_column is NONE when the source data shows the column is not a foreign key
-- referenced_column is NOT_AVAILABLE when foreign key information is not provided in the source data
-- the foreign key relationship section is NONE when the source data shows no relationships in scope
-- column_description may be NOT_AVAILABLE
-- example_values may be NOT_AVAILABLE
-- Table names and column names must be used exactly as provided in the schema
+- The schema excerpt has already been filtered to candidate tables, and it may still include only a subset of columns because of prompt-budget filtering.
+- Primary keys are listed only for key columns that appear in the current schema excerpt.
+- Foreign key relationships are listed only when both linked columns appear in the current schema excerpt.
+- `Sample values` are separated by semicolons when multiple values are shown.
+- `NOT_AVAILABLE` means the source data does not provide that metadata.
+- `NONE` means the source data explicitly indicates there are no items in that section.
+- Table names and column names must be used exactly as provided in the schema excerpt.
 
 ### Hint:
 The hint (if provided) may highlight columns, conditions, or relationships that are relevant to the question.
-Use the hint as additional guidance, but rely primarily on the schema and the question.
+Use the hint as additional guidance, but rely primarily on the schema excerpt and the question.
 
 ### Output Requirements (STRICT):
 
@@ -46,15 +31,16 @@ Format:
 }
 
 Rules (STRICT):
-- Keys must be table names from the provided database schema.
-- Values must be lists of column names from the schema.
+- Keys must be table names from the provided schema excerpt.
+- Values must be lists of column names from the provided schema excerpt.
 - Use double quotes for all keys and strings.
-- Do NOT invent tables or columns that do not exist in the schema.
+- Do NOT invent tables or columns that do not exist in the schema excerpt.
 - Do NOT include explanations.
 - Do NOT include reasoning.
 - Do NOT include markdown or code blocks.
 - Do NOT include any text before or after the JSON.
 - Only include columns required for writing the SQL query.
+- If a required column is not visible in the schema excerpt, do NOT guess it.
 - If a table has no required columns, do NOT include that table.
 
 If no columns can be confidently identified, return:
@@ -64,7 +50,7 @@ You may reason internally to determine the correct columns, but do NOT output th
 Only output the final JSON object.
 
 ### INPUT:
-{DATABASE_SCHEMA}
+{DATABASE_SCHEMAS}
 
 Question:
 {QUESTION}

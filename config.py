@@ -8,7 +8,7 @@ DATASET_NAME = "MMQA"
 
 DEFAULT_QDRANT_PATH = PROJECT_ROOT / "Data" / DATASET_NAME / "qdrant_column_index"
 
-DEFAULT_SCHEMA_DIR = PROJECT_ROOT / "Data" / DATASET_NAME / "Column_level_schema"
+DEFAULT_DB_INFO_PATH = PROJECT_ROOT / "Data" / DATASET_NAME / "db_info.json"
 
 DEVICE = "cuda"
 
@@ -44,4 +44,3 @@ TABLE2COLUMN_QUERY_SETTINGS = {
 }
 
 THINKING_MODE = False
-

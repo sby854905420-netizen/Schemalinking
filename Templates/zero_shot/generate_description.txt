@@ -74,7 +74,7 @@ If the schema is insufficient to determine meaning, produce the most reasonable 
 ### INPUT:
 
 Database Schema:
-{DATABASE_SCHEMA}
+{DATABASE_SCHEMAS}
 
 Data Samples:
 {DATA_SAMPLES}

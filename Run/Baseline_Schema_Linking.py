@@ -10,11 +10,11 @@ import pandas as pd
 from config import *
 from Llm.llm_loader import LLM
 from Run.logging_utils import log_run_configuration, setup_task_logger
+from Utils.render_tools import SchemaTextRenderer
+from Utils.schema_selection import DbInfoSchemaStore
 from Utils.tools import (
-    build_db_schema_text,
     get_row_value,
     load_db_info_index,
-    load_schema_dataframe_from_db_info,
     normalize_response_text,
     render_prompt,
     resolve_hint,
@@ -109,9 +109,10 @@ def append_log_entry(
 def run_baseline_schema_linking(
     dataset_df: Any,
     dataset_name: str,
+    documents_dir: Path,
     prompt_template: str,
     output_path: Path,
-    db_info_index: dict[str, dict[str, Any]],
+    schema_store: DbInfoSchemaStore,
     answer_llm: Any,
     answer_llm_name: str,
     provider: str,
@@ -132,14 +133,9 @@ def run_baseline_schema_linking(
                 output_path=output_path,
             )
             continue
-        try:
-            schema_df = load_schema_dataframe_from_db_info(
-                predict_db_id=str(predict_db_id),
-                dataset_name=dataset_name,
-                db_info_index=db_info_index,
-            )
-            database_schema = build_db_schema_text(schema_df=schema_df, db_id=str(predict_db_id))
-        except FileNotFoundError:
+        predict_db_id = str(predict_db_id)
+        column_records = schema_store.get_column_records(predict_db_id)
+        if not column_records:
             append_log_entry(
                 log_records=log_records,
                 row=row,
@@ -149,11 +145,16 @@ def run_baseline_schema_linking(
                 output_path=output_path,
             )
             continue
+        database_schema = schema_store.get_full_schema_text(predict_db_id)
         prompt = render_prompt(
             prompt_template,
-            DATABASE_SCHEMA=database_schema,
+            DATABASE_SCHEMAS=database_schema,
             QUESTION=row["question"],
-            HINT=resolve_hint(row),
+            HINT=resolve_hint(
+                row,
+                dataset_name=dataset_name,
+                documents_dir=documents_dir,
+            ),
         )
         response_text = answer_llm.query(prompt)
         append_log_entry(
@@ -179,6 +180,7 @@ def main() -> None:
     max_generation_num = args.max_generation_num or MAX_GENERATEION_NUM
 
     dataset_root = PROJECT_ROOT / "Data" / dataset_name
+    documents_dir = dataset_root / "documents"
     logs_dir = args.logs_dir or (PROJECT_ROOT / "Logs")
     prompt_path = PROJECT_ROOT / "Templates" / method_name / "baseline_schema_linking.txt"
     db_info_path = args.db_info_path or (dataset_root / "db_info.json")
@@ -216,6 +218,7 @@ def main() -> None:
             "Input path": input_path,
             "Prompt template": prompt_path,
             "DB info path": db_info_path,
+            "Documents dir": documents_dir,
             "Max input length": max_input_length,
             "Max generation num": max_generation_num,
             "Logger path": logger_path,
@@ -229,13 +232,19 @@ def main() -> None:
         max_generation_num=max_generation_num,
         query_settings=BASELINE_SCHEMA_LINKING_QUERY_SETTINGS,
     )
+    renderer = SchemaTextRenderer(tokenizer=answer_llm.tokenizer)
+    schema_store = DbInfoSchemaStore(
+        db_info_index=db_info_index,
+        renderer=renderer,
+    )
 
     processed_count = run_baseline_schema_linking(
         dataset_df=dataset_df,
         dataset_name=dataset_name,
+        documents_dir=documents_dir,
         prompt_template=prompt_template,
         output_path=output_path,
-        db_info_index=db_info_index,
+        schema_store=schema_store,
         answer_llm=answer_llm,
         answer_llm_name=answer_llm_name,
         provider=provider,
