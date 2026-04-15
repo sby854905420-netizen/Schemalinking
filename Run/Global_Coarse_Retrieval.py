@@ -716,7 +716,7 @@ def main() -> None:
                 'model': answer_llm_name,
                 'provider': provider,
                 'id': f"{row['id']}",
-                'spider_db_id': row['db_id'],
+                'gold_db_id': row['db_id'],
                 'question': row['question'],
                 'FCD_ids': ",".join(FCD_db_ids),
                 'CFCD_db_ids': ",".join(final_cfcd_db_ids),
