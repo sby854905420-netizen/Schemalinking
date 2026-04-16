@@ -40,7 +40,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_dataset(dataset_root: Path) -> pd.DataFrame:
-    return pd.read_json(dataset_root / "preprocessed_data.json")
+    return pd.read_json(dataset_root / "gold_sl.json")
 
 
 def load_database_schema(path: Path) -> dict[str, str]:
@@ -79,7 +79,7 @@ def append_log_entry(
         {
             "model": answer_llm_name,
             "provider": provider,
-            "id": f"{row['instance_id']}",
+            "id": f"{row['id']}",
             "spider_db_id": row["db_id"],
             "question": row["question"],
             "pre_db_response": response_text,
@@ -124,7 +124,7 @@ def run_baseline_retrieval(
             ),
         )
         # prompt_token_count = ranking_llm.count_input_tokens(prompt)
-        # print(f"[Baseline] instance_id={row['instance_id']} prompt_tokens={prompt_token_count}")
+        # print(f"[Baseline] id={row['id']} prompt_tokens={prompt_token_count}")
         response_text = ranking_llm.query(prompt)
         append_log_entry(
             log_records=log_records,
