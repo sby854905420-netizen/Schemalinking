@@ -15,6 +15,7 @@ from Llm.embedding_model_loader import EmbeddingModelLoader
 from config import *
 from Llm.llm_loader import LLM
 from Run.logging_utils import log_run_configuration, setup_task_logger
+from Utils.efficiency_utils import SampleEfficiencyTracker
 from Utils.render_tools import SchemaTextRenderer
 from Utils.schema_selection import (
     DbInfoSchemaStore,
@@ -278,6 +279,7 @@ def CFCD_rerank_select(query:str, query_vector: list[float], ranking_llm:LLM,
                        qdrant_client: QdrantClient,
                        collection_name: str,
                        db_counts: dict[str, int],
+                       efficiency_tracker: SampleEfficiencyTracker | None = None,
                        logger: logging.Logger | None = None,
                        enable_progress_log: bool = False,
                        sample_tag: str = ""):
@@ -373,7 +375,9 @@ def CFCD_rerank_select(query:str, query_vector: list[float], ranking_llm:LLM,
                 target_prompt_cap,
             )
             continue
-        next_token_logits = ranking_llm._query_transformers(prompt, output_hidden_states=True)
+        next_token_logits, total_tokens = ranking_llm.query_logits_with_usage(prompt)
+        if efficiency_tracker is not None:
+            efficiency_tracker.add_llm_total_tokens(total_tokens)
         yes_prob_binary = compute_yes_probability(next_token_logits,ranking_llm.tokenizer)
         yes_scores.append(float(yes_prob_binary.detach()))
         log_progress(
@@ -498,6 +502,7 @@ def main() -> None:
 
     total_samples = len(dataset_df)
     for sample_index, (_, row) in enumerate(tqdm(dataset_df.iterrows(), total=total_samples)):
+        efficiency_tracker = SampleEfficiencyTracker()
         sample_tag = build_sample_tag(row, sample_index, total_samples)
         log_progress(
             logger,
@@ -586,6 +591,7 @@ def main() -> None:
                 qdrant_client=client,
                 collection_name=collection_name,
                 db_counts=db_counts,
+                efficiency_tracker=efficiency_tracker,
                 logger=logger,
                 enable_progress_log=enable_progress_log,
                 sample_tag=sample_tag,
@@ -621,6 +627,7 @@ def main() -> None:
                 qdrant_client=client,
                 collection_name=collection_name,
                 db_counts=db_counts,
+                efficiency_tracker=efficiency_tracker,
                 logger=logger,
                 enable_progress_log=enable_progress_log,
                 sample_tag=sample_tag,
@@ -698,6 +705,7 @@ def main() -> None:
                 qdrant_client=client,
                 collection_name=collection_name,
                 db_counts=db_counts,
+                efficiency_tracker=efficiency_tracker,
                 logger=logger,
                 enable_progress_log=enable_progress_log,
                 sample_tag=sample_tag,
@@ -720,7 +728,8 @@ def main() -> None:
                 'question': row['question'],
                 'FCD_ids': ",".join(FCD_db_ids),
                 'CFCD_db_ids': ",".join(final_cfcd_db_ids),
-                'predict_db_id': target_db_id[0] if target_db_id else None
+                'predict_db_id': target_db_id[0] if target_db_id else None,
+                'efficiency': efficiency_tracker.finalize(),
             }
         )
         log_path.write_text(json.dumps(log_records, ensure_ascii=False, indent=2), encoding='utf-8')

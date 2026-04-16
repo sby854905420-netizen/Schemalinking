@@ -10,6 +10,7 @@ import pandas as pd
 from config import *
 from Llm.llm_loader import LLM
 from Run.logging_utils import log_run_configuration, setup_task_logger
+from Utils.efficiency_utils import SampleEfficiencyTracker
 from Utils.render_tools import SchemaTextRenderer
 from Utils.schema_selection import DbInfoSchemaStore
 from Utils.tools import (
@@ -86,11 +87,13 @@ def append_log_entry(
     log_records: list[dict[str, Any]],
     row: Any,
     response_text: str,
+    efficiency_tracker: SampleEfficiencyTracker,
     answer_llm_name: str,
     provider: str,
     output_path: Path,
 ) -> None:
     predict_columns = parse_sl_response(response_text)
+    efficiency = efficiency_tracker.finalize()
     log_records.append(
         {
             "model": answer_llm_name,
@@ -101,6 +104,7 @@ def append_log_entry(
             "predict_db_id": get_row_value(row, "predict_db_id"),
             "predict_columns_text": response_text,
             "predict_columns": predict_columns,
+            "efficiency": efficiency,
         }
     )
     output_path.write_text(json.dumps(log_records, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -122,12 +126,14 @@ def run_baseline_schema_linking(
     log_records: list[dict[str, Any]] = []
 
     for _, row in tqdm(dataset_df.iterrows(), total=len(dataset_df)):
+        efficiency_tracker = SampleEfficiencyTracker()
         predict_db_id = get_row_value(row, "predict_db_id")
         if predict_db_id is None or str(predict_db_id).strip() == "":
             append_log_entry(
                 log_records=log_records,
                 row=row,
                 response_text="No Valid Database.",
+                efficiency_tracker=efficiency_tracker,
                 answer_llm_name=answer_llm_name,
                 provider=provider,
                 output_path=output_path,
@@ -140,6 +146,7 @@ def run_baseline_schema_linking(
                 log_records=log_records,
                 row=row,
                 response_text="No Valid Database.",
+                efficiency_tracker=efficiency_tracker,
                 answer_llm_name=answer_llm_name,
                 provider=provider,
                 output_path=output_path,
@@ -156,11 +163,13 @@ def run_baseline_schema_linking(
                 documents_dir=documents_dir,
             ),
         )
-        response_text = answer_llm.query(prompt)
+        response_text, total_tokens = answer_llm.query_with_usage(prompt)
+        efficiency_tracker.add_llm_total_tokens(total_tokens)
         append_log_entry(
             log_records=log_records,
             row=row,
             response_text=response_text,
+            efficiency_tracker=efficiency_tracker,
             answer_llm_name=answer_llm_name,
             provider=provider,
             output_path=output_path,

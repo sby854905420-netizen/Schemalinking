@@ -10,6 +10,7 @@ import pandas as pd
 from config import *
 from Llm.llm_loader import LLM
 from Run.logging_utils import log_run_configuration, setup_task_logger
+from Utils.efficiency_utils import SampleEfficiencyTracker
 from Utils.render_tools import SchemaTextRenderer
 from Utils.schema_selection import (
     DbInfoSchemaStore,
@@ -258,11 +259,12 @@ def append_log_entry(
     predict_columns:dict,
     table_response_text: str,
     column_response_text: str,
+    efficiency_tracker: SampleEfficiencyTracker,
     answer_llm_name: str,
     provider: str,
     output_path: Path,
 ) -> None:
-    
+    efficiency = efficiency_tracker.finalize()
     log_records.append(
         {
             "model": answer_llm_name,
@@ -275,6 +277,7 @@ def append_log_entry(
             "predict_columns_text":column_response_text,
             "predict_tables": predict_tables,
             "predict_columns": predict_columns,
+            "efficiency": efficiency,
         }
     )
     output_path.write_text(json.dumps(log_records, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -300,6 +303,7 @@ def run_table2column(
     log_records: list[dict[str, Any]] = []
 
     for _, row in tqdm(dataset_df.iterrows(), total=len(dataset_df)):
+        efficiency_tracker = SampleEfficiencyTracker()
         predict_db_id = get_row_value(row, "predict_db_id")
         if predict_db_id is None or str(predict_db_id).strip() == "":
             append_log_entry(
@@ -309,6 +313,7 @@ def run_table2column(
                 predict_columns={},
                 table_response_text="No Valid Database.",
                 column_response_text="No Valid Database.",
+                efficiency_tracker=efficiency_tracker,
                 answer_llm_name=answer_llm_name,
                 provider=provider,
                 output_path=output_path,
@@ -331,6 +336,7 @@ def run_table2column(
                 predict_columns={},
                 table_response_text="No Valid Database.",
                 column_response_text="No Valid Database.",
+                efficiency_tracker=efficiency_tracker,
                 answer_llm_name=answer_llm_name,
                 provider=provider,
                 output_path=output_path,
@@ -355,7 +361,8 @@ def run_table2column(
             question=question,
             hint=hint,
         )
-        table_response_text = answer_llm.query(table_prompt)
+        table_response_text, table_total_tokens = answer_llm.query_with_usage(table_prompt)
+        efficiency_tracker.add_llm_total_tokens(table_total_tokens)
         relevant_table_list = normalize_relevant_tables(
             parse_table_response(table_response_text),
             full_db_records,
@@ -381,7 +388,8 @@ def run_table2column(
             question=question,
             hint=hint,
         )
-        column_response_text = answer_llm.query(column_prompt)
+        column_response_text, column_total_tokens = answer_llm.query_with_usage(column_prompt)
+        efficiency_tracker.add_llm_total_tokens(column_total_tokens)
         predict_columns = parse_column_response(column_response_text)
         append_log_entry(
             log_records=log_records,
@@ -390,6 +398,7 @@ def run_table2column(
             predict_columns=predict_columns,
             table_response_text=table_response_text,
             column_response_text=column_response_text,
+            efficiency_tracker=efficiency_tracker,
             answer_llm_name=answer_llm_name,
             provider=provider,
             output_path=output_path,

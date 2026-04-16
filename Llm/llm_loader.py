@@ -139,32 +139,44 @@ class LLM:
                 f"limit {self._get_max_context_window()}."
             )
 
-    def count_input_tokens(self, prompt: str) -> int:
-        messages = [{"role": "user", "content": prompt}]
+    def _build_user_messages(self, prompt: str) -> list[dict[str, str]]:
+        return [{"role": "user", "content": prompt}]
 
-        if self.provider != "transformers":
-            raise NotImplementedError(
-                f"Prompt token counting is currently only implemented for transformers models, got {self.provider}."
-            )
-
+    def _build_model_inputs(self, prompt: str):
+        messages = self._build_user_messages(prompt)
         if hasattr(self.tokenizer, "apply_chat_template"):
-            model_inputs = self.tokenizer.apply_chat_template(
+            return self.tokenizer.apply_chat_template(
                 messages,
                 tokenize=True,
                 add_generation_prompt=True,
                 return_tensors="pt",
             )
+        return self.tokenizer(
+            prompt,
+            return_tensors="pt",
+            truncation=False,
+        )
+
+    def _resolve_input_tensors(self, prompt: str):
+        model_inputs = self._build_model_inputs(prompt)
+        if isinstance(model_inputs, torch.Tensor):
+            input_ids = model_inputs
+            attention_mask = torch.ones_like(input_ids)
         else:
-            model_inputs = self.tokenizer(
-                prompt,
-                return_tensors="pt",
-                truncation=False,
+            input_ids = model_inputs["input_ids"]
+            attention_mask = model_inputs.get("attention_mask")
+            if attention_mask is None:
+                attention_mask = torch.ones_like(input_ids)
+        return model_inputs, input_ids, attention_mask
+
+    def count_input_tokens(self, prompt: str) -> int:
+        if self.provider != "transformers":
+            raise NotImplementedError(
+                f"Prompt token counting is currently only implemented for transformers models, got {self.provider}."
             )
 
-        if isinstance(model_inputs, torch.Tensor):
-            return int(model_inputs.shape[-1])
-
-        return int(model_inputs["input_ids"].shape[-1])
+        _, input_ids, _ = self._resolve_input_tensors(prompt)
+        return int(input_ids.shape[-1])
 
     def _get_transformers_generation_kwargs(self) -> dict:
         generation_kwargs = deepcopy(self.query_settings)
@@ -208,21 +220,21 @@ class LLM:
         self.current_context_window = self.max_input_length
 
     def _query_ministral(self, prompt: str, output_hidden_states: bool = False):
-        messages = [{"role": "user", "content": prompt}]
-        model_inputs = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_tensors="pt",
+        response, _ = self._query_ministral_with_usage(
+            prompt,
+            output_hidden_states=output_hidden_states,
         )
+        return response
+
+    def _query_ministral_with_usage(self, prompt: str, output_hidden_states: bool = False):
+        model_inputs, input_ids, attention_mask = self._resolve_input_tensors(prompt)
         model_inputs = model_inputs.to(self.model.device)
         input_ids = model_inputs["input_ids"]
-        attention_mask = model_inputs.get("attention_mask")
-        if attention_mask is None:
-            attention_mask = torch.ones_like(input_ids)
+        attention_mask = model_inputs.get("attention_mask", attention_mask).to(self.model.device)
 
         self._validate_input_length(input_ids.shape[-1])
         generation_kwargs = self._get_transformers_generation_kwargs()
+        input_token_count = int(input_ids.shape[-1])
 
         if output_hidden_states:
             with torch.inference_mode():
@@ -233,7 +245,7 @@ class LLM:
                     use_cache=False,
                     return_dict=True,
                 )
-            return outputs.logits[:, -1, :].float()
+            return outputs.logits[:, -1, :].float(), input_token_count
 
         with torch.no_grad():
             outputs = self.model.generate(
@@ -243,7 +255,11 @@ class LLM:
                 **generation_kwargs,
             )
         generated_tokens = outputs[0][input_ids.shape[-1]:]
-        return self.tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+        output_token_count = int(generated_tokens.shape[-1])
+        return (
+            self.tokenizer.decode(generated_tokens, skip_special_tokens=True).strip(),
+            input_token_count + output_token_count,
+        )
 
     def _load_transformers_model(self, target_context_window: Optional[int] = None):
         """Load a local or Hugging Face causal language model."""
@@ -298,36 +314,21 @@ class LLM:
 
     def _query_transformers(self, prompt: str, output_hidden_states: bool = False):
         """Call a local transformers model to generate text."""
-        messages = [{"role": "user", "content": prompt}]
+        response, _ = self._query_transformers_with_usage(
+            prompt,
+            output_hidden_states=output_hidden_states,
+        )
+        return response
 
-        if hasattr(self.tokenizer, "apply_chat_template"):
-            model_inputs = self.tokenizer.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                return_tensors="pt",
-            )
-        else:
-            model_inputs = self.tokenizer(
-                prompt,
-                return_tensors="pt",
-                truncation=False,
-            )
-
-        if isinstance(model_inputs, torch.Tensor):
-            input_ids = model_inputs
-            attention_mask = torch.ones_like(input_ids)
-        else:
-            input_ids = model_inputs["input_ids"]
-            attention_mask = model_inputs.get("attention_mask")
-            if attention_mask is None:
-                attention_mask = torch.ones_like(input_ids)
-
+    def _query_transformers_with_usage(self, prompt: str, output_hidden_states: bool = False):
+        """Call a local transformers model and return response plus total token usage."""
+        _, input_ids, attention_mask = self._resolve_input_tensors(prompt)
         self._validate_input_length(input_ids.shape[-1])
 
         input_ids = input_ids.to(self.model.device)
         attention_mask = attention_mask.to(self.model.device)
         generation_kwargs = self._get_transformers_generation_kwargs()
+        input_token_count = int(input_ids.shape[-1])
 
         if output_hidden_states:
             with torch.inference_mode():
@@ -338,7 +339,7 @@ class LLM:
                     use_cache=False,
                     return_dict=True,
                 )
-            return outputs.logits[:, -1, :].float()
+            return outputs.logits[:, -1, :].float(), input_token_count
 
         with torch.no_grad():
             outputs = self.model.generate(
@@ -348,29 +349,44 @@ class LLM:
                 **generation_kwargs,
             )
         generated_tokens = outputs[0][input_ids.shape[-1]:]
-        return self.tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+        output_token_count = int(generated_tokens.shape[-1])
+        return (
+            self.tokenizer.decode(generated_tokens, skip_special_tokens=True).strip(),
+            input_token_count + output_token_count,
+        )
 
     def _query_openai(self, prompt: str) -> str:
         """Call the OpenAI API to generate text."""
+        response_text, _ = self._query_openai_with_usage(prompt)
+        return response_text
+
+    def _query_openai_with_usage(self, prompt: str) -> tuple[str, int]:
         client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         response = client.chat.completions.create(
             model=self.model_name,
-            messages=[{"role": "user", "content": prompt}],
+            messages=self._build_user_messages(prompt),
             **self._get_openai_request_kwargs(),
         )
-        return response.choices[0].message.content
+        response_text = response.choices[0].message.content
+        total_tokens = int(getattr(response.usage, "total_tokens", 0) or 0)
+        return response_text, total_tokens
 
     def _query_ollama(self, prompt: str) -> str:
         """Call a local Ollama model to generate text."""
+        response_text, _ = self._query_ollama_with_usage(prompt)
+        return response_text
+
+    def _query_ollama_with_usage(self, prompt: str) -> tuple[str, int]:
         response_format, options = self._get_ollama_request_kwargs()
         response = ollama.chat(
             model=self.model_name,
-            messages=[{"role": "user", "content": prompt}],
+            messages=self._build_user_messages(prompt),
             format=response_format,
             think=self.think_mode,
             options=options,
         )
-        return response["message"]["content"]
+        total_tokens = int(response.get("prompt_eval_count", 0) or 0) + int(response.get("eval_count", 0) or 0)
+        return response["message"]["content"], total_tokens
 
     def batch_query(self, prompts: List[str], use_cache: bool = True) -> List[str]:
         """
@@ -386,17 +402,30 @@ class LLM:
         _ = use_cache
         return [self.query(prompt) for prompt in prompts]
 
-    def query(self, prompt: str) -> str:
+    def query_with_usage(self, prompt: str) -> tuple[str, int]:
         provider = self.provider
         if provider == "ollama":
-            return self._query_ollama(prompt)
+            return self._query_ollama_with_usage(prompt)
         if provider == "openai":
-            return self._query_openai(prompt)
+            return self._query_openai_with_usage(prompt)
         if provider == "transformers":
             if "ministral" in self.model_name.lower():
-                return self._query_ministral(prompt)
-            return self._query_transformers(prompt)
+                return self._query_ministral_with_usage(prompt)
+            return self._query_transformers_with_usage(prompt)
         raise ValueError(f"Unsupported LLM provider: {provider}")
+
+    def query_logits_with_usage(self, prompt: str):
+        if self.provider != "transformers":
+            raise NotImplementedError(
+                f"Logits queries are currently only implemented for transformers models, got {self.provider}."
+            )
+        if "ministral" in self.model_name.lower():
+            return self._query_ministral_with_usage(prompt, output_hidden_states=True)
+        return self._query_transformers_with_usage(prompt, output_hidden_states=True)
+
+    def query(self, prompt: str) -> str:
+        response_text, _ = self.query_with_usage(prompt)
+        return response_text
 
 
 if __name__ == "__main__":

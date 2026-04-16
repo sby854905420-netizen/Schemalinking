@@ -10,6 +10,7 @@ from tqdm import tqdm
 from Llm.llm_loader import LLM
 from config import *
 from Run.logging_utils import log_run_configuration, setup_task_logger
+from Utils.efficiency_utils import SampleEfficiencyTracker
 from Utils.tools import normalize_response_text, render_prompt, resolve_hint
 
 
@@ -70,11 +71,13 @@ def append_log_entry(
     log_records: list[dict[str, Any]],
     row: pd.Series,
     response_text: str,
+    efficiency_tracker: SampleEfficiencyTracker,
     answer_llm_name: str,
     provider: str,
     log_path: Path,
 ) -> None:
     predict_db_id = parse_db_response(response_text)
+    efficiency = efficiency_tracker.finalize()
     log_records.append(
         {
             "model": answer_llm_name,
@@ -83,7 +86,8 @@ def append_log_entry(
             "spider_db_id": row["db_id"],
             "question": row["question"],
             "pre_db_response": response_text,
-            "predict_db_id": predict_db_id
+            "predict_db_id": predict_db_id,
+            "efficiency": efficiency,
         }
     )
     log_path.write_text(json.dumps(log_records, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -112,6 +116,7 @@ def run_baseline_retrieval(
     database_count = len(database_schemas)
 
     for _, row in tqdm(dataset_df.iterrows(), total=len(dataset_df)):
+        efficiency_tracker = SampleEfficiencyTracker()
         schemas_string = database_schema_to_string(database_schemas)
         prompt = render_prompt(
             prompt_template,
@@ -125,11 +130,13 @@ def run_baseline_retrieval(
         )
         # prompt_token_count = ranking_llm.count_input_tokens(prompt)
         # print(f"[Baseline] id={row['id']} prompt_tokens={prompt_token_count}")
-        response_text = ranking_llm.query(prompt)
+        response_text, total_tokens = ranking_llm.query_with_usage(prompt)
+        efficiency_tracker.add_llm_total_tokens(total_tokens)
         append_log_entry(
             log_records=log_records,
             row=row,
             response_text=response_text,
+            efficiency_tracker=efficiency_tracker,
             answer_llm_name=answer_llm_name,
             provider=provider,
             log_path=log_path,
