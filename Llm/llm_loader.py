@@ -1,4 +1,5 @@
 import os
+import inspect
 from copy import deepcopy
 from typing import List, Optional
 
@@ -178,6 +179,18 @@ class LLM:
         _, input_ids, _ = self._resolve_input_tensors(prompt)
         return int(input_ids.shape[-1])
 
+    def _get_last_token_logits_kwargs(self) -> dict:
+        try:
+            forward_signature = inspect.signature(self.model.forward)
+        except (TypeError, ValueError):
+            return {}
+
+        if "logits_to_keep" in forward_signature.parameters:
+            return {"logits_to_keep": 1}
+        if "num_logits_to_keep" in forward_signature.parameters:
+            return {"num_logits_to_keep": 1}
+        return {}
+
     def _get_transformers_generation_kwargs(self) -> dict:
         generation_kwargs = deepcopy(self.query_settings)
         generation_kwargs.pop("max_new_tokens", None)
@@ -244,6 +257,7 @@ class LLM:
                     output_hidden_states=False,
                     use_cache=False,
                     return_dict=True,
+                    **self._get_last_token_logits_kwargs(),
                 )
             return outputs.logits[:, -1, :].float(), input_token_count
 
@@ -338,6 +352,7 @@ class LLM:
                     output_hidden_states=False,
                     use_cache=False,
                     return_dict=True,
+                    **self._get_last_token_logits_kwargs(),
                 )
             return outputs.logits[:, -1, :].float(), input_token_count
 
