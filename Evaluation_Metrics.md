@@ -34,7 +34,17 @@ Recall = \frac{\text{所有样本中命中的正确列总数}}{\text{所有样�
 
 ## 4. Avg_Ratio
 
-`Avg_Ratio` 用于计算平均 schema linking 预测列数量与标准答案列数量之间的比值。
+`Avg_Ratio` 用于同时统计 schema linking 的平均预测列数量、平均标准答案列数量，以及预测列数量与标准答案列数量之间的平均比值。
+
+首先分别计算所有样本的平均预测列数量与平均标准答案列数量：
+
+\[
+Avg\_Pred\_Cols = \frac{1}{N}\sum_{i=1}^{N} \text{第 } i \text{ 个样本的预测列数量}
+\]
+
+\[
+Avg\_Gold\_Cols = \frac{1}{N}\sum_{i=1}^{N} \text{第 } i \text{ 个样本的标准答案列数量}
+\]
 
 对于每个样本，先计算：
 
@@ -48,7 +58,7 @@ ratio_i = \frac{\text{第 } i \text{ 个样本的预测列数量}}{\text{第 } i
 Avg\_Ratio = \frac{1}{N}\sum_{i=1}^{N} ratio_i
 \]
 
-该指标用于反映模型预测的列数量相对于标准答案列数量是偏多、偏少还是大致相当。
+其中，`Avg_Pred_Cols` 反映模型平均每个样本预测了多少个 schema linking 列，`Avg_Gold_Cols` 反映平均每个样本包含多少个标准答案列，`Avg_Ratio` 则用于反映模型预测的列数量相对于标准答案列数量是偏多、偏少还是大致相当。
 
 ## 5. Avg_token
 
@@ -73,4 +83,3 @@ Avg\_time = \frac{\sum_{i=1}^{N} time_i}{N}
 \]
 
 其中，`time_i` 表示第 `i` 个样本完成数据库预测和 schema linking 预测所花费的总时间。
-
