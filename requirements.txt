@@ -1,0 +1,29 @@
+# Runtime dependencies for Schemalinking.
+# Recommended Python: 3.11.x
+#
+# The PyTorch wheel is pinned to CUDA 12.8 so the same environment can run on:
+# - NVIDIA GeForce RTX 5090 / Blackwell / sm_120
+# - NVIDIA A100 80G / Ampere / sm_80
+#
+# Make sure the host NVIDIA driver is new enough for CUDA 12.8.
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+numpy==2.4.4
+pandas==3.0.3
+tqdm==4.67.3
+
+torch==2.11.0+cu128
+transformers==5.8.0
+accelerate==1.13.0
+safetensors==0.7.0
+tokenizers==0.22.2
+huggingface-hub==1.14.0
+
+sentence-transformers==5.4.1
+qdrant-client==1.18.0
+
+openai==2.36.0
+ollama==0.6.2
+
+# Required by MistralCommonBackend for the current Ministral loading path.
+mistral-common==1.11.2
