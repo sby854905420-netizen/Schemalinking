@@ -34,7 +34,7 @@ from Utils.tools import (
 )
 
 PROMPT_BUDGET_BUFFER = 512
-PROMPT_BUDGET_RATIO = 0.9
+PROMPT_BUDGET_RATIO = 0.8
 
 def clean_text(value: Any) -> str:
     if value is None:
