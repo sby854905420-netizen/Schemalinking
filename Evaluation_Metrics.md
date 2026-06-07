@@ -1,6 +1,6 @@
 # Evaluation Metrics
 
-本文档定义了 6 个评估指标，用于衡量数据库预测任务与 schema linking 任务的表现。
+本文档定义了 7 个评估指标，用于衡量数据库预测、schema linking 与 SQL 生成任务的表现。
 
 ## 1. LA
 
@@ -60,7 +60,29 @@ Avg\_Ratio = \frac{1}{N}\sum_{i=1}^{N} ratio_i
 
 其中，`Avg_Pred_Cols` 反映模型平均每个样本预测了多少个 schema linking 列，`Avg_Gold_Cols` 反映平均每个样本包含多少个标准答案列，`Avg_Ratio` 则用于反映模型预测的列数量相对于标准答案列数量是偏多、偏少还是大致相当。
 
-## 5. Avg_token
+## 5. Execution Accuracy (EX)
+
+`Execution Accuracy (EX)` 用于衡量模型生成 SQL 的执行结果是否与标准答案 SQL 的执行结果一致。该指标遵循 Spider 与 BIRD benchmark 的执行评测思想：不直接比较 SQL 字符串，而是在对应样本的标准答案数据库上分别执行预测 SQL 与 gold SQL，并比较两者返回的结果。
+
+对于第 \(i\) 个样本，设预测 SQL 的执行结果为 \(R_i^{pred}\)，gold SQL 的执行结果为 \(R_i^{gold}\)。若两条 SQL 都能成功执行，且返回的行和值一致，则该样本记为正确：
+
+\[
+EX_i =
+\begin{cases}
+1, & R_i^{pred} \equiv R_i^{gold} \\
+0, & \text{otherwise}
+\end{cases}
+\]
+
+总体 `EX` 定义为所有样本中执行结果一致的比例：
+
+\[
+EX = \frac{1}{N}\sum_{i=1}^{N} EX_i
+\]
+
+其中，\(N\) 为参与 SQL 执行评测的样本总数。执行结果比较时，SQL 写法可以不同，只要返回结果一致即可；若 gold SQL 中包含明确的 `ORDER BY`，则结果行顺序也视为语义的一部分，否则按无序结果集合进行比较。预测 SQL 发生语法错误、运行错误、超时，或返回结果与 gold SQL 不一致时，均记为 0。
+
+## 6. Avg_token
 
 `Avg_token` 用于计算平均每个样本完成数据库预测和 schema linking 预测所使用的 token 数量。
 
@@ -72,7 +94,7 @@ Avg\_token = \frac{\sum_{i=1}^{N} token_i}{N}
 
 其中，`token_i` 表示第 `i` 个样本完成数据库预测和 schema linking 预测所消耗的总 token 数。
 
-## 6. Avg_time
+## 7. Avg_time
 
 `Avg_time` 用于计算平均每个样本完成数据库预测和 schema linking 预测所使用的时间。
 

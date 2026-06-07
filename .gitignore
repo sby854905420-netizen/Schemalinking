@@ -1,4 +1,5 @@
 .env
+snowflake_credential.json
 .DS_Store
 __pycache__/
 *.py[cod]
@@ -9,7 +10,6 @@ Logs/
 
 # Large local datasets
 Data/
-Evluation/
 
 # Local editor and runtime caches
 .vscode/
