@@ -143,17 +143,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-csv",
         type=Path,
-        default=project_root / "Evluation" / "all_evaluation_metrics.csv",
+        default=project_root / "Evaluation" / "all_evaluation_metrics.csv",
     )
     parser.add_argument(
         "--output-json",
         type=Path,
-        default=project_root / "Evluation" / "all_evaluation_metrics.json",
+        default=project_root / "Evaluation" / "all_evaluation_metrics.json",
     )
     parser.add_argument(
         "--details-json",
         type=Path,
-        default=project_root / "Evluation" / "all_evaluation_details.json",
+        default=project_root / "Evaluation" / "all_evaluation_details.json",
     )
     return parser.parse_args()
 
