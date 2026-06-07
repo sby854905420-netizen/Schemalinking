@@ -886,6 +886,14 @@ def evaluate_sql_log(
             }
         )
 
+    evaluated_samples = samples - skipped
+    skipped_error = ""
+    if skipped == samples and skipped:
+        for detail in details:
+            if detail.get("status") == "skipped":
+                skipped_error = normalize_text(detail.get("error"))
+                break
+
     summary = {
         "metric_task": "execution_accuracy",
         "dataset": dataset_name,
@@ -902,7 +910,7 @@ def evaluate_sql_log(
         "Avg_Pred_Cols": "",
         "Avg_Gold_Cols": "",
         "Avg_Ratio": "",
-        "EX": correct / samples if samples else 0.0,
+        "EX": correct / evaluated_samples if evaluated_samples else "",
         "correct": correct,
         "Avg_token": "",
         "Avg_time": "",
@@ -917,7 +925,7 @@ def evaluate_sql_log(
         "wrong_result_count": wrong_results,
         "log_file": str(path),
         "database_retrieval_log_file": "",
-        "error": "",
+        "error": skipped_error,
     }
     return summary, details
 
@@ -981,9 +989,11 @@ def print_schema_summary(rows: list[dict[str, Any]]) -> None:
 
 def print_execution_summary(rows: list[dict[str, Any]]) -> None:
     for row in rows:
+        ex_value = row["EX"]
+        ex_text = f"{ex_value:.4f}" if isinstance(ex_value, float) else "NA"
         print(
             f"{row['dataset']} sql_generation {row['timestamp']}: "
-            f"EX={row['EX']:.4f} ({row['correct']}/{row['samples']}), "
+            f"EX={ex_text} ({row['correct']}/{row['samples']}), "
             f"errors={row['execution_error_count']}, skipped={row['skipped_count']}"
         )
 
