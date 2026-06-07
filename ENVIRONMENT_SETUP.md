@@ -21,7 +21,6 @@ LLM provider 说明：
 
 - `transformers`：本地或 Hugging Face 模型推理，通常需要 GPU。
 - `openai`：脚本直接读取环境变量 `OPENAI_API_KEY`，不会自动加载 `.env`。
-- `ollama`：需要本机已经启动 Ollama，并提前拉取对应模型。
 
 例如使用 OpenAI provider：
 

@@ -23,7 +23,6 @@ sentence-transformers==5.4.1
 qdrant-client==1.18.0
 
 openai==2.36.0
-ollama==0.6.2
 
 # Required by MistralCommonBackend for the current Ministral loading path.
 mistral-common==1.11.2

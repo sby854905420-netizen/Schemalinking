@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from config import *
-from Llm.llm_loader import LLM
+from Llm.llm_loader import LLM, resolve_provider
 from Run.logging_utils import log_run_configuration, setup_task_logger
 from Utils.efficiency_utils import SampleEfficiencyTracker
 from Utils.render_tools import SchemaTextRenderer
@@ -665,7 +665,7 @@ def main() -> None:
 
     dataset_name = args.dataset_name or DATASET_NAME
     answer_llm_name = args.answer_llm_name or DEFAULT_SQL_LLM_NAME
-    provider = args.provider or PROVIDER
+    provider = resolve_provider(args.provider or PROVIDER)
     max_input_length = args.max_input_length or MAX_INPUT_LENGTH
     max_generation_num = args.max_generation_num or max(MAX_GENERATEION_NUM, DEFAULT_SQL_GENERATION_NUM)
     logs_dir = args.logs_dir or (PROJECT_ROOT / "Logs")

@@ -42,11 +42,11 @@ pip install -r requirements.txt
 
 ### Provider 兼容性
 
-`LLM` 封装支持 `transformers`、`openai` 和 `ollama`，但各脚本实际依赖不同：
+`LLM` 封装支持 `transformers` 和 `openai`，但各脚本实际依赖不同：
 
 | 脚本 | 当前可用 provider | 原因 |
 | --- | --- | --- |
-| `Baseline_Database_Retrival.py` | `transformers` / `openai` / `ollama` | 只需要普通文本生成 |
+| `Baseline_Database_Retrival.py` | `transformers` / `openai` | 只需要普通文本生成 |
 | `Global_Coarse_Retrieval.py` | `transformers` | 需要 tokenizer 计数和下一 token logits 做 yes/no 重排 |
 | `Baseline_Schema_Linking.py` | `transformers` | schema 渲染器依赖 `answer_llm.tokenizer` |
 | `table2column.py` | `transformers` | 依赖 tokenizer 计数、schema 裁剪和本地 embedding 检索 |
@@ -60,8 +60,6 @@ python -m Run.Baseline_Database_Retrival \
   --provider openai \
   --answer-llm-name gpt-4.1-mini
 ```
-
-使用 Ollama provider 时，需要本机已启动 Ollama，并提前拉取对应模型。
 
 ## 2. 数据目录约定
 
@@ -223,7 +221,7 @@ python -m Run.table2column \
 | --- | --- | --- |
 | `--dataset-name` | 数据集名称，对应 `Data/<dataset>/` | `DATASET_NAME` |
 | `--answer-llm-name` | LLM 名称 | `ANSWER_LLM_NAME` |
-| `--provider` | `transformers` / `openai` / `ollama` | `PROVIDER` |
+| `--provider` | `transformers` / `openai` | `PROVIDER` |
 | `--max-input-length` | 最大输入 token 数 | `MAX_INPUT_LENGTH` |
 | `--max-generation-num` | 最大生成 token 数 | `MAX_GENERATEION_NUM` |
 | `--database-schema-path` | 数据库摘要文件路径 | `Data/<dataset>/Database_schemas_summary.json` |

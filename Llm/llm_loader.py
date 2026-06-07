@@ -3,8 +3,6 @@ import inspect
 from copy import deepcopy
 from typing import List, Optional
 
-import ollama
-import openai
 import torch
 from transformers import (
     AutoConfig,
@@ -19,6 +17,14 @@ from config import *
 
 QWEN25_DEFAULT_CONTEXT_WINDOW = 32768
 QWEN25_MAX_CONTEXT_WINDOW = 131072
+SUPPORTED_PROVIDERS = {"transformers", "openai"}
+
+
+def resolve_provider(provider: Optional[str] = None) -> str:
+    requested_provider = (provider or PROVIDER).lower()
+    if requested_provider in SUPPORTED_PROVIDERS:
+        return requested_provider
+    return "transformers"
 
 
 class LLM:
@@ -41,7 +47,7 @@ class LLM:
         model_name:
             The model name or path.
         provider:
-            The model service provider, such as "openai", "ollama", or "transformers".
+            The model service provider, either "openai" or "transformers".
         max_input_length:
             The maximum number of input tokens allowed for a request.
         max_generation_num:
@@ -50,12 +56,12 @@ class LLM:
             Whether to enable provider-specific thinking mode.
         query_settings:
             Provider-agnostic generation settings such as temperature, top_p, or
-            provider-specific options like response_format / format.
+            provider-specific options like response_format.
         num_ctx:
             Backward-compatible alias for max_input_length.
         """
         self.model_name = model_name or ANSWER_LLM_NAME
-        self.provider = (provider or PROVIDER).lower()
+        self.provider = resolve_provider(provider)
 
         resolved_max_input_length = max_input_length
         if resolved_max_input_length is None:
@@ -211,13 +217,6 @@ class LLM:
         request_kwargs.setdefault("temperature", 0.0)
         request_kwargs.setdefault("response_format", {"type": "json_object"})
         return request_kwargs
-
-    def _get_ollama_request_kwargs(self) -> tuple[Optional[str], dict]:
-        options = deepcopy(self.query_settings)
-        response_format = options.pop("format", "json")
-        options["num_ctx"] = self.max_input_length
-        options.setdefault("num_predict", self.max_generation_num)
-        return response_format, options
 
     def _load_ministral_model(self):
         self.tokenizer = MistralCommonBackend.from_pretrained(self.model_name)
@@ -376,6 +375,8 @@ class LLM:
         return response_text
 
     def _query_openai_with_usage(self, prompt: str) -> tuple[str, int]:
+        import openai
+
         client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         response = client.chat.completions.create(
             model=self.model_name,
@@ -385,23 +386,6 @@ class LLM:
         response_text = response.choices[0].message.content
         total_tokens = int(getattr(response.usage, "total_tokens", 0) or 0)
         return response_text, total_tokens
-
-    def _query_ollama(self, prompt: str) -> str:
-        """Call a local Ollama model to generate text."""
-        response_text, _ = self._query_ollama_with_usage(prompt)
-        return response_text
-
-    def _query_ollama_with_usage(self, prompt: str) -> tuple[str, int]:
-        response_format, options = self._get_ollama_request_kwargs()
-        response = ollama.chat(
-            model=self.model_name,
-            messages=self._build_user_messages(prompt),
-            format=response_format,
-            think=self.think_mode,
-            options=options,
-        )
-        total_tokens = int(response.get("prompt_eval_count", 0) or 0) + int(response.get("eval_count", 0) or 0)
-        return response["message"]["content"], total_tokens
 
     def batch_query(self, prompts: List[str], use_cache: bool = True) -> List[str]:
         """
@@ -419,8 +403,6 @@ class LLM:
 
     def query_with_usage(self, prompt: str) -> tuple[str, int]:
         provider = self.provider
-        if provider == "ollama":
-            return self._query_ollama_with_usage(prompt)
         if provider == "openai":
             return self._query_openai_with_usage(prompt)
         if provider == "transformers":

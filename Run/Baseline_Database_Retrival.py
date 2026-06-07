@@ -7,7 +7,7 @@ from typing import Any
 import pandas as pd
 from tqdm import tqdm
 
-from Llm.llm_loader import LLM
+from Llm.llm_loader import LLM, resolve_provider
 from config import *
 from Run.logging_utils import log_run_configuration, setup_task_logger
 from Utils.efficiency_utils import SampleEfficiencyTracker
@@ -150,7 +150,7 @@ def main() -> None:
 
     dataset_name = args.dataset_name or DATASET_NAME
     answer_llm_name = args.answer_llm_name or ANSWER_LLM_NAME
-    provider = args.provider or PROVIDER
+    provider = resolve_provider(args.provider or PROVIDER)
     max_input_length = args.max_input_length or MAX_INPUT_LENGTH
     max_generation_num = args.max_generation_num or MAX_GENERATEION_NUM
 
