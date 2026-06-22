@@ -1,5 +1,6 @@
 .env
 snowflake_credential.json
+gpt_credential.json
 .DS_Store
 __pycache__/
 *.py[cod]

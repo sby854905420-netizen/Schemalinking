@@ -50,8 +50,9 @@ pip install -r requirements.txt
 | `Global_Coarse_Retrieval.py` | `transformers` | 需要 tokenizer 计数和下一 token logits 做 yes/no 重排 |
 | `Baseline_Schema_Linking.py` | `transformers` | schema 渲染器依赖 `answer_llm.tokenizer` |
 | `table2column.py` | `transformers` | 依赖 tokenizer 计数、schema 裁剪和本地 embedding 检索 |
+| `sql_generator.py` | `transformers` / `openai` | OpenAI provider 会提供 tokenizer-like prompt 预算接口，并可直接调用 GPT-5 系列模型 |
 
-使用 OpenAI provider 时，代码会直接读取环境变量 `OPENAI_API_KEY`：
+使用 OpenAI provider 时，代码会优先读取环境变量 `OPENAI_API_KEY`，也可以读取 `OPENAI_CREDENTIAL_PATH` 或项目根目录下的 `gpt_credential.json`。凭据 JSON 支持 `api_key`、`openai_api_key`、`OPENAI_API_KEY`、`key` 字段。
 
 ```bash
 export OPENAI_API_KEY=your_api_key_here
@@ -59,6 +60,17 @@ python -m Run.Baseline_Database_Retrival \
   --dataset-name MMQA \
   --provider openai \
   --answer-llm-name gpt-4.1-mini
+```
+
+SQL generator 使用 GPT-5 mini 的示例：
+
+```bash
+python -m Run.sql_generator \
+  --dataset-name MMQA \
+  --provider openai \
+  --answer-llm-name gpt-5-mini-2025-08-07 \
+  --credential-path gpt_credential.json \
+  --schema-llm-name mistralai/Ministral-3-14B-Instruct-2512
 ```
 
 ## 2. 数据目录约定
@@ -307,5 +319,5 @@ python -m Run.table2column \
 2. `Global_Coarse_Retrieval.py` 当前没有读取 Qdrant `meta.json`，collection 名必须和 `--dataset-name` 一致。
 3. `Baseline_Schema_Linking.py` 和 `table2column.py` 默认会回溯最近一次数据库检索结果；实验较多时建议显式传入 `--input-path`。
 4. `Spider2` 的 hint 读取方式和其他数据集不同：`external_knowledge` 会优先作为文档文件名解析。
-5. 如果使用 `openai` provider，请先在当前 shell 中导出 `OPENAI_API_KEY`；仅在仓库中放 `.env` 文件不会自动生效。
+5. 如果使用 `openai` provider，可以导出 `OPENAI_API_KEY`，或通过 `OPENAI_CREDENTIAL_PATH` / `--credential-path` 指向 JSON 凭据文件；代码不会自动加载 `.env`。
 6. 当前环境若缺少依赖，甚至 `--help` 也可能因为顶层 import 失败而无法打印；请先完成 `pip install -r requirements.txt`。

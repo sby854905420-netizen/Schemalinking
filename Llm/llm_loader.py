@@ -1,23 +1,52 @@
 import os
 import inspect
+import json
+from pathlib import Path
 from copy import deepcopy
-from typing import List, Optional
+from typing import Any, List, Optional
 
-import torch
-from transformers import (
-    AutoConfig,
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    FineGrainedFP8Config,
-    Mistral3ForConditionalGeneration,
-    MistralCommonBackend,
-)
+try:
+    import torch
+except ImportError:
+    torch = None
+
+try:
+    from transformers import (
+        AutoConfig,
+        AutoModelForCausalLM,
+        AutoTokenizer,
+        FineGrainedFP8Config,
+        Mistral3ForConditionalGeneration,
+        MistralCommonBackend,
+    )
+except ImportError:
+    AutoConfig = None
+    AutoModelForCausalLM = None
+    AutoTokenizer = None
+    FineGrainedFP8Config = None
+    Mistral3ForConditionalGeneration = None
+    MistralCommonBackend = None
 
 from config import *
 
 QWEN25_DEFAULT_CONTEXT_WINDOW = 32768
 QWEN25_MAX_CONTEXT_WINDOW = 131072
 SUPPORTED_PROVIDERS = {"transformers", "openai"}
+DEFAULT_OPENAI_CREDENTIAL_PATH = PROJECT_ROOT / "gpt_credential.json"
+
+
+class FallbackTextTokenizer:
+    """Small tokenizer-like fallback for prompt budgeting without extra deps."""
+
+    def encode(self, text: str, *args, **kwargs) -> list[str]:
+        _ = args, kwargs
+        normalized_text = "" if text is None else str(text)
+        # Use short character chunks so token counts are conservative enough for truncation.
+        return [normalized_text[index:index + 3] for index in range(0, len(normalized_text), 3)]
+
+    def decode(self, token_ids: list[Any], *args, **kwargs) -> str:
+        _ = args, kwargs
+        return "".join(str(token_id) for token_id in token_ids)
 
 
 def resolve_provider(provider: Optional[str] = None) -> str:
@@ -38,6 +67,7 @@ class LLM:
         think_mode: bool = False,
         query_settings: Optional[dict] = None,
         num_ctx: Optional[int] = None,
+        credential_path: Optional[Any] = None,
     ):
         """
         Initialize the LLM loader.
@@ -59,6 +89,10 @@ class LLM:
             provider-specific options like response_format.
         num_ctx:
             Backward-compatible alias for max_input_length.
+        credential_path:
+            Optional JSON credential file for OpenAI provider. If omitted,
+            OPENAI_API_KEY, OPENAI_CREDENTIAL_PATH, and gpt_credential.json are
+            tried in that order.
         """
         self.model_name = model_name or ANSWER_LLM_NAME
         self.provider = resolve_provider(provider)
@@ -74,19 +108,30 @@ class LLM:
         self.max_generation_num = max_generation_num or MAX_GENERATEION_NUM
         self.think_mode = think_mode
         self.current_context_window = None
+        self.credential_path = Path(credential_path) if credential_path is not None else None
 
         self.query_settings = deepcopy(
             query_settings if query_settings is not None else BASELINE_DATABASE_RETRIVAL_QUERY_SETTINGS
         )
 
-        self.torch_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
         self.device_map = "auto"
+        self.torch_dtype = None
 
         if self.provider == "transformers":
+            self._ensure_transformers_dependencies()
+            self.torch_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
             if "ministral" in self.model_name.lower():
                 self._load_ministral_model()
             else:
                 self._load_transformers_model()
+        elif self.provider == "openai":
+            self._load_openai_model()
+
+    def _ensure_transformers_dependencies(self) -> None:
+        if torch is None or AutoTokenizer is None or AutoModelForCausalLM is None:
+            raise ImportError(
+                "Transformers provider requires torch and transformers. Install project requirements first."
+            )
 
     def _is_qwen25_model(self) -> bool:
         return "qwen2.5" in self.model_name.lower()
@@ -177,10 +222,13 @@ class LLM:
         return model_inputs, input_ids, attention_mask
 
     def count_input_tokens(self, prompt: str) -> int:
+        if self.provider == "openai":
+            # Include a small chat-message overhead margin. This count is used
+            # for prompt fitting, not billing.
+            return len(self.tokenizer.encode(prompt)) + 8
+
         if self.provider != "transformers":
-            raise NotImplementedError(
-                f"Prompt token counting is currently only implemented for transformers models, got {self.provider}."
-            )
+            raise NotImplementedError(f"Prompt token counting is not implemented for provider {self.provider}.")
 
         _, input_ids, _ = self._resolve_input_tensors(prompt)
         return int(input_ids.shape[-1])
@@ -213,10 +261,122 @@ class LLM:
 
     def _get_openai_request_kwargs(self) -> dict:
         request_kwargs = deepcopy(self.query_settings)
+        request_kwargs = {
+            key: value
+            for key, value in request_kwargs.items()
+            if value is not None
+        }
+        request_kwargs.pop("repetition_penalty", None)
         request_kwargs.setdefault("max_completion_tokens", self.max_generation_num)
         request_kwargs.setdefault("temperature", 0.0)
         request_kwargs.setdefault("response_format", {"type": "json_object"})
         return request_kwargs
+
+    def _get_openai_responses_request_kwargs(self) -> dict:
+        request_kwargs = self._get_openai_request_kwargs()
+        max_completion_tokens = request_kwargs.pop("max_completion_tokens", None)
+        if max_completion_tokens is not None:
+            request_kwargs["max_output_tokens"] = max_completion_tokens
+
+        if self._is_gpt5_model():
+            request_kwargs.pop("temperature", None)
+            request_kwargs.pop("top_p", None)
+
+        response_format = request_kwargs.pop("response_format", None)
+        if isinstance(response_format, dict) and response_format.get("type") != "text":
+            request_kwargs["text"] = {"format": response_format}
+
+        return request_kwargs
+
+    def _get_openai_chat_request_kwargs(self) -> dict:
+        request_kwargs = self._get_openai_request_kwargs()
+        response_format = request_kwargs.get("response_format")
+        if isinstance(response_format, dict) and response_format.get("type") == "text":
+            request_kwargs.pop("response_format", None)
+        return request_kwargs
+
+    def _resolve_openai_api_key(self) -> str:
+        env_api_key = os.getenv("OPENAI_API_KEY")
+        if env_api_key:
+            return env_api_key
+
+        credential_path = self.credential_path
+        if credential_path is None and os.getenv("OPENAI_CREDENTIAL_PATH"):
+            credential_path = Path(os.environ["OPENAI_CREDENTIAL_PATH"])
+        if credential_path is None and DEFAULT_OPENAI_CREDENTIAL_PATH.is_file():
+            credential_path = DEFAULT_OPENAI_CREDENTIAL_PATH
+
+        if credential_path is None:
+            raise ValueError(
+                "OpenAI provider requires OPENAI_API_KEY or a credential JSON file."
+            )
+        if not credential_path.is_file():
+            raise FileNotFoundError(f"OpenAI credential file not found: {credential_path}")
+
+        credentials = json.loads(credential_path.read_text(encoding="utf-8"))
+        if not isinstance(credentials, dict):
+            raise ValueError(f"OpenAI credential file must contain a JSON object: {credential_path}")
+
+        for key_name in ("api_key", "openai_api_key", "OPENAI_API_KEY", "key"):
+            api_key = credentials.get(key_name)
+            if isinstance(api_key, str) and api_key.strip():
+                return api_key.strip()
+
+        raise ValueError(
+            f"OpenAI credential file must contain one of: api_key, openai_api_key, OPENAI_API_KEY, key."
+        )
+
+    def _load_openai_tokenizer(self):
+        try:
+            import tiktoken
+
+            try:
+                return tiktoken.encoding_for_model(self.model_name)
+            except KeyError:
+                return tiktoken.get_encoding("o200k_base")
+        except ImportError:
+            return FallbackTextTokenizer()
+
+    def _load_openai_model(self):
+        try:
+            import openai
+        except ImportError as exc:
+            raise ImportError(
+                "OpenAI provider requires the openai package. Install project requirements first."
+            ) from exc
+
+        self.client = openai.OpenAI(api_key=self._resolve_openai_api_key())
+        self.tokenizer = self._load_openai_tokenizer()
+        self.current_context_window = self.max_input_length + self.max_generation_num
+
+    def _is_gpt5_model(self) -> bool:
+        return self.model_name.lower().startswith("gpt-5")
+
+    def _extract_openai_response_text(self, response) -> str:
+        output_text = getattr(response, "output_text", None)
+        if isinstance(output_text, str):
+            return output_text.strip()
+
+        output_parts: list[str] = []
+        for output_item in getattr(response, "output", []) or []:
+            for content_item in getattr(output_item, "content", []) or []:
+                text_value = getattr(content_item, "text", None)
+                if isinstance(text_value, str):
+                    output_parts.append(text_value)
+        return "".join(output_parts).strip()
+
+    def _extract_openai_usage_tokens(self, response) -> int:
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return 0
+
+        total_tokens = getattr(usage, "total_tokens", None)
+        if total_tokens is not None:
+            return int(total_tokens or 0)
+
+        input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+        output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+        return input_tokens + output_tokens
 
     def _load_ministral_model(self):
         self.tokenizer = MistralCommonBackend.from_pretrained(self.model_name)
@@ -375,16 +535,24 @@ class LLM:
         return response_text
 
     def _query_openai_with_usage(self, prompt: str) -> tuple[str, int]:
-        import openai
+        if self._is_gpt5_model() and hasattr(self.client, "responses"):
+            response = self.client.responses.create(
+                model=self.model_name,
+                input=self._build_user_messages(prompt),
+                **self._get_openai_responses_request_kwargs(),
+            )
+            return (
+                self._extract_openai_response_text(response),
+                self._extract_openai_usage_tokens(response),
+            )
 
-        client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        response = client.chat.completions.create(
+        response = self.client.chat.completions.create(
             model=self.model_name,
             messages=self._build_user_messages(prompt),
-            **self._get_openai_request_kwargs(),
+            **self._get_openai_chat_request_kwargs(),
         )
-        response_text = response.choices[0].message.content
-        total_tokens = int(getattr(response.usage, "total_tokens", 0) or 0)
+        response_text = response.choices[0].message.content or ""
+        total_tokens = self._extract_openai_usage_tokens(response)
         return response_text, total_tokens
 
     def batch_query(self, prompts: List[str], use_cache: bool = True) -> List[str]:

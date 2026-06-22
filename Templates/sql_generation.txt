@@ -6,11 +6,7 @@ The schema excerpt is built from schema-linking predictions stored under the Log
 
 ### Dataset Context:
 - Dataset name: {DATASET_NAME}
-- SQL dialect requirements: {SQL_DIALECT}
-- MMQA uses SQLite databases. Generate SQLite-compatible SQL for MMQA.
-- Spider2 uses Snowflake databases. Generate Snowflake-compatible SQL for Spider2.
-- MMQA examples usually use compact Spider-style relational databases. Primary-key and foreign-key metadata is usually available, and hints are usually absent.
-- Spider2 examples often use large warehouse databases with fully qualified table names. Primary-key and foreign-key metadata may be unavailable or incomplete. Hints may point to external documents containing formulas, SQL functions, constants, filters, or domain definitions; use those hints when provided.
+- Dataset-specific SQL requirements: {SQL_DIALECT}
 
 ### Schema Format:
 - The schema begins with `Database: ...`.
@@ -23,15 +19,12 @@ The schema excerpt is built from schema-linking predictions stored under the Log
 
 ### SQL Construction Rules:
 - Write a single SQL query that directly answers the question.
-- Follow the SQL dialect requirements exactly. Do not mix SQLite and Snowflake syntax.
-- For SQLite, avoid Snowflake-only syntax such as `QUALIFY`, `ILIKE`, `TRY_CAST`, `DATEADD`, `DATEDIFF`, `TO_DATE`, `::` casts, and warehouse-style database/schema qualification unless such qualification is literally part of the provided table name.
-- For Snowflake, preserve fully qualified table names exactly as shown. Quote identifiers only when needed for case sensitivity or special characters, and quote each part of a qualified name separately when quoting is required.
+- Follow the dataset-specific SQL requirements exactly.
 - Use the hint as additional guidance, especially for Spider2 formulas, UDFs, special constants, date windows, and business logic.
 - Use sample values and value descriptions to choose literal values, boolean values, category names, and variable codes when they are available.
 - Include all filters, joins, grouping, ordering, limits, calculations, and aliases required by the question.
 - Prefer clear CTEs for multi-step logic.
 - If foreign-key metadata is unavailable, infer joins cautiously from matching column names, descriptions, sample values, and the hint.
-- Quote identifiers only when needed by the target dialect, when names are fully qualified and case-sensitive, or when names contain special characters.
 - Do not use columns that are not visible in the schema excerpt.
 - Do not use `SELECT *` unless the question explicitly asks for all columns.
 - Do not include comments or explanations in the SQL.

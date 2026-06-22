@@ -40,6 +40,18 @@ SCHEMA_RESULT_PATTERN_TEMPLATE = (
 )
 
 
+def safe_path_component(value: str) -> str:
+    component = re.sub(r"[^A-Za-z0-9._-]+", "__", str(value).strip())
+    return component.strip("._-") or "unknown"
+
+
+def sql_generation_query_settings(provider: str) -> dict[str, Any]:
+    settings = dict(SQL_GENERATION_QUERY_SETTINGS)
+    if provider == "openai":
+        settings["response_format"] = {"type": "text"}
+    return settings
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate SQL from schema-linking prediction logs."
@@ -47,6 +59,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-name", dest="dataset_name", type=str, default=None)
     parser.add_argument("--answer-llm-name", dest="answer_llm_name", type=str, default=None)
     parser.add_argument("--provider", dest="provider", type=str, default=None)
+    parser.add_argument("--credential-path", dest="credential_path", type=Path, default=None)
     parser.add_argument("--max-input-length", dest="max_input_length", type=int, default=None)
     parser.add_argument("--max-generation-num", dest="max_generation_num", type=int, default=None)
     parser.add_argument("--input-path", dest="input_path", type=Path, default=None)
@@ -68,6 +81,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-path", dest="dataset_path", type=Path, default=None)
     parser.add_argument("--documents-dir", dest="documents_dir", type=Path, default=None)
     parser.add_argument("--prompt-path", dest="prompt_path", type=Path, default=None)
+    parser.add_argument(
+        "--output-dir",
+        dest="output_dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory for SQL generation results. If omitted, results are saved under "
+            "Logs/sql_results/<dataset_name>/<model_name>/."
+        ),
+    )
     parser.add_argument("--output-path", dest="output_path", type=Path, default=None)
     parser.add_argument("--sql-dialect", dest="sql_dialect", type=str, default=None)
     parser.add_argument("--start-index", dest="start_index", type=int, default=0)
@@ -193,15 +216,22 @@ def resolve_input_path(
 
 def resolve_output_path(
     output_path: Path | None,
+    output_dir: Path | None,
     logs_dir: Path,
     dataset_name: str,
+    model_name: str,
 ) -> Path:
     if output_path is not None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         return output_path
 
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_dir = logs_dir / "sql_results"
+    save_dir = output_dir or (
+        logs_dir
+        / "sql_results"
+        / safe_path_component(dataset_name)
+        / safe_path_component(model_name)
+    )
     save_dir.mkdir(parents=True, exist_ok=True)
     return save_dir / f"sql_generation_{dataset_name}_{run_id}.json"
 
@@ -209,17 +239,27 @@ def resolve_output_path(
 def default_sql_dialect(dataset_name: str) -> str:
     if dataset_name.lower() == "mmqa":
         return (
-            "Use SQLite SQL. Do not use Snowflake-only features such as QUALIFY, ILIKE, "
-            "TRY_CAST, DATEADD, DATEDIFF, TO_DATE, :: casts, or fully qualified "
-            "DATABASE.SCHEMA.TABLE notation unless the table name is explicitly shown that way. "
-            "Use SQLite-compatible functions such as strftime/date/datetime when date logic is needed."
+            "Use SQLite SQL for MMQA. MMQA uses compact Spider-style SQLite databases. "
+            "Use only SQLite-compatible syntax and functions. Use strftime/date/datetime "
+            "for date logic when needed. Use table and column names exactly as shown in "
+            "the schema excerpt. Do not use Snowflake-only features such as QUALIFY, ILIKE, "
+            "TRY_CAST, DATEADD, DATEDIFF, TO_DATE, TRUE/FALSE boolean literals, :: casts, "
+            "or warehouse-style DATABASE.SCHEMA.TABLE qualification unless that qualification "
+            "is literally part of a provided SQLite table name."
         )
     if dataset_name.lower() == "spider2":
         return (
-            "Use Snowflake SQL. Preserve fully qualified table names exactly as shown, usually "
-            "DATABASE.SCHEMA.TABLE. Snowflake features such as CTEs, QUALIFY, ILIKE, DATEADD, "
-            "DATEDIFF, TRY_CAST, TO_DATE, TRUE/FALSE boolean literals, and :: casts are allowed "
-            "when useful. Do not write SQLite-specific SQL."
+            "Use Snowflake SQL for Spider2. Spider2 uses large Snowflake warehouse databases, "
+            "often with fully qualified table names. Preserve every table and column name exactly "
+            "as shown in the schema excerpt. Any Snowflake identifier containing lowercase letters, "
+            "mixed case, spaces, or special characters must be double-quoted. Quote each part of "
+            "a mixed-case fully qualified table name separately, for example "
+            "\"DATABASE\".\"SCHEMA\".\"MixedCaseTable\". Reference mixed-case columns as "
+            "alias.\"ColumnName\". Do not write DATABASE.SCHEMA.MixedCaseTable or alias.ColumnName "
+            "for mixed-case objects because Snowflake will uppercase unquoted identifiers. "
+            "Snowflake features such as CTEs, QUALIFY, ILIKE, DATEADD, DATEDIFF, TRY_CAST, "
+            "TO_DATE, TRUE/FALSE boolean literals, and :: casts are allowed when useful. "
+            "Do not write SQLite-specific SQL."
         )
     return "Use the dialect implied by the question, schema, and hint."
 
@@ -687,8 +727,10 @@ def main() -> None:
     )
     output_path = resolve_output_path(
         output_path=args.output_path,
+        output_dir=args.output_dir,
         logs_dir=logs_dir,
         dataset_name=dataset_name,
+        model_name=answer_llm_name,
     )
     logger, logger_path = setup_task_logger("sql_generation", output_path)
 
@@ -701,6 +743,7 @@ def main() -> None:
         "dataset_name": dataset_name,
         "model": answer_llm_name,
         "provider": provider,
+        "credential_path": None if args.credential_path is None else str(args.credential_path),
         "schema_source_model": schema_llm_name,
         "schema_input_path": str(input_path),
         "prompt_template": str(prompt_path),
@@ -727,6 +770,7 @@ def main() -> None:
         extra_fields={
             "Schema input path": input_path,
             "Schema source model": schema_llm_name,
+            "Credential path": args.credential_path,
             "Schema method": args.schema_method,
             "Schema task": args.schema_task,
             "Prompt template": prompt_path,
@@ -748,7 +792,8 @@ def main() -> None:
         provider=provider,
         max_input_length=max_input_length,
         max_generation_num=max_generation_num,
-        query_settings=SQL_GENERATION_QUERY_SETTINGS,
+        query_settings=sql_generation_query_settings(provider),
+        credential_path=args.credential_path,
     )
     renderer = SchemaTextRenderer(tokenizer=answer_llm.tokenizer)
     schema_store = DbInfoSchemaStore(
