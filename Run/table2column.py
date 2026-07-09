@@ -54,6 +54,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--db-info-path", dest="db_info_path", type=Path, default=None)
     parser.add_argument("--qdrant-path", dest="qdrant_path", type=Path, default=None)
     parser.add_argument("--output-path", dest="output_path", type=Path, default=None)
+    parser.add_argument(
+        "--disable-table-filtering",
+        dest="disable_table_filtering",
+        action="store_true",
+        help="Skip table prediction and run column linking over the predicted database schema.",
+    )
     return parser.parse_args()
 
 
@@ -263,6 +269,7 @@ def append_log_entry(
     answer_llm_name: str,
     provider: str,
     output_path: Path,
+    table_filtering_enabled: bool,
 ) -> None:
     efficiency = efficiency_tracker.finalize()
     log_records.append(
@@ -277,6 +284,7 @@ def append_log_entry(
             "predict_columns_text":column_response_text,
             "predict_tables": predict_tables,
             "predict_columns": predict_columns,
+            "table_filtering_enabled": table_filtering_enabled,
             "efficiency": efficiency,
         }
     )
@@ -297,6 +305,7 @@ def run_table2column(
     answer_llm: Any,
     answer_llm_name: str,
     provider: str,
+    table_filtering_enabled: bool,
 ) -> int:
     from tqdm import tqdm
 
@@ -317,6 +326,7 @@ def run_table2column(
                 answer_llm_name=answer_llm_name,
                 provider=provider,
                 output_path=output_path,
+                table_filtering_enabled=table_filtering_enabled,
             )
             continue
 
@@ -340,48 +350,65 @@ def run_table2column(
                 answer_llm_name=answer_llm_name,
                 provider=provider,
                 output_path=output_path,
+                table_filtering_enabled=table_filtering_enabled,
             )
             continue
 
-        table_schema_text, table_prompt_records = resolve_table_prompt_schema(
-            predict_db_id=predict_db_id,
-            question=question,
-            hint=hint,
-            prompt_template=prompt_templates["table"],
-            answer_llm=answer_llm,
-            embedder=embedder,
-            schema_store=schema_store,
-            qdrant_client=qdrant_client,
-            qdrant_collection_name=qdrant_collection_name,
-            db_counts=db_counts,
-        )
-        table_prompt = render_schema_prompt(
-            prompt_template=prompt_templates["table"],
-            schema_text=table_schema_text,
-            question=question,
-            hint=hint,
-        )
-        table_response_text, table_total_tokens = answer_llm.query_with_usage(table_prompt)
-        efficiency_tracker.add_llm_total_tokens(table_total_tokens)
-        relevant_table_list = normalize_relevant_tables(
-            parse_table_response(table_response_text),
-            full_db_records,
-        )
+        if table_filtering_enabled:
+            table_schema_text, table_prompt_records = resolve_table_prompt_schema(
+                predict_db_id=predict_db_id,
+                question=question,
+                hint=hint,
+                prompt_template=prompt_templates["table"],
+                answer_llm=answer_llm,
+                embedder=embedder,
+                schema_store=schema_store,
+                qdrant_client=qdrant_client,
+                qdrant_collection_name=qdrant_collection_name,
+                db_counts=db_counts,
+            )
+            table_prompt = render_schema_prompt(
+                prompt_template=prompt_templates["table"],
+                schema_text=table_schema_text,
+                question=question,
+                hint=hint,
+            )
+            table_response_text, table_total_tokens = answer_llm.query_with_usage(table_prompt)
+            efficiency_tracker.add_llm_total_tokens(table_total_tokens)
+            relevant_table_list = normalize_relevant_tables(
+                parse_table_response(table_response_text),
+                full_db_records,
+            )
 
-        column_prompt_records = resolve_column_prompt_records(
-            predict_db_id=predict_db_id,
-            question=question,
-            hint=hint,
-            relevant_table_list=relevant_table_list,
-            table_prompt_records=table_prompt_records,
-            schema_store=schema_store,
-            answer_llm=answer_llm,
-            prompt_template=prompt_templates["column"],
-        )
-        column_schema_text = schema_store.render_schema_text(
-            predict_db_id,
-            column_prompt_records,
-        )
+            column_prompt_records = resolve_column_prompt_records(
+                predict_db_id=predict_db_id,
+                question=question,
+                hint=hint,
+                relevant_table_list=relevant_table_list,
+                table_prompt_records=table_prompt_records,
+                schema_store=schema_store,
+                answer_llm=answer_llm,
+                prompt_template=prompt_templates["column"],
+            )
+            column_schema_text = schema_store.render_schema_text(
+                predict_db_id,
+                column_prompt_records,
+            )
+        else:
+            table_response_text = "Table filtering disabled."
+            relevant_table_list = []
+            column_schema_text, column_prompt_records = resolve_table_prompt_schema(
+                predict_db_id=predict_db_id,
+                question=question,
+                hint=hint,
+                prompt_template=prompt_templates["column"],
+                answer_llm=answer_llm,
+                embedder=embedder,
+                schema_store=schema_store,
+                qdrant_client=qdrant_client,
+                qdrant_collection_name=qdrant_collection_name,
+                db_counts=db_counts,
+            )
         column_prompt = render_schema_prompt(
             prompt_template=prompt_templates["column"],
             schema_text=column_schema_text,
@@ -402,6 +429,7 @@ def run_table2column(
             answer_llm_name=answer_llm_name,
             provider=provider,
             output_path=output_path,
+            table_filtering_enabled=table_filtering_enabled,
         )
 
     return len(log_records)
@@ -416,6 +444,7 @@ def main() -> None:
     provider = resolve_provider(args.provider or PROVIDER)
     max_input_length = args.max_input_length or MAX_INPUT_LENGTH
     max_generation_num = args.max_generation_num or MAX_GENERATEION_NUM
+    table_filtering_enabled = not args.disable_table_filtering
 
     dataset_root = PROJECT_ROOT / "Data" / dataset_name
     documents_dir = dataset_root / "documents"
@@ -437,7 +466,11 @@ def main() -> None:
         output_path=args.output_path,
         answer_llm_name=answer_llm_name,
         dataset_name=dataset_name,
-        output_stem=f"{method_name}_table2column",
+        output_stem=(
+            f"{method_name}_table2column"
+            if table_filtering_enabled
+            else f"{method_name}_wo_table_filtering_table2column"
+        ),
         project_root=PROJECT_ROOT,
     )
     logger, logger_path = setup_task_logger("table2column", output_path)
@@ -455,6 +488,7 @@ def main() -> None:
         result_path=output_path,
         extra_fields={
             "Method": method_name,
+            "Table filtering enabled": table_filtering_enabled,
             "Input path": input_path,
             "Table prompt template": PROJECT_ROOT / "Templates" / method_name / "extract_relevant_tables.txt",
             "Column prompt template": PROJECT_ROOT / "Templates" / method_name / "extract_relevant_columns.txt",
@@ -499,6 +533,7 @@ def main() -> None:
         answer_llm=answer_llm,
         answer_llm_name=answer_llm_name,
         provider=provider,
+        table_filtering_enabled=table_filtering_enabled,
     )
     logger.info("Completed %s records.", processed_count)
 

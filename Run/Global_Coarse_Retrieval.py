@@ -2,7 +2,7 @@ import pandas as pd
 import argparse
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import ScoredPoint
-from typing import Any
+from typing import Any, Optional
 from pathlib import Path
 from tqdm import tqdm
 import json
@@ -35,6 +35,7 @@ from Utils.tools import (
 
 PROMPT_BUDGET_BUFFER = 512
 PROMPT_BUDGET_RATIO = 0.8
+SUPPORTED_DB_SELECTION_MODES = {"rerank", "pruning"}
 
 def clean_text(value: Any) -> str:
     if value is None:
@@ -100,6 +101,16 @@ def parse_args() -> argparse.Namespace:
         default=None,
     )
     parser.add_argument("--candidate-db-top-k", dest="candidate_db_top_k", type=int, default=None)
+    parser.add_argument(
+        "--db-selection-mode",
+        dest="db_selection_mode",
+        choices=sorted(SUPPORTED_DB_SELECTION_MODES),
+        default="rerank",
+        help=(
+            "How to select databases after support-based pruning. "
+            "'rerank' uses the LLM yes/no reranker; 'pruning' directly keeps the pruning order."
+        ),
+    )
     parser.add_argument(
         "--enable-progress-log",
         dest="enable_progress_log",
@@ -417,6 +428,60 @@ def CFCD_rerank_select(query:str, query_vector: list[float], ranking_llm:LLM,
     return ranked_db_ids
 
 
+def select_candidate_databases(
+    query: str,
+    query_vector: list[float],
+    ranking_llm: Optional[LLM],
+    candidate_db_ids: list[str],
+    prompt_template: str,
+    top_k: int,
+    hint_text: str,
+    schema_store: Optional[DbInfoSchemaStore],
+    qdrant_client: QdrantClient,
+    collection_name: str,
+    db_counts: dict[str, int],
+    db_selection_mode: str,
+    efficiency_tracker: SampleEfficiencyTracker | None = None,
+    logger: logging.Logger | None = None,
+    enable_progress_log: bool = False,
+    sample_tag: str = "",
+    step: str = "select",
+) -> list[str]:
+    if db_selection_mode == "pruning":
+        selected_db_ids = candidate_db_ids[:top_k]
+        log_progress(
+            logger,
+            enable_progress_log,
+            sample_tag,
+            step,
+            "Selected %s databases directly from pruning order: %s",
+            len(selected_db_ids),
+            ",".join(selected_db_ids) if selected_db_ids else "NONE",
+        )
+        return selected_db_ids
+
+    if ranking_llm is None or schema_store is None:
+        raise ValueError("LLM reranking requires ranking_llm and schema_store.")
+
+    return CFCD_rerank_select(
+        query,
+        query_vector,
+        ranking_llm,
+        candidate_db_ids,
+        prompt_template,
+        top_k=top_k,
+        hint_text=hint_text,
+        schema_store=schema_store,
+        qdrant_client=qdrant_client,
+        collection_name=collection_name,
+        db_counts=db_counts,
+        efficiency_tracker=efficiency_tracker,
+        logger=logger,
+        enable_progress_log=enable_progress_log,
+        sample_tag=sample_tag,
+    )
+
+
 def main() -> None:
     args = parse_args()
 
@@ -426,6 +491,7 @@ def main() -> None:
     max_input_length = args.max_input_length or MAX_INPUT_LENGTH
     max_generation_num = args.max_generation_num or MAX_GENERATEION_NUM
     candidate_db_top_k = args.candidate_db_top_k if args.candidate_db_top_k is not None else CANDIDATE_DB_TOP_K
+    db_selection_mode = args.db_selection_mode
     enable_progress_log = args.enable_progress_log
     
     run_id = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -474,6 +540,7 @@ def main() -> None:
             "Prompt budget ratio": PROMPT_BUDGET_RATIO,
             "Prompt budget buffer": PROMPT_BUDGET_BUFFER,
             "Candidate db top k": candidate_db_top_k,
+            "DB selection mode": db_selection_mode,
             "Max input length": max_input_length,
             "Max generation num": max_generation_num,
             "Enable progress log": enable_progress_log,
@@ -485,17 +552,20 @@ def main() -> None:
         model_name=EMBEDDING_MODEL_NAME,
     )
     
-    ranking_llm = LLM(
-        model_name=answer_llm_name,
-        provider=provider,
-        max_input_length=max_input_length,
-        max_generation_num=max_generation_num,
-    )
-    renderer = SchemaTextRenderer(tokenizer=ranking_llm.tokenizer)
-    schema_store = DbInfoSchemaStore(
-        db_info_index=db_info_index,
-        renderer=renderer,
-    )
+    ranking_llm = None
+    schema_store = None
+    if db_selection_mode == "rerank":
+        ranking_llm = LLM(
+            model_name=answer_llm_name,
+            provider=provider,
+            max_input_length=max_input_length,
+            max_generation_num=max_generation_num,
+        )
+        renderer = SchemaTextRenderer(tokenizer=ranking_llm.tokenizer)
+        schema_store = DbInfoSchemaStore(
+            db_info_index=db_info_index,
+            renderer=renderer,
+        )
 
     log_records = []
 
@@ -579,22 +649,24 @@ def main() -> None:
                 len(first_round_cfcd_db_ids),
                 candidate_db_top_k,
             )
-            FCD_db_ids = CFCD_rerank_select(
-                row['question'],
-                query_embedding,
-                ranking_llm,
-                first_round_cfcd_db_ids,
-                prompt_template,
+            FCD_db_ids = select_candidate_databases(
+                query=row['question'],
+                query_vector=query_embedding,
+                ranking_llm=ranking_llm,
+                candidate_db_ids=first_round_cfcd_db_ids,
+                prompt_template=prompt_template,
                 top_k=1,
                 hint_text=hint_text,
                 schema_store=schema_store,
                 qdrant_client=client,
                 collection_name=collection_name,
                 db_counts=db_counts,
+                db_selection_mode=db_selection_mode,
                 efficiency_tracker=efficiency_tracker,
                 logger=logger,
                 enable_progress_log=enable_progress_log,
                 sample_tag=sample_tag,
+                step="round1.step3",
             )
             target_db_id = FCD_db_ids
             log_progress(
@@ -602,7 +674,7 @@ def main() -> None:
                 enable_progress_log,
                 sample_tag,
                 "round1.step3",
-                "First-round rerank directly selected target database: %s",
+                "First-round selection directly selected target database: %s",
                 target_db_id[0] if target_db_id else "NONE",
             )
         else:
@@ -612,32 +684,34 @@ def main() -> None:
                 enable_progress_log,
                 sample_tag,
                 "round1.step3",
-                "Starting first-round rerank to select top %s databases.",
+                "Starting first-round database selection to select top %s databases.",
                 candidate_db_top_k,
             )
-            FCD_db_ids = CFCD_rerank_select(
-                row['question'],
-                query_embedding,
-                ranking_llm,
-                first_round_cfcd_db_ids,
-                prompt_template,
+            FCD_db_ids = select_candidate_databases(
+                query=row['question'],
+                query_vector=query_embedding,
+                ranking_llm=ranking_llm,
+                candidate_db_ids=first_round_cfcd_db_ids,
+                prompt_template=prompt_template,
                 top_k=candidate_db_top_k,
                 hint_text=hint_text,
                 schema_store=schema_store,
                 qdrant_client=client,
                 collection_name=collection_name,
                 db_counts=db_counts,
+                db_selection_mode=db_selection_mode,
                 efficiency_tracker=efficiency_tracker,
                 logger=logger,
                 enable_progress_log=enable_progress_log,
                 sample_tag=sample_tag,
+                step="round1.step3",
             )
             log_progress(
                 logger,
                 enable_progress_log,
                 sample_tag,
                 "round1.step3",
-                "First-round rerank selected %s final candidate databases: %s",
+                "First-round selection selected %s final candidate databases: %s",
                 len(FCD_db_ids),
                 ",".join(FCD_db_ids) if FCD_db_ids else "NONE",
             )
@@ -691,31 +765,33 @@ def main() -> None:
                 enable_progress_log,
                 sample_tag,
                 "round2.step3",
-                "Starting second-round rerank to select the target database.",
+                "Starting second-round database selection to select the target database.",
             )
-            target_db_id = CFCD_rerank_select(
-                row['question'],
-                query_embedding,
-                ranking_llm,
-                second_round_cfcd_db_ids,
-                prompt_template,
+            target_db_id = select_candidate_databases(
+                query=row['question'],
+                query_vector=query_embedding,
+                ranking_llm=ranking_llm,
+                candidate_db_ids=second_round_cfcd_db_ids,
+                prompt_template=prompt_template,
                 top_k=1,
                 hint_text=hint_text,
                 schema_store=schema_store,
                 qdrant_client=client,
                 collection_name=collection_name,
                 db_counts=db_counts,
+                db_selection_mode=db_selection_mode,
                 efficiency_tracker=efficiency_tracker,
                 logger=logger,
                 enable_progress_log=enable_progress_log,
                 sample_tag=sample_tag,
+                step="round2.step3",
             )
             log_progress(
                 logger,
                 enable_progress_log,
                 sample_tag,
                 "round2.step3",
-                "Second-round rerank selected target database: %s",
+                "Second-round selection selected target database: %s",
                 target_db_id[0] if target_db_id else "NONE",
             )
         # save the predict results
@@ -729,6 +805,7 @@ def main() -> None:
                 'FCD_ids': ",".join(FCD_db_ids),
                 'CFCD_db_ids': ",".join(final_cfcd_db_ids),
                 'predict_db_id': target_db_id[0] if target_db_id else None,
+                'db_selection_mode': db_selection_mode,
                 'efficiency': efficiency_tracker.finalize(),
             }
         )
