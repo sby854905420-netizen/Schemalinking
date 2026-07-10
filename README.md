@@ -5,17 +5,19 @@
 1. 数据库检索：根据自然语言问题预测最相关的数据库 `predict_db_id`。
 2. Schema Linking：在预测数据库中定位相关表或相关列。
 
-当前代码中主要有 5 个可运行入口：
+当前代码中主要有 7 个可运行入口：
 
 | 阶段 | 脚本 | 作用 |
 | --- | --- | --- |
-| 离线构建 | [`Rag_pipline/build_index.py`](Rag_pipline/build_index.py) | 从 `db_info.json` 构建列级 Qdrant 向量索引 |
-| 数据库检索 | [`Run/Baseline_Database_Retrival.py`](Run/Baseline_Database_Retrival.py) | 基线数据库检索：把所有数据库摘要拼进 prompt，让 LLM 输出相关数据库 |
-| 数据库检索 | [`Run/Global_Coarse_Retrieval.py`](Run/Global_Coarse_Retrieval.py) | 检索增强版数据库检索：列级向量召回、数据库剪枝、LLM 二分类重排 |
-| Schema Linking | [`Run/Baseline_Schema_Linking.py`](Run/Baseline_Schema_Linking.py) | 已知 `predict_db_id` 后，对目标数据库直接做列级 schema linking |
-| Schema Linking | [`Run/table2column.py`](Run/table2column.py) | 先预测相关表，再在候选表范围内预测相关列 |
+| 离线构建 | [`Indexing/build_column_index.py`](Indexing/build_column_index.py) | 从 `db_info.json` 构建列级 Qdrant 向量索引 |
+| 数据库检索 | [`Baseline/baseline_database_retrieval.py`](Baseline/baseline_database_retrieval.py) | 基线数据库检索：把所有数据库摘要拼进 prompt，让 LLM 输出相关数据库 |
+| 数据库检索 | [`Run/global_coarse_retrieval.py`](Run/global_coarse_retrieval.py) | 检索增强版数据库检索：列级向量召回、数据库剪枝、LLM 二分类重排 |
+| Schema Linking | [`Baseline/baseline_schema_linking.py`](Baseline/baseline_schema_linking.py) | 已知 `predict_db_id` 后，对目标数据库直接做列级 schema linking |
+| Schema Linking | [`Baseline/rag_column_retrieval.py`](Baseline/rag_column_retrieval.py) | 纯向量检索 baseline |
+| Schema Linking | [`Run/table_to_column.py`](Run/table_to_column.py) | 先预测相关表，再在候选表范围内预测相关列 |
+| SQL 生成 | [`Run/sql_generator.py`](Run/sql_generator.py) | Spider-Agent-TC 与 one-shot SQL 生成统一入口 |
 
-注意：仓库中的文件名和输出目录保留了 `Retrival` 这个拼写，运行命令和结果路径都需要按实际名称使用。
+目录职责和新增文件放置规则见 [`docs/project_structure.md`](docs/project_structure.md)。新结果使用正确拼写的 `database_retrieval`；读取阶段仍兼容历史 `Database_Retrival` 目录及 `*_retrival_*.json` 文件。
 
 ## 1. 环境准备
 
@@ -46,17 +48,17 @@ pip install -r requirements.txt
 
 | 脚本 | 当前可用 provider | 原因 |
 | --- | --- | --- |
-| `Baseline_Database_Retrival.py` | `transformers` / `openai` | 只需要普通文本生成 |
-| `Global_Coarse_Retrieval.py` | `transformers` | 需要 tokenizer 计数和下一 token logits 做 yes/no 重排 |
-| `Baseline_Schema_Linking.py` | `transformers` | schema 渲染器依赖 `answer_llm.tokenizer` |
-| `table2column.py` | `transformers` | 依赖 tokenizer 计数、schema 裁剪和本地 embedding 检索 |
-| `sql_generator.py` | `transformers` / `openai` | OpenAI provider 会提供 tokenizer-like prompt 预算接口，并可直接调用 GPT-5 系列模型 |
+| `baseline_database_retrieval.py` | `transformers` / `openai` | 只需要普通文本生成 |
+| `global_coarse_retrieval.py` | `transformers` | 需要 tokenizer 计数和下一 token logits 做 yes/no 重排 |
+| `baseline_schema_linking.py` | `transformers` | schema 渲染器依赖 `answer_llm.tokenizer` |
+| `table_to_column.py` | `transformers` | 依赖 tokenizer 计数、schema 裁剪和本地 embedding 检索 |
+| `sql_generator.py` | Agent：`transformers`；one-shot：`transformers` / `openai` | 默认 Spider-Agent-TC 固定使用本地 Qwen3-Coder；旧 provider 兼容性由 `--generator-mode one_shot` 保留 |
 
 使用 OpenAI provider 时，代码会优先读取环境变量 `OPENAI_API_KEY`，也可以读取 `OPENAI_CREDENTIAL_PATH` 或项目根目录下的 `gpt_credential.json`。凭据 JSON 支持 `api_key`、`openai_api_key`、`OPENAI_API_KEY`、`key` 字段。
 
 ```bash
 export OPENAI_API_KEY=your_api_key_here
-python -m Run.Baseline_Database_Retrival \
+python -m Baseline.baseline_database_retrieval \
   --dataset-name MMQA \
   --provider openai \
   --answer-llm-name gpt-4.1-mini
@@ -67,6 +69,7 @@ SQL generator 使用 GPT-5 mini 的示例：
 ```bash
 python -m Run.sql_generator \
   --dataset-name MMQA \
+  --generator-mode one_shot \
   --provider openai \
   --answer-llm-name gpt-5-mini-2025-08-07 \
   --credential-path gpt_credential.json \
@@ -82,23 +85,23 @@ python -m Run.sql_generator \
 | `Data/<dataset>/db_info.json` | 数据库 schema、列描述、样例值、主外键等统一来源 |
 | `Data/<dataset>/Database_schemas_summary.json` | 基线数据库检索使用的数据库摘要 |
 | `Data/<dataset>/gold_sl.json` | 数据库检索阶段默认输入文件 |
-| `Data/<dataset>/qdrant_column_index/` | 本地 Qdrant 列级索引目录，由 `build_index.py` 生成 |
+| `Data/<dataset>/qdrant_column_index/` | 本地 Qdrant 列级索引目录，由 `build_column_index.py` 生成 |
 | `Data/<dataset>/documents/` | Spider2 的 `external_knowledge` 文档目录 |
 
 当前仓库里的实际情况：
 
 - `MMQA` 和 `BIRD` 提供了 `Database_schemas_summary.json`，可以直接运行基线数据库检索。
-- `Spider2` 当前没有 `Database_schemas_summary.json`，不能直接跑 `Baseline_Database_Retrival.py`，除非用 `--database-schema-path` 指向你自己准备的摘要文件。
+- `Spider2` 当前没有 `Database_schemas_summary.json`，不能直接跑 `baseline_database_retrieval.py`，除非用 `--database-schema-path` 指向你自己准备的摘要文件。
 - 三个数据集都提供了 `db_info.json` 和 `gold_sl.json`。
 
 输入字段约定：
 
 | 脚本 | 必需字段 |
 | --- | --- |
-| `Baseline_Database_Retrival.py` | `id`、`db_id`、`question` |
-| `Global_Coarse_Retrieval.py` | `id`、`db_id`、`question` |
-| `Baseline_Schema_Linking.py` | `question`、`predict_db_id`，以及 `id` 或 `instance_id` |
-| `table2column.py` | `id`、`question`、`predict_db_id` |
+| `baseline_database_retrieval.py` | `id`、`db_id`、`question` |
+| `global_coarse_retrieval.py` | `id`、`db_id`、`question` |
+| `baseline_schema_linking.py` | `question`、`predict_db_id`，以及 `id` 或 `instance_id` |
+| `table_to_column.py` | `id`、`question`、`predict_db_id` |
 
 可选字段：
 
@@ -109,10 +112,10 @@ python -m Run.sql_generator \
 
 ### 3.1 构建列级向量索引
 
-`Global_Coarse_Retrieval.py` 和 `table2column.py` 都依赖本地 Qdrant 索引。首次运行某个数据集前先执行：
+`global_coarse_retrieval.py` 和 `table_to_column.py` 都依赖本地 Qdrant 索引。首次运行某个数据集前先执行：
 
 ```bash
-python -m Rag_pipline.build_index \
+python -m Indexing.build_column_index \
   --db-info-path Data/MMQA/db_info.json \
   --collection-name MMQA \
   --qdrant-path Data/MMQA/qdrant_column_index \
@@ -124,8 +127,8 @@ python -m Rag_pipline.build_index \
 
 重要限制：
 
-- `Global_Coarse_Retrieval.py` 当前固定使用 `dataset_name` 作为 Qdrant collection 名称，所以构建索引时建议保持 `--collection-name` 与 `--dataset-name` 一致。
-- `table2column.py` 会读取 `qdrant_column_index/meta.json` 中的 collection 名称。
+- `global_coarse_retrieval.py` 当前固定使用 `dataset_name` 作为 Qdrant collection 名称，所以构建索引时建议保持 `--collection-name` 与 `--dataset-name` 一致。
+- `table_to_column.py` 会读取 `qdrant_column_index/meta.json` 中的 collection 名称。
 - 构建索引时的 embedding 模型应与 [`config.py`](config.py) 中的 `EMBEDDING_MODEL_NAME` 保持一致，否则查询阶段可能出现向量维度不匹配或效果异常。
 
 ### 3.2 基线流程
@@ -133,39 +136,39 @@ python -m Rag_pipline.build_index \
 先运行基线数据库检索，再直接做列级 Schema Linking：
 
 ```bash
-python -m Run.Baseline_Database_Retrival \
+python -m Baseline.baseline_database_retrieval \
   --dataset-name MMQA \
   --answer-llm-name mistralai/Ministral-3-8B-Instruct-2512 \
   --provider transformers
 
-python -m Run.Baseline_Schema_Linking \
+python -m Baseline.baseline_schema_linking \
   --method few_shot \
   --dataset-name MMQA \
   --answer-llm-name mistralai/Ministral-3-8B-Instruct-2512 \
   --provider transformers
 ```
 
-`Baseline_Schema_Linking.py` 如果不传 `--input-path`，会自动在 `Logs/<answer_llm_name>/Database_Retrival/` 下寻找当前数据集最近一次数据库检索结果。
+`baseline_schema_linking.py` 如果不传 `--input-path`，会自动在 `Logs/<answer_llm_name>/database_retrieval/` 下寻找当前数据集最近一次数据库检索结果。
 
 ### 3.3 检索增强流程
 
 先运行全局粗检索，再运行 table-to-column Schema Linking：
 
 ```bash
-python -m Run.Global_Coarse_Retrieval \
+python -m Run.global_coarse_retrieval \
   --dataset-name MMQA \
   --answer-llm-name mistralai/Ministral-3-8B-Instruct-2512 \
   --provider transformers \
   --candidate-db-top-k 3
 
-python -m Run.table2column \
+python -m Run.table_to_column \
   --method few_shot \
   --dataset-name MMQA \
   --answer-llm-name mistralai/Ministral-3-8B-Instruct-2512 \
   --provider transformers
 ```
 
-`Global_Coarse_Retrieval.py` 的粗检索逻辑：
+`global_coarse_retrieval.py` 的粗检索逻辑：
 
 1. 对问题做 embedding，检索全局高相关列。
 2. 按数据库聚合检索命中，做基于命中数和相似度的剪枝。
@@ -177,37 +180,64 @@ python -m Run.table2column \
 两个 Schema Linking 脚本都支持显式传入数据库检索结果：
 
 ```bash
-python -m Run.Baseline_Schema_Linking \
+python -m Baseline.baseline_schema_linking \
   --method few_shot \
-  --input-path Logs/mistralai/Ministral-3-8B-Instruct-2512/Database_Retrival/iterative_database_retrival_MMQA_20260416_120000.json
+  --input-path Logs/mistralai/Ministral-3-8B-Instruct-2512/database_retrieval/iterative_database_retrieval_MMQA_20260416_120000.json
 
-python -m Run.table2column \
+python -m Run.table_to_column \
   --method few_shot \
-  --input-path Logs/mistralai/Ministral-3-8B-Instruct-2512/Database_Retrival/iterative_database_retrival_MMQA_20260416_120000.json
+  --input-path Logs/mistralai/Ministral-3-8B-Instruct-2512/database_retrieval/iterative_database_retrieval_MMQA_20260416_120000.json
 ```
 
 连续跑不同模型或不同数据集时，建议显式指定 `--input-path`，避免自动读取到旧结果。
 
 ## 4. 输出文件
 
-每个主脚本都会生成 `.json` 结果文件，并通过 [`Run/logging_utils.py`](Run/logging_utils.py) 生成同名 `.log` 日志文件。
+各阶段脚本都会生成 `.json` 结果文件；检索与 Schema Linking 脚本还会通过 [`Utils/logging_utils.py`](Utils/logging_utils.py) 生成同名 `.log` 日志文件。
 
 | 脚本 | 默认输出位置 |
 | --- | --- |
-| `Baseline_Database_Retrival.py` | `Logs/<answer_llm_name>/Database_Retrival/baseline_database_retrival_<dataset>_<timestamp>.json` |
-| `Global_Coarse_Retrieval.py` | `Logs/<answer_llm_name>/Database_Retrival/iterative_database_retrival_<dataset>_<timestamp>.json` |
-| `Baseline_Schema_Linking.py` | `Logs/<answer_llm_name>/<method>_baseline_schema_linking_<dataset>_<timestamp>.json` |
-| `table2column.py` | `Logs/<answer_llm_name>/<method>_table2column_<dataset>_<timestamp>.json` |
+| `baseline_database_retrieval.py` | `Logs/<answer_llm_name>/database_retrieval/baseline_database_retrieval_<dataset>_<timestamp>.json` |
+| `global_coarse_retrieval.py` | `Logs/<answer_llm_name>/database_retrieval/iterative_database_retrieval_<dataset>_<timestamp>.json` |
+| `baseline_schema_linking.py` | `Logs/<answer_llm_name>/<method>_baseline_schema_linking_<dataset>_<timestamp>.json` |
+| `table_to_column.py` | `Logs/<answer_llm_name>/<method>_table2column_<dataset>_<timestamp>.json` |
+| `sql_generator.py` | 原生兼容输出：`Logs/sql_results/<dataset>/<model>/sql_generation_<dataset>_<timestamp>.json`；统一输出：`results/sql/<sql_method>/<dataset>/<sql_model>/<sl_method>/<sl_model>.json` |
 
 说明：
 
 - `<answer_llm_name>` 会按模型名原样展开。
 - 如果模型名包含 `/`，例如 `mistralai/Ministral-3-8B-Instruct-2512`，日志目录会自然变成多级路径。
-- 输出记录中会包含 `efficiency` 字段，记录当前样本的 token 使用等效率信息。
+- 检索与 Schema Linking 输出记录包含 `efficiency` 字段；SQL 预测文件按 EX 契约只保留 4 个最小字段。
+
+上述 `Logs/` 文件是保留的 MDBlink 原生输出。Schema Linking 完成后还会立即写入统一、原子更新的结果：
+
+```text
+results/sl/<sl_method>/<dataset>/<sl_model>/prediction.json
+```
+
+其中 `sl_method` 为 `prompt_baseline`、`table_to_column` 或 `rag_column_retrieval`。表名前缀严格匹配 `predict_db_id + "."` 时会在统一结果中去掉；SQL generator 读取 Spider2 统一结果时会重新组合 Snowflake 三段表名。
+
+SQL 统一结果独立保存，不修改 Schema Linking 文件：
+
+```text
+results/sql/<sql_method>/<dataset>/<sql_model>/<sl_method>/<sl_model>.json
+```
+
+离线转换已有原生日志的示例：
+
+```bash
+python -m Run.export_prediction \
+  --dataset-name MMQA \
+  --method table_to_column \
+  --database-results Logs/<model>/database_retrieval/iterative_database_retrieval_MMQA_<timestamp>.json \
+  --schema-results Logs/<model>/few_shot_table2column_MMQA_<timestamp>.json
+```
+
+SQL generator 可通过 `--input-path` 直接读取统一 SL 文件，也可同时指定 `--sl-method` 和 `--schema-llm-name` 使用默认统一路径。
 
 ## 5. 脚本参数
 
-### 5.1 `Rag_pipline/build_index.py`
+### 5.1 `Indexing/build_column_index.py`
 
 用途：从 `db_info.json` 构建列级 Qdrant 索引。
 
@@ -225,7 +255,7 @@ python -m Run.table2column \
 
 索引文档由表名、列名、列描述和 value descriptions 渲染而成；单条 embedding 输入最多保留 `8096` tokens。
 
-### 5.2 `Run/Baseline_Database_Retrival.py`
+### 5.2 `Baseline/baseline_database_retrieval.py`
 
 用途：把所有数据库摘要拼成一个 prompt，让 LLM 输出 JSON 字段 `relevant_database`。
 
@@ -240,7 +270,7 @@ python -m Run.table2column \
 
 固定输入为 `Data/<dataset>/gold_sl.json`，固定 prompt 模板为 `Templates/zero_shot/find_relevant_database_baseline.txt`。
 
-### 5.3 `Run/Global_Coarse_Retrieval.py`
+### 5.3 `Run/global_coarse_retrieval.py`
 
 用途：列级向量召回 + 数据库剪枝 + LLM yes/no 二分类重排，输出 `predict_db_id`。
 
@@ -263,7 +293,7 @@ python -m Run.table2column \
 - prompt 模板固定为 `Templates/zero_shot/binary_classification_database.txt`。
 - 当前 prompt 裁剪预算由 `resolve_prompt_token_cap()` 控制。实际调用未传入脚本级常量，因此使用工具函数默认值：soft cap 为 `0.85 * max_input_length`，hard cap 为 `max_input_length - 512`。日志中还会记录脚本级 `PROMPT_BUDGET_RATIO = 0.8` 和 `PROMPT_BUDGET_BUFFER = 512`。
 
-### 5.4 `Run/Baseline_Schema_Linking.py`
+### 5.4 `Baseline/baseline_schema_linking.py`
 
 用途：在已有 `predict_db_id` 的前提下，对目标数据库直接做列级 Schema Linking。
 
@@ -287,7 +317,7 @@ python -m Run.table2column \
 - 当前实现直接从 `db_info.json` 渲染 schema 文本，不再依赖 `Table_schema_csv/`。
 - 如果 `predict_db_id` 为空或不在 `db_info.json` 中，对应样本会输出 `No Valid Database.`。
 
-### 5.5 `Run/table2column.py`
+### 5.5 `Run/table_to_column.py`
 
 用途：先预测相关表，再在候选表范围内预测相关列。
 
@@ -313,11 +343,49 @@ python -m Run.table2column \
 - 表筛选阶段会优先尝试渲染完整目标数据库；如果 prompt 超过预算，会用 Qdrant 排名结果裁剪 schema。
 - 列筛选阶段会优先使用预测相关表中的全部列；如果仍超预算，会回退到表筛选阶段已经裁剪过的列集合。
 
-## 6. 常见注意事项
+## 6. SQL Generator：Spider-Agent-TC 与 one-shot 对比
 
-1. `build_index.py` 可通过 `--model-name` 指定 embedding 模型，但查询阶段使用 [`config.py`](config.py) 中的 `EMBEDDING_MODEL_NAME`，两者应保持一致。
-2. `Global_Coarse_Retrieval.py` 当前没有读取 Qdrant `meta.json`，collection 名必须和 `--dataset-name` 一致。
-3. `Baseline_Schema_Linking.py` 和 `table2column.py` 默认会回溯最近一次数据库检索结果；实验较多时建议显式传入 `--input-path`。
+[`Run/sql_generator.py`](Run/sql_generator.py) 默认使用 `spider_agent_tc`：Qwen3-Coder 先输出 XML tool call，执行候选 SQL，再根据 SQLite/Snowflake 返回的样例行或错误迭代修正，最后以 `terminate` 提交 SQL。原有一次提示、一次生成的完整实现保留在 [`Run/one_shot_sql_generator.py`](Run/one_shot_sql_generator.py)，可通过 `--generator-mode one_shot` 继续运行并做消融对比。两种模式共享同一个 `SchemaLinkingAdapter`，只接收 `predict_db_id`、`predict_tables` 和 `predict_columns` 指定的 schema。
+
+主实验配置固定为 `Qwen/Qwen3-Coder-30B-A3B-Instruct`、Transformers BF16、单张 A100 80GB、`cuda:0`、SDPA、输入上限 24576 tokens、输出上限 4096 tokens。默认最多 10 个 Agent round，每次模型调用失败后额外重试 2 次；Spider2、MMQA 和 BIRD 使用同一套生成超参数。
+
+执行后端：
+
+- Spider2 使用 Snowflake。通过 `--snowflake-credential-path` 传入 JSON；支持 `account`、`username`/`user`、`password`/`pat`/`token`、`warehouse`、`role`。连接 database 始终取当前样本的 `predict_db_id`，不会采用 credential 中的默认 database 或 gold database。
+- MMQA 默认在 `Data/MMQA/Sqlite_database` 定位只读 SQLite；BIRD 默认在 `Data/BIRD/Raw_data/dev_databases` 定位。可以用 `--database-root` 覆盖。SQLite 使用 `mode=ro`，禁止 `ATTACH`。
+
+Spider2 示例：
+
+```bash
+python -m Run.sql_generator \
+  --dataset-name Spider2 \
+  --generator-mode spider_agent_tc \
+  --input-path <schema_linking_log.json> \
+  --snowflake-credential-path <snowflake_credential.json> \
+  --resume
+```
+
+MMQA 示例：
+
+```bash
+python -m Run.sql_generator \
+  --dataset-name MMQA \
+  --generator-mode spider_agent_tc \
+  --input-path <schema_linking_log.json> \
+  --database-root Data/MMQA/Sqlite_database \
+  --resume
+```
+
+运行旧方法时只需改为 `--generator-mode one_shot`。`--dry-run --limit 1` 只检查输入、Adapter、executor 路由和 prompt 预算，不加载 30B 模型，也不连接数据库。
+
+预测文件保留顶层 `results`，每条记录严格只有 `id`、`predict_db_id`、`predict_sql`、`status`。`status` 为 `success`、`empty` 或 `failed`；执行是否正确仍由独立 EX evaluator 根据 `id` 回查 gold 数据。结果逐样本原子写入，`--resume` 会按稳定 id 跳过已经完成的记录。
+
+## 7. 常见注意事项
+
+1. `build_column_index.py` 可通过 `--model-name` 指定 embedding 模型，但查询阶段使用 [`config.py`](config.py) 中的 `EMBEDDING_MODEL_NAME`，两者应保持一致。
+2. `global_coarse_retrieval.py` 当前没有读取 Qdrant `meta.json`，collection 名必须和 `--dataset-name` 一致。
+3. `baseline_schema_linking.py` 和 `table_to_column.py` 默认会回溯最近一次数据库检索结果；实验较多时建议显式传入 `--input-path`。
 4. `Spider2` 的 hint 读取方式和其他数据集不同：`external_knowledge` 会优先作为文档文件名解析。
 5. 如果使用 `openai` provider，可以导出 `OPENAI_API_KEY`，或通过 `OPENAI_CREDENTIAL_PATH` / `--credential-path` 指向 JSON 凭据文件；代码不会自动加载 `.env`。
 6. 当前环境若缺少依赖，甚至 `--help` 也可能因为顶层 import 失败而无法打印；请先完成 `pip install -r requirements.txt`。
+7. CLI 中的相对文件路径统一相对于项目根目录解析；模块命令仍建议在项目根目录执行，例如 `python -m Run.sql_generator`。

@@ -16,12 +16,25 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from config import DATASET_NAME
-from Run.logging_utils import log_run_configuration, setup_task_logger
+from config import (
+    DATASET_NAME,
+    LOGS_ROOT,
+    MODEL_CACHE_ROOT,
+    dataset_root,
+    resolve_project_path,
+)
+from Utils.json_utils import atomic_write_json
+from Utils.prediction_adapter import build_prediction_from_native
+from Utils.prediction_store import (
+    build_prediction_path,
+    initialize_prediction_file,
+    upsert_prediction,
+)
+from Utils.value_utils import get_row_value
+from Utils.logging_utils import log_run_configuration, setup_task_logger
 from Utils.tools import (
     build_db_id_filter,
     get_qdrant_client,
-    get_row_value,
     query_qdrant,
     resolve_hint,
 )
@@ -57,18 +70,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--qdrant-path", dest="qdrant_path", type=Path, default=None)
     parser.add_argument("--collection-name", dest="collection_name", type=str, default=None)
     parser.add_argument("--output-path", dest="output_path", type=Path, default=None)
+    parser.add_argument("--prediction-path", dest="prediction_path", type=Path, default=None)
     parser.add_argument("--top-k", dest="top_k", type=int, default=DEFAULT_TOP_K)
     parser.add_argument("--global-top-k", dest="global_top_k", type=int, default=None)
     parser.add_argument("--local-top-k", dest="local_top_k", type=int, default=None)
     parser.add_argument("--embedding-model-name", dest="embedding_model_name", type=str, default=None)
     parser.add_argument("--cache-dir", dest="cache_dir", type=Path, default=None)
     parser.add_argument("--device", dest="device", type=str, default=None)
-    parser.add_argument(
-        "--include-hint-in-query",
-        dest="include_hint_in_query",
-        action="store_true",
-        help="Append external_knowledge/hint text to the embedding query when available.",
-    )
     parser.add_argument("--start-index", dest="start_index", type=int, default=0)
     parser.add_argument("--limit", dest="limit", type=int, default=None)
     return parser.parse_args()
@@ -104,7 +112,7 @@ def resolve_output_path(output_path: Path | None, dataset_name: str) -> Path:
         return output_path
 
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_dir = PROJECT_ROOT / "Logs" / BASELINE_NAME
+    save_dir = LOGS_ROOT / BASELINE_NAME
     save_dir.mkdir(parents=True, exist_ok=True)
     return save_dir / f"zero_shot_table2column_{dataset_name}_{run_id}.json"
 
@@ -229,11 +237,9 @@ def group_columns_by_table(columns: Sequence[RetrievedColumn]) -> dict[str, list
     return dict(grouped)
 
 
-def resolve_query_text(row: Any, dataset_name: str, documents_dir: Path, include_hint: bool) -> tuple[str, str]:
+def resolve_query_text(row: Any, dataset_name: str, documents_dir: Path) -> tuple[str, str]:
     question = str(row["question"])
     hint = resolve_hint(row, dataset_name=dataset_name, documents_dir=documents_dir)
-    if include_hint and hint != "No hint":
-        return f"{question}\n{hint}", hint
     return question, hint
 
 
@@ -247,15 +253,20 @@ def append_result(
     local_columns: Sequence[RetrievedColumn],
     db_ranking: Sequence[dict[str, Any]],
     elapsed_seconds: float,
-) -> None:
+    database_elapsed_seconds: float | None = None,
+    schema_elapsed_seconds: float | None = None,
+    prediction_path: Path | None = None,
+    dataset_name: str | None = None,
+    documents_dir: Path | None = None,
+    error_message: str | None = None,
+) -> dict[str, Any]:
     predict_columns = group_columns_by_table(local_columns)
     predict_tables = list(predict_columns.keys())
     sample_id = get_row_value(row, "id", "instance_id")
     gold_db_id = get_row_value(row, "db_id", "gold_db_id", "spider_db_id")
     question = str(row["question"])
 
-    records.append(
-        {
+    record = {
             "model": BASELINE_NAME,
             "provider": BASELINE_PROVIDER,
             "id": None if sample_id is None else str(sample_id),
@@ -294,8 +305,31 @@ def append_result(
                 "sample_elapsed_seconds": round(elapsed_seconds, 6),
             },
         }
-    )
-    output_path.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
+    if error_message:
+        record["database_error"] = error_message
+    records.append(record)
+    atomic_write_json(output_path, records)
+    if prediction_path is not None:
+        if dataset_name is None or documents_dir is None:
+            raise ValueError("Unified prediction context is incomplete.")
+        prediction = build_prediction_from_native(
+            schema_record=record,
+            database_record=record,
+            source_record=row,
+            dataset_name=dataset_name,
+            method="rag_column_retrieval",
+            documents_dir=documents_dir,
+            database_usage={
+                "elapsed_seconds": database_elapsed_seconds,
+                "total_tokens": None,
+            },
+            schema_usage={
+                "elapsed_seconds": schema_elapsed_seconds,
+                "total_tokens": None,
+            },
+        )
+        upsert_prediction(prediction_path, prediction)
+    return record
 
 
 def run_baseline(
@@ -309,9 +343,9 @@ def run_baseline(
     collection_name: str,
     global_top_k: int,
     local_top_k: int,
-    include_hint_in_query: bool,
     start_index: int,
     limit: int | None,
+    prediction_path: Path | None = None,
 ) -> int:
     from tqdm import tqdm
 
@@ -321,34 +355,46 @@ def run_baseline(
         selected_df = selected_df.iloc[: max(0, limit)]
 
     for _, row in tqdm(selected_df.iterrows(), total=len(selected_df)):
-        started_at = perf_counter()
-        query_text, _ = resolve_query_text(
-            row=row,
-            dataset_name=dataset_name,
-            documents_dir=documents_dir,
-            include_hint=include_hint_in_query,
-        )
-        query_vector = embedder.encode(query_text, convert_to_list=True)
-        global_columns = retrieve_columns(
-            client=qdrant_client,
-            collection_name=collection_name,
-            query_vector=query_vector,
-            top_k=global_top_k,
-        )
-        db_ranking = rank_databases(global_columns)
-        predicted_db_id = str(db_ranking[0]["db_id"]) if db_ranking else None
-        local_columns = (
-            retrieve_columns(
+        database_started_at = perf_counter()
+        try:
+            query_text, _ = resolve_query_text(
+                row=row,
+                dataset_name=dataset_name,
+                documents_dir=documents_dir,
+            )
+            query_vector = embedder.encode(query_text, convert_to_list=True)
+            global_columns = retrieve_columns(
                 client=qdrant_client,
                 collection_name=collection_name,
                 query_vector=query_vector,
-                top_k=local_top_k,
-                candidate_db_ids=[predicted_db_id],
+                top_k=global_top_k,
             )
-            if predicted_db_id
-            else []
-        )
-        elapsed_seconds = perf_counter() - started_at
+            db_ranking = rank_databases(global_columns)
+            predicted_db_id = str(db_ranking[0]["db_id"]) if db_ranking else None
+            database_elapsed_seconds = perf_counter() - database_started_at
+            schema_started_at = perf_counter()
+            local_columns = (
+                retrieve_columns(
+                    client=qdrant_client,
+                    collection_name=collection_name,
+                    query_vector=query_vector,
+                    top_k=local_top_k,
+                    candidate_db_ids=[predicted_db_id],
+                )
+                if predicted_db_id
+                else []
+            )
+            schema_elapsed_seconds = perf_counter() - schema_started_at
+            error_message = None
+        except Exception as exc:
+            error_message = f"{type(exc).__name__}: {exc}"
+            global_columns = []
+            local_columns = []
+            db_ranking = []
+            predicted_db_id = None
+            database_elapsed_seconds = perf_counter() - database_started_at
+            schema_elapsed_seconds = None
+        elapsed_seconds = database_elapsed_seconds + (schema_elapsed_seconds or 0.0)
         append_result(
             records=result_records,
             output_path=output_path,
@@ -358,6 +404,12 @@ def run_baseline(
             local_columns=local_columns,
             db_ranking=db_ranking,
             elapsed_seconds=elapsed_seconds,
+            database_elapsed_seconds=database_elapsed_seconds,
+            schema_elapsed_seconds=schema_elapsed_seconds,
+            prediction_path=prediction_path,
+            dataset_name=dataset_name,
+            documents_dir=documents_dir,
+            error_message=error_message,
         )
 
     return len(result_records)
@@ -367,11 +419,14 @@ def main() -> None:
     args = parse_args()
 
     dataset_name = args.dataset_name or DATASET_NAME
-    dataset_root = PROJECT_ROOT / "Data" / dataset_name
-    input_path = args.input_path or (dataset_root / "gold_sl.json")
-    qdrant_path = args.qdrant_path or (dataset_root / "qdrant_column_index")
-    documents_dir = dataset_root / "documents"
-    output_path = resolve_output_path(args.output_path, dataset_name)
+    current_dataset_root = dataset_root(dataset_name)
+    input_path = resolve_project_path(args.input_path) if args.input_path else current_dataset_root / "gold_sl.json"
+    qdrant_path = resolve_project_path(args.qdrant_path) if args.qdrant_path else current_dataset_root / "qdrant_column_index"
+    documents_dir = current_dataset_root / "documents"
+    output_path = resolve_output_path(
+        resolve_project_path(args.output_path) if args.output_path else None,
+        dataset_name,
+    )
     collection_name = args.collection_name or load_qdrant_collection_name(
         qdrant_path=qdrant_path,
         fallback=dataset_name,
@@ -386,9 +441,23 @@ def main() -> None:
         "local-top-k",
     )
     embedding_model_name = args.embedding_model_name or DEFAULT_EMBEDDING_MODEL_NAME
-    cache_dir = args.cache_dir or (PROJECT_ROOT / "Llm" / "cache")
+    cache_dir = resolve_project_path(args.cache_dir) if args.cache_dir else MODEL_CACHE_ROOT
 
     dataset_df = load_dataset(input_path)
+    prediction_path = (
+        resolve_project_path(args.prediction_path)
+        if args.prediction_path
+        else build_prediction_path(
+            "rag_column_retrieval", dataset_name, embedding_model_name
+        )
+    )
+    initialize_prediction_file(
+        prediction_path,
+        dataset_name=dataset_name,
+        method="rag_column_retrieval",
+        database_selection_model_name=embedding_model_name,
+        schema_linking_model_name=embedding_model_name,
+    )
     logger, logger_path = setup_task_logger(BASELINE_NAME, output_path)
     log_run_configuration(
         logger,
@@ -407,10 +476,10 @@ def main() -> None:
             "Device": args.device or "auto",
             "Global top k": global_top_k,
             "Local top k": local_top_k,
-            "Include hint in query": args.include_hint_in_query,
             "Start index": args.start_index,
             "Limit": args.limit,
             "Logger path": logger_path,
+            "Unified prediction path": prediction_path,
         },
     )
 
@@ -433,9 +502,9 @@ def main() -> None:
         collection_name=collection_name,
         global_top_k=global_top_k,
         local_top_k=local_top_k,
-        include_hint_in_query=args.include_hint_in_query,
         start_index=args.start_index,
         limit=args.limit,
+        prediction_path=prediction_path,
     )
     logger.info("Completed %s records.", processed_count)
 

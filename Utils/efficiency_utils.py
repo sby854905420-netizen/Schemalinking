@@ -18,15 +18,21 @@ def normalize_token_count(total_tokens: int | None) -> int:
 class SampleEfficiencyTracker:
     started_at: float = field(default_factory=perf_counter)
     llm_total_tokens: int = 0
+    token_usage_missing: bool = False
 
     def add_llm_total_tokens(self, total_tokens: int | None) -> None:
+        if total_tokens is None:
+            self.token_usage_missing = True
+            return
         self.llm_total_tokens += normalize_token_count(total_tokens)
 
-    def finalize(self) -> dict[str, float | int]:
+    def finalize(self) -> dict[str, float | int | None]:
         elapsed_seconds = perf_counter() - self.started_at
         return {
             "sample_elapsed_seconds": round(elapsed_seconds, 6),
-            "llm_total_tokens": self.llm_total_tokens,
+            "llm_total_tokens": (
+                None if self.token_usage_missing else self.llm_total_tokens
+            ),
         }
 
 

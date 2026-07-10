@@ -9,7 +9,7 @@ class EmbeddingModelLoader:
     def __init__(
         self,
         model_name: str = EMBEDDING_MODEL_NAME,
-        cache_dir: str = PROJECT_ROOT / "Llm" / "cache",
+        cache_dir: str = MODEL_CACHE_ROOT,
         device: Union[str, None] = None,
         normalize_embeddings: bool = True,
         trust_remote_code: bool = True,

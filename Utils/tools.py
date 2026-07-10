@@ -8,6 +8,13 @@ from typing import Any, Iterable
 
 import pandas as pd
 
+from config import (
+    DATABASE_RETRIEVAL_DIR_NAME,
+    LEGACY_DATABASE_RETRIEVAL_DIR_NAME,
+    resolve_project_path,
+)
+from Utils.value_utils import resolve_external_knowledge
+
 
 SCHEMA_DF_COLUMNS = [
     "table_name",
@@ -18,6 +25,19 @@ SCHEMA_DF_COLUMNS = [
     "column_description",
     "example_values",
 ]
+
+
+def resolve_supported_method(
+    method: str | None,
+    *,
+    default: str,
+    supported: set[str],
+) -> str:
+    resolved = method or default
+    if resolved not in supported:
+        expected = ", ".join(sorted(supported))
+        raise ValueError(f"Unsupported method {resolved!r}. Expected one of: {expected}.")
+    return resolved
 
 
 def clean_text(value: Any) -> str:
@@ -251,20 +271,30 @@ def extract_timestamp(path: Path, dataset_name: str, timestamp_pattern_template:
     return match.group(1)
 
 
-def find_model_dir(logs_dir: Path, model_name: str, task_dir_name: str = "Database_Retrival") -> Path:
-    direct_path = logs_dir / model_name / task_dir_name
-    if direct_path.is_dir():
-        return direct_path
+def find_model_dir(
+    logs_dir: Path,
+    model_name: str,
+    task_dir_name: str = DATABASE_RETRIEVAL_DIR_NAME,
+) -> Path:
+    task_dir_names = [task_dir_name]
+    if task_dir_name == DATABASE_RETRIEVAL_DIR_NAME:
+        task_dir_names.append(LEGACY_DATABASE_RETRIEVAL_DIR_NAME)
+
+    for candidate_name in task_dir_names:
+        direct_path = logs_dir / model_name / candidate_name
+        if direct_path.is_dir():
+            return direct_path
 
     model_leaf_name = Path(model_name).name
-    matching_dirs = sorted(
+    matching_dirs = sorted({
         path
-        for path in logs_dir.rglob(task_dir_name)
+        for candidate_name in task_dir_names
+        for path in logs_dir.rglob(candidate_name)
         if path.is_dir() and path.parent.name == model_leaf_name
-    )
+    })
     if not matching_dirs:
         raise FileNotFoundError(
-            f"Could not find a {task_dir_name} directory for model '{model_name}' under {logs_dir}."
+            f"Could not find any of {task_dir_names} for model '{model_name}' under {logs_dir}."
         )
     if len(matching_dirs) > 1:
         matched_paths = "\n".join(str(path) for path in matching_dirs)
@@ -308,18 +338,56 @@ def resolve_input_path(
     dataset_name: str,
     input_file_patterns: tuple[str, ...],
     timestamp_pattern_template: str,
-    task_dir_name: str = "Database_Retrival",
+    task_dir_name: str = DATABASE_RETRIEVAL_DIR_NAME,
 ) -> Path:
     if input_path is not None:
-        return input_path
+        return resolve_project_path(input_path)
 
-    model_dir = find_model_dir(logs_dir=logs_dir, model_name=answer_llm_name, task_dir_name=task_dir_name)
-    return find_result_file(
-        model_dir=model_dir,
-        dataset_name=dataset_name,
-        input_file_patterns=input_file_patterns,
-        timestamp_pattern_template=timestamp_pattern_template,
+    task_dir_names = [task_dir_name]
+    if task_dir_name == DATABASE_RETRIEVAL_DIR_NAME:
+        task_dir_names.append(LEGACY_DATABASE_RETRIEVAL_DIR_NAME)
+
+    model_leaf_name = Path(answer_llm_name).name
+    candidate_dirs = {
+        logs_dir / answer_llm_name / candidate_name
+        for candidate_name in task_dir_names
+        if (logs_dir / answer_llm_name / candidate_name).is_dir()
+    }
+    candidate_dirs.update(
+        path
+        for candidate_name in task_dir_names
+        for path in logs_dir.rglob(candidate_name)
+        if path.is_dir() and path.parent.name == model_leaf_name
     )
+
+    candidates: list[tuple[str, Path]] = []
+    for model_dir in candidate_dirs:
+        try:
+            result_path = find_result_file(
+                model_dir=model_dir,
+                dataset_name=dataset_name,
+                input_file_patterns=input_file_patterns,
+                timestamp_pattern_template=timestamp_pattern_template,
+            )
+        except FileNotFoundError:
+            continue
+        timestamp = extract_timestamp(
+            result_path,
+            dataset_name,
+            timestamp_pattern_template,
+        )
+        if timestamp is not None:
+            candidates.append((timestamp, result_path))
+
+    if not candidates:
+        searched = ", ".join(str(path) for path in sorted(candidate_dirs)) or str(logs_dir)
+        raise FileNotFoundError(
+            f"Could not find a database-retrieval result for dataset '{dataset_name}' "
+            f"and model '{answer_llm_name}'. Searched: {searched}."
+        )
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
 
 
 def resolve_output_path(
@@ -339,50 +407,6 @@ def resolve_output_path(
     return save_dir / f"{output_stem}_{dataset_name}_{run_id}.json"
 
 
-def get_row_value(row: pd.Series, *keys: str) -> Any:
-    for key in keys:
-        value = row.get(key)
-        if pd.notna(value):
-            return value
-    return None
-
-
-def resolve_hint_source_value(source: Any, key: str = "external_knowledge") -> Any:
-    if hasattr(source, "get"):
-        return source.get(key)
-    return source
-
-
-def resolve_document_backed_hint(
-    value: Any,
-    dataset_name: str | None = None,
-    documents_dir: Path | None = None,
-) -> Any:
-    """Resolve dataset-specific hint storage into prompt-ready content.
-
-    Convention:
-    - Spider2 stores `external_knowledge` as a document filename under
-      `Data/Spider2/documents/`.
-    - Other datasets store `external_knowledge` as direct prompt text, so the
-      value should pass through unchanged.
-    """
-    if not dataset_name or dataset_name.lower() != "spider2":
-        return value
-
-    if not isinstance(value, str):
-        return value
-
-    document_name = value.strip()
-    if not document_name or documents_dir is None:
-        return value
-
-    document_path = documents_dir / document_name
-    if not document_path.is_file():
-        return value
-
-    return document_path.read_text(encoding="utf-8").strip()
-
-
 def resolve_hint(
     source: Any,
     key: str = "external_knowledge",
@@ -395,31 +419,13 @@ def resolve_hint(
     storage differs by dataset. This helper centralizes the convention so call
     sites can always request final prompt text from one place.
     """
-    value = resolve_hint_source_value(source, key=key)
-    value = resolve_document_backed_hint(
-        value,
+    value = resolve_external_knowledge(
+        source,
+        key=key,
         dataset_name=dataset_name,
         documents_dir=documents_dir,
     )
-
-    if value is None:
-        return "No hint"
-
-    if isinstance(value, str):
-        hint_text = value.strip()
-    elif isinstance(value, (dict, list)):
-        hint_text = json.dumps(value, ensure_ascii=False, sort_keys=True)
-    else:
-        try:
-            if pd.isna(value):
-                return "No hint"
-        except (TypeError, ValueError):
-            pass
-        hint_text = str(value).strip()
-
-    if hint_text == "":
-        return "No hint"
-    return hint_text
+    return value if value is not None else "No hint"
 
 
 def render_prompt(prompt_template: str, **replacements: Any) -> str:
@@ -427,13 +433,6 @@ def render_prompt(prompt_template: str, **replacements: Any) -> str:
     for key, value in replacements.items():
         prompt = prompt.replace(f"{{{key}}}", "" if value is None else str(value))
     return prompt
-
-
-def normalize_response_text(response_text: str) -> str:
-    normalized_response = response_text.replace("```", "").replace("json", "").strip()
-    if "</think>" in normalized_response:
-        normalized_response = normalized_response.split("</think>")[-1].strip()
-    return normalized_response
 
 
 def has_explicit_key_metadata(dataset_name: str, db_entry: dict[str, Any]) -> bool:

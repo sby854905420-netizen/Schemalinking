@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 from typing import Any
 import pandas as pd
@@ -9,27 +8,40 @@ import pandas as pd
 
 from config import *
 from Llm.llm_loader import LLM, resolve_provider
-from Run.logging_utils import log_run_configuration, setup_task_logger
+from Utils.json_utils import atomic_write_json, load_json_records
+from Utils.prediction_adapter import build_prediction_from_native
+from Utils.prediction_store import (
+    build_prediction_path,
+    initialize_prediction_file,
+    upsert_prediction,
+)
+from Utils.value_utils import index_records_by_id
+from Utils.logging_utils import log_run_configuration, setup_task_logger
 from Utils.efficiency_utils import SampleEfficiencyTracker
 from Utils.render_tools import SchemaTextRenderer
 from Utils.schema_selection import DbInfoSchemaStore
+from Utils.schema_prediction_utils import normalize_predicted_columns
+from Utils.value_utils import get_row_value
 from Utils.tools import (
-    get_row_value,
     load_db_info_index,
-    normalize_response_text,
     render_prompt,
     resolve_hint,
     resolve_input_path,
     resolve_output_path,
+    resolve_supported_method,
 )
 
 SUPPORTED_METHODS = {"zero_shot", "few_shot"}
 INPUT_FILE_PATTERNS = (
+    "baseline_database_retrieval_{dataset_name}_{timestamp}.json",
+    "iterative_database_retrieval_{dataset_name}_{timestamp}.json",
     "baseline_database_retrival_{dataset_name}_{timestamp}.json",
     "iterative_database_retrival_{dataset_name}_{timestamp}.json",
 )
 TIMESTAMP_PATTERN_TEMPLATE = (
-    r"(?:baseline_database_retrival|iterative_database_retrival)_{dataset_name}_(\d{{8}}_\d{{6}})\.json$"
+    r"(?:baseline_database_retrieval|iterative_database_retrieval|"
+    r"baseline_database_retrival|iterative_database_retrival)_{dataset_name}_"
+    r"(\d{{8}}_\d{{6}})\.json$"
 )
 DEFAULT_METHOD = "few_shot"
 
@@ -46,15 +58,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--logs-dir", dest="logs_dir", type=Path, default=None)
     parser.add_argument("--db-info-path", dest="db_info_path", type=Path, default=None)
     parser.add_argument("--output-path", dest="output_path", type=Path, default=None)
+    parser.add_argument("--prediction-path", dest="prediction_path", type=Path, default=None)
     return parser.parse_args()
-
-
-def resolve_method(method: str | None) -> str:
-    resolved_method = method or DEFAULT_METHOD
-    if resolved_method not in SUPPORTED_METHODS:
-        supported_methods = ", ".join(sorted(SUPPORTED_METHODS))
-        raise ValueError(f"Unsupported method '{resolved_method}'. Expected one of: {supported_methods}.")
-    return resolved_method
 
 
 def load_dataset(input_path: Path):
@@ -66,23 +71,9 @@ def load_prompt_template(prompt_path: Path) -> str:
     return prompt_path.read_text(encoding="utf-8").strip()
 
 
-def parse_sl_response(response:str) -> dict:
-    nor_response = normalize_response_text(response)
-    try:
-        response_json = json.loads(nor_response)
-    except json.JSONDecodeError:
-        return {}
+def parse_sl_response(response: str) -> dict[str, list[str]]:
+    return normalize_predicted_columns(response)
 
-    if not isinstance(response_json, dict):
-        return {}
-
-    try:
-        pred_sl = response_json["relevant_columns"]
-    except KeyError:
-        return {}
-    
-    return pred_sl
-    
 def append_log_entry(
     log_records: list[dict[str, Any]],
     row: Any,
@@ -91,11 +82,15 @@ def append_log_entry(
     answer_llm_name: str,
     provider: str,
     output_path: Path,
-) -> None:
+    prediction_path: Path | None = None,
+    source_record: dict[str, Any] | None = None,
+    dataset_name: str | None = None,
+    documents_dir: Path | None = None,
+    error_message: str | None = None,
+) -> dict[str, Any]:
     predict_columns = parse_sl_response(response_text)
     efficiency = efficiency_tracker.finalize()
-    log_records.append(
-        {
+    record = {
             "model": answer_llm_name,
             "provider": provider,
             "id": f"{get_row_value(row, 'id', 'instance_id')}",
@@ -106,8 +101,23 @@ def append_log_entry(
             "predict_columns": predict_columns,
             "efficiency": efficiency,
         }
-    )
-    output_path.write_text(json.dumps(log_records, ensure_ascii=False, indent=2), encoding="utf-8")
+    if error_message:
+        record["schema_error"] = error_message
+    log_records.append(record)
+    atomic_write_json(output_path, log_records)
+    if prediction_path is not None:
+        if dataset_name is None or documents_dir is None:
+            raise ValueError("Unified prediction context is incomplete.")
+        prediction = build_prediction_from_native(
+            schema_record=record,
+            database_record=row,
+            source_record=source_record or row,
+            dataset_name=dataset_name,
+            method="prompt_baseline",
+            documents_dir=documents_dir,
+        )
+        upsert_prediction(prediction_path, prediction)
+    return record
 
 
 def run_baseline_schema_linking(
@@ -120,6 +130,8 @@ def run_baseline_schema_linking(
     answer_llm: Any,
     answer_llm_name: str,
     provider: str,
+    prediction_path: Path | None = None,
+    source_index: dict[str, dict[str, Any]] | None = None,
 ) -> int:
     from tqdm import tqdm
 
@@ -127,6 +139,8 @@ def run_baseline_schema_linking(
 
     for _, row in tqdm(dataset_df.iterrows(), total=len(dataset_df)):
         efficiency_tracker = SampleEfficiencyTracker()
+        sample_id = get_row_value(row, "id", "instance_id")
+        source_record = (source_index or {}).get(str(sample_id), {})
         predict_db_id = get_row_value(row, "predict_db_id")
         if predict_db_id is None or str(predict_db_id).strip() == "":
             append_log_entry(
@@ -137,34 +151,48 @@ def run_baseline_schema_linking(
                 answer_llm_name=answer_llm_name,
                 provider=provider,
                 output_path=output_path,
+                prediction_path=prediction_path,
+                source_record=source_record,
+                dataset_name=dataset_name,
+                documents_dir=documents_dir,
             )
             continue
         predict_db_id = str(predict_db_id)
-        column_records = schema_store.get_column_records(predict_db_id)
-        if not column_records:
-            append_log_entry(
-                log_records=log_records,
-                row=row,
-                response_text="No Valid Database.",
-                efficiency_tracker=efficiency_tracker,
-                answer_llm_name=answer_llm_name,
-                provider=provider,
-                output_path=output_path,
+        try:
+            column_records = schema_store.get_column_records(predict_db_id)
+            if not column_records:
+                append_log_entry(
+                    log_records=log_records,
+                    row=row,
+                    response_text="No Valid Database.",
+                    efficiency_tracker=efficiency_tracker,
+                    answer_llm_name=answer_llm_name,
+                    provider=provider,
+                    output_path=output_path,
+                    prediction_path=prediction_path,
+                    source_record=source_record,
+                    dataset_name=dataset_name,
+                    documents_dir=documents_dir,
+                )
+                continue
+            database_schema = schema_store.get_full_schema_text(predict_db_id)
+            prompt = render_prompt(
+                prompt_template,
+                DATABASE_SCHEMAS=database_schema,
+                QUESTION=row["question"],
+                HINT=resolve_hint(
+                    row,
+                    dataset_name=dataset_name,
+                    documents_dir=documents_dir,
+                ),
             )
-            continue
-        database_schema = schema_store.get_full_schema_text(predict_db_id)
-        prompt = render_prompt(
-            prompt_template,
-            DATABASE_SCHEMAS=database_schema,
-            QUESTION=row["question"],
-            HINT=resolve_hint(
-                row,
-                dataset_name=dataset_name,
-                documents_dir=documents_dir,
-            ),
-        )
-        response_text, total_tokens = answer_llm.query_with_usage(prompt)
-        efficiency_tracker.add_llm_total_tokens(total_tokens)
+            response_text, total_tokens = answer_llm.query_with_usage(prompt)
+            efficiency_tracker.add_llm_total_tokens(total_tokens)
+            error_message = None
+        except Exception as exc:
+            error_message = f"{type(exc).__name__}: {exc}"
+            response_text = error_message
+
         append_log_entry(
             log_records=log_records,
             row=row,
@@ -173,28 +201,38 @@ def run_baseline_schema_linking(
             answer_llm_name=answer_llm_name,
             provider=provider,
             output_path=output_path,
+            prediction_path=prediction_path,
+            source_record=source_record,
+            dataset_name=dataset_name,
+            documents_dir=documents_dir,
+            error_message=error_message,
         )
-
     return len(log_records)
 
 
 def main() -> None:
     args = parse_args()
 
-    method_name = resolve_method(args.method)
+    method_name = resolve_supported_method(
+        args.method, default=DEFAULT_METHOD, supported=SUPPORTED_METHODS
+    )
     dataset_name = args.dataset_name or DATASET_NAME
     answer_llm_name = args.answer_llm_name or ANSWER_LLM_NAME
     provider = resolve_provider(args.provider or PROVIDER)
     max_input_length = args.max_input_length or MAX_INPUT_LENGTH
     max_generation_num = args.max_generation_num or MAX_GENERATEION_NUM
 
-    dataset_root = PROJECT_ROOT / "Data" / dataset_name
-    documents_dir = dataset_root / "documents"
-    logs_dir = args.logs_dir or (PROJECT_ROOT / "Logs")
-    prompt_path = PROJECT_ROOT / "Templates" / method_name / "baseline_schema_linking.txt"
-    db_info_path = args.db_info_path or (dataset_root / "db_info.json")
+    current_dataset_root = dataset_root(dataset_name)
+    documents_dir = current_dataset_root / "documents"
+    logs_dir = resolve_project_path(args.logs_dir) if args.logs_dir else LOGS_ROOT
+    prompt_path = TEMPLATES_ROOT / method_name / "baseline_schema_linking.txt"
+    db_info_path = (
+        resolve_project_path(args.db_info_path)
+        if args.db_info_path
+        else current_dataset_root / "db_info.json"
+    )
     input_path = resolve_input_path(
-        input_path=args.input_path,
+        input_path=resolve_project_path(args.input_path) if args.input_path else None,
         logs_dir=logs_dir,
         answer_llm_name=answer_llm_name,
         dataset_name=dataset_name,
@@ -202,7 +240,7 @@ def main() -> None:
         timestamp_pattern_template=TIMESTAMP_PATTERN_TEMPLATE,
     )
     output_path = resolve_output_path(
-        output_path=args.output_path,
+        output_path=resolve_project_path(args.output_path) if args.output_path else None,
         answer_llm_name=answer_llm_name,
         dataset_name=dataset_name,
         output_stem=f"{method_name}_baseline_schema_linking",
@@ -211,8 +249,29 @@ def main() -> None:
     logger, logger_path = setup_task_logger("baseline_schema_linking", output_path)
 
     dataset_df = load_dataset(input_path)
+    source_records = load_json_records(current_dataset_root / "gold_sl.json")
+    source_index = {
+        key: dict(value) for key, value in index_records_by_id(source_records).items()
+    }
     prompt_template = load_prompt_template(prompt_path)
     db_info_index = load_db_info_index(db_info_path)
+    database_model_name = (
+        str(dataset_df.iloc[0].get("model") or answer_llm_name)
+        if len(dataset_df)
+        else answer_llm_name
+    )
+    prediction_path = (
+        resolve_project_path(args.prediction_path)
+        if args.prediction_path
+        else build_prediction_path("prompt_baseline", dataset_name, answer_llm_name)
+    )
+    initialize_prediction_file(
+        prediction_path,
+        dataset_name=dataset_name,
+        method="prompt_baseline",
+        database_selection_model_name=database_model_name,
+        schema_linking_model_name=answer_llm_name,
+    )
 
     log_run_configuration(
         logger,
@@ -231,6 +290,7 @@ def main() -> None:
             "Max input length": max_input_length,
             "Max generation num": max_generation_num,
             "Logger path": logger_path,
+            "Unified prediction path": prediction_path,
         },
     )
 
@@ -257,6 +317,8 @@ def main() -> None:
         answer_llm=answer_llm,
         answer_llm_name=answer_llm_name,
         provider=provider,
+        prediction_path=prediction_path,
+        source_index=source_index,
     )
     logger.info("Completed %s records.", processed_count)
 

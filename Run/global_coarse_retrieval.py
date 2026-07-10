@@ -5,7 +5,6 @@ from qdrant_client.http.models import ScoredPoint
 from typing import Any, Optional
 from pathlib import Path
 from tqdm import tqdm
-import json
 import torch
 from datetime import datetime
 import logging
@@ -14,7 +13,8 @@ import logging
 from Llm.embedding_model_loader import EmbeddingModelLoader
 from config import *
 from Llm.llm_loader import LLM, resolve_provider
-from Run.logging_utils import log_run_configuration, setup_task_logger
+from Utils.json_utils import atomic_write_json
+from Utils.logging_utils import log_run_configuration, setup_task_logger
 from Utils.efficiency_utils import SampleEfficiencyTracker
 from Utils.render_tools import SchemaTextRenderer
 from Utils.schema_selection import (
@@ -25,6 +25,7 @@ from Utils.schema_selection import (
 )
 from Utils.tools import (
     build_db_id_filter,
+    clean_text,
     get_qdrant_client,
     load_db_info_index,
     query_qdrant,
@@ -36,15 +37,6 @@ from Utils.tools import (
 PROMPT_BUDGET_BUFFER = 512
 PROMPT_BUDGET_RATIO = 0.8
 SUPPORTED_DB_SELECTION_MODES = {"rerank", "pruning"}
-
-def clean_text(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value.strip()
-    if isinstance(value, (dict, list)):
-        return json.dumps(value, ensure_ascii=False, sort_keys=True)
-    return str(value).strip()
 
 def resolve_top_kd(column_count: int) -> int:
     if column_count <= 20:
@@ -187,18 +179,18 @@ def resolve_base_prompt_hint(
     return "No hint"
 
 
-def get_Highly_Relevant_Columns(query_vector:list[float], 
-                                qdrant_client:QdrantClient, 
+def get_Highly_Relevant_Columns(query_vector:list[float],
+                                qdrant_client:QdrantClient,
                                 db_counts: dict[str, int],
                                 collection_name:str,
-                                candidate_db_ids:list[str]=None,  
+                                candidate_db_ids:list[str]=None,
                                 ) -> list[ScoredPoint]:
-    
+
     query_filter = build_db_id_filter(candidate_db_ids)
 
     if candidate_db_ids is not None and query_filter is None:
         return []
-    
+
     resolved_top_k = resolve_top_k(
         db_counts=db_counts,
         candidate_db_ids=candidate_db_ids,
@@ -219,7 +211,7 @@ def get_Highly_Relevant_Columns(query_vector:list[float],
 
 
 def database_pruning(HRC_points:list[ScoredPoint],
-                      min_hit_count:int, 
+                      min_hit_count:int,
                       min_sim_ratio: float
                     ) -> list[str]:
     if not HRC_points:
@@ -283,7 +275,7 @@ def compute_yes_probability(next_token_logits:torch.tensor, tokenizer):
     return yes_prob_binary
 
 
-def CFCD_rerank_select(query:str, query_vector: list[float], ranking_llm:LLM, 
+def CFCD_rerank_select(query:str, query_vector: list[float], ranking_llm:LLM,
                        CFCD_db_ids: list[str], prompt_template:str, top_k:float,
                        hint_text: str,
                        schema_store: DbInfoSchemaStore,
@@ -493,28 +485,28 @@ def main() -> None:
     candidate_db_top_k = args.candidate_db_top_k if args.candidate_db_top_k is not None else CANDIDATE_DB_TOP_K
     db_selection_mode = args.db_selection_mode
     enable_progress_log = args.enable_progress_log
-    
+
     run_id = datetime.now().strftime('%Y%m%d_%H%M%S')
-    dataset_root = PROJECT_ROOT / "Data" / dataset_name
-    qdrant_path = dataset_root / "qdrant_column_index"
-    db_info_path = dataset_root / "db_info.json"
-    documents_dir = dataset_root / "documents"
-    dataset_path = args.input_path or (dataset_root / "gold_sl.json")
+    current_dataset_root = dataset_root(dataset_name)
+    qdrant_path = current_dataset_root / "qdrant_column_index"
+    db_info_path = current_dataset_root / "db_info.json"
+    documents_dir = current_dataset_root / "documents"
+    dataset_path = resolve_project_path(args.input_path) if args.input_path else current_dataset_root / "gold_sl.json"
 
     dataset_df = pd.read_json(dataset_path)
     db_info_index = load_db_info_index(db_info_path)
     db_counts = load_db_counts(db_info_index)
-    prompt_path = PROJECT_ROOT / "Templates" / "zero_shot" / "binary_classification_database.txt"
+    prompt_path = TEMPLATES_ROOT / "zero_shot" / "binary_classification_database.txt"
     prompt_template = prompt_path.read_text(encoding='utf-8').strip()
-    
+
     if args.output_path is None:
-        logs_dir = PROJECT_ROOT / 'Logs' / answer_llm_name / "Database_Retrival"
+        logs_dir = LOGS_ROOT / answer_llm_name / DATABASE_RETRIEVAL_DIR_NAME
         logs_dir.mkdir(parents=True, exist_ok=True)
-        log_path = logs_dir / f'iterative_database_retrival_{dataset_name}_{run_id}.json'
+        log_path = logs_dir / f'iterative_database_retrieval_{dataset_name}_{run_id}.json'
     else:
-        log_path = args.output_path
+        log_path = resolve_project_path(args.output_path)
         log_path.parent.mkdir(parents=True, exist_ok=True)
-    logger, logger_path = setup_task_logger("iterative_database_retrival", log_path)
+    logger, logger_path = setup_task_logger("iterative_database_retrieval", log_path)
 
     client = get_qdrant_client(qdrant_path)
     collection_name = dataset_name
@@ -551,7 +543,7 @@ def main() -> None:
     embedder = EmbeddingModelLoader(
         model_name=EMBEDDING_MODEL_NAME,
     )
-    
+
     ranking_llm = None
     schema_store = None
     if db_selection_mode == "rerank":
@@ -809,7 +801,7 @@ def main() -> None:
                 'efficiency': efficiency_tracker.finalize(),
             }
         )
-        log_path.write_text(json.dumps(log_records, ensure_ascii=False, indent=2), encoding='utf-8')
+        atomic_write_json(log_path, log_records)
         log_progress(
             logger,
             enable_progress_log,
@@ -821,7 +813,7 @@ def main() -> None:
         )
 
     logger.info("Completed %s records.", len(log_records))
-    
+
 
 if __name__ == "__main__":
     main()

@@ -1,7 +1,6 @@
 import os
 import inspect
 import json
-from pathlib import Path
 from copy import deepcopy
 from typing import Any, List, Optional
 
@@ -32,7 +31,7 @@ from config import *
 QWEN25_DEFAULT_CONTEXT_WINDOW = 32768
 QWEN25_MAX_CONTEXT_WINDOW = 131072
 SUPPORTED_PROVIDERS = {"transformers", "openai"}
-DEFAULT_OPENAI_CREDENTIAL_PATH = PROJECT_ROOT / "gpt_credential.json"
+DEFAULT_OPENAI_CREDENTIAL_PATH = OPENAI_CREDENTIAL_PATH
 
 
 class FallbackTextTokenizer:
@@ -108,7 +107,11 @@ class LLM:
         self.max_generation_num = max_generation_num or MAX_GENERATEION_NUM
         self.think_mode = think_mode
         self.current_context_window = None
-        self.credential_path = Path(credential_path) if credential_path is not None else None
+        self.credential_path = (
+            resolve_project_path(credential_path)
+            if credential_path is not None
+            else None
+        )
 
         self.query_settings = deepcopy(
             query_settings if query_settings is not None else BASELINE_DATABASE_RETRIVAL_QUERY_SETTINGS
@@ -302,7 +305,7 @@ class LLM:
 
         credential_path = self.credential_path
         if credential_path is None and os.getenv("OPENAI_CREDENTIAL_PATH"):
-            credential_path = Path(os.environ["OPENAI_CREDENTIAL_PATH"])
+            credential_path = resolve_project_path(os.environ["OPENAI_CREDENTIAL_PATH"])
         if credential_path is None and DEFAULT_OPENAI_CREDENTIAL_PATH.is_file():
             credential_path = DEFAULT_OPENAI_CREDENTIAL_PATH
 

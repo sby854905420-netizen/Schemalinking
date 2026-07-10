@@ -9,7 +9,15 @@ import pandas as pd
 
 from config import *
 from Llm.llm_loader import LLM, resolve_provider
-from Run.logging_utils import log_run_configuration, setup_task_logger
+from Utils.json_utils import atomic_write_json, load_json_records
+from Utils.prediction_adapter import build_prediction_from_native
+from Utils.prediction_store import (
+    build_prediction_path,
+    initialize_prediction_file,
+    upsert_prediction,
+)
+from Utils.value_utils import index_records_by_id
+from Utils.logging_utils import log_run_configuration, setup_task_logger
 from Utils.efficiency_utils import SampleEfficiencyTracker
 from Utils.render_tools import SchemaTextRenderer
 from Utils.schema_selection import (
@@ -18,25 +26,33 @@ from Utils.schema_selection import (
     load_db_counts,
     resolve_schema_text_for_db,
 )
+from Utils.schema_prediction_utils import (
+    normalize_predicted_columns,
+    normalize_predicted_tables,
+)
+from Utils.value_utils import get_row_value
 from Utils.tools import (
     get_qdrant_client,
-    get_row_value,
     load_db_info_index,
-    normalize_response_text,
     render_prompt,
     resolve_hint,
     resolve_input_path,
     resolve_output_path,
     resolve_prompt_token_cap,
+    resolve_supported_method,
 )
 
 SUPPORTED_METHODS = {"zero_shot", "few_shot"}
 INPUT_FILE_PATTERNS = (
+    "baseline_database_retrieval_{dataset_name}_{timestamp}.json",
+    "iterative_database_retrieval_{dataset_name}_{timestamp}.json",
     "baseline_database_retrival_{dataset_name}_{timestamp}.json",
     "iterative_database_retrival_{dataset_name}_{timestamp}.json",
 )
 TIMESTAMP_PATTERN_TEMPLATE = (
-    r"(?:baseline_database_retrival|iterative_database_retrival)_{dataset_name}_(\d{{8}}_\d{{6}})\.json$"
+    r"(?:baseline_database_retrieval|iterative_database_retrieval|"
+    r"baseline_database_retrival|iterative_database_retrival)_{dataset_name}_"
+    r"(\d{{8}}_\d{{6}})\.json$"
 )
 DEFAULT_METHOD = "few_shot"
 
@@ -54,6 +70,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--db-info-path", dest="db_info_path", type=Path, default=None)
     parser.add_argument("--qdrant-path", dest="qdrant_path", type=Path, default=None)
     parser.add_argument("--output-path", dest="output_path", type=Path, default=None)
+    parser.add_argument("--prediction-path", dest="prediction_path", type=Path, default=None)
     parser.add_argument(
         "--disable-table-filtering",
         dest="disable_table_filtering",
@@ -63,20 +80,12 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def resolve_method(method: str | None) -> str:
-    resolved_method = method or DEFAULT_METHOD
-    if resolved_method not in SUPPORTED_METHODS:
-        supported_methods = ", ".join(sorted(SUPPORTED_METHODS))
-        raise ValueError(f"Unsupported method '{resolved_method}'. Expected one of: {supported_methods}.")
-    return resolved_method
-
-
 def load_dataset(input_path: Path) -> pd.DataFrame:
     return pd.read_json(input_path)
 
 
 def load_prompt_templates(method_name: str) -> dict[str, str]:
-    prompt_dir = PROJECT_ROOT / "Templates" / method_name
+    prompt_dir = TEMPLATES_ROOT / method_name
     return {
         "table": (prompt_dir / "extract_relevant_tables.txt").read_text(encoding="utf-8").strip(),
         "column": (prompt_dir / "extract_relevant_columns.txt").read_text(encoding="utf-8").strip(),
@@ -96,25 +105,11 @@ def load_qdrant_collection_name(qdrant_path: Path) -> str:
     return next(iter(collections))
 
 
-def normalize_table_names(table_names: Sequence[Any]) -> list[str]:
-    normalized_table_names: list[str] = []
-    seen: set[str] = set()
-
-    for table_name in table_names:
-        normalized_table_name = str(table_name).strip()
-        if not normalized_table_name or normalized_table_name in seen:
-            continue
-        seen.add(normalized_table_name)
-        normalized_table_names.append(normalized_table_name)
-
-    return normalized_table_names
-
-
 def filter_column_records_by_tables(
     column_records: Sequence[dict[str, Any]],
     table_names: Sequence[str],
 ) -> list[dict[str, Any]]:
-    selected_table_names = set(normalize_table_names(table_names))
+    selected_table_names = set(normalize_predicted_tables(table_names))
     if not selected_table_names:
         return []
 
@@ -137,7 +132,7 @@ def normalize_relevant_tables(
 
     return [
         table_name
-        for table_name in normalize_table_names(relevant_table_list)
+        for table_name in normalize_predicted_tables(relevant_table_list)
         if table_name in available_table_names
     ]
 
@@ -217,45 +212,12 @@ def resolve_column_prompt_records(
     return fallback_records or list(table_prompt_records) or selected_table_records
 
 
-def parse_table_response(response_text: str) -> list:
-    nor_response_text = normalize_response_text(response_text)
-    try:
-        response_json = json.loads(nor_response_text)
-    except json.JSONDecodeError:
-        return []
+def parse_table_response(response_text: str) -> list[str]:
+    return normalize_predicted_tables(response_text)
 
-    if not response_json:
-        return []
-    
-    try:
-        relevant_table_list = response_json["relevant_tables"]
-    except KeyError:
-        return []
 
-    if not isinstance(relevant_table_list, list):
-        return []
-
-    return relevant_table_list
-
-def parse_column_response(response_text: str) -> dict:
-    nor_response_text = normalize_response_text(response_text)
-    try:
-        response_json = json.loads(nor_response_text)
-    except json.JSONDecodeError:
-        return {}
-
-    if not response_json:
-        return {}
-
-    try:
-        relevant_columns = response_json['relevant_columns']
-    except KeyError:
-        return {}
-
-    if not isinstance(relevant_columns, dict):
-        return {}
-
-    return relevant_columns
+def parse_column_response(response_text: str) -> dict[str, list[str]]:
+    return normalize_predicted_columns(response_text)
 
 
 def append_log_entry(
@@ -270,10 +232,14 @@ def append_log_entry(
     provider: str,
     output_path: Path,
     table_filtering_enabled: bool,
-) -> None:
+    prediction_path: Path | None = None,
+    source_record: dict[str, Any] | None = None,
+    dataset_name: str | None = None,
+    documents_dir: Path | None = None,
+    error_message: str | None = None,
+) -> dict[str, Any]:
     efficiency = efficiency_tracker.finalize()
-    log_records.append(
-        {
+    record = {
             "model": answer_llm_name,
             "provider": provider,
             "id": f"{get_row_value(row, 'id')}",
@@ -287,8 +253,107 @@ def append_log_entry(
             "table_filtering_enabled": table_filtering_enabled,
             "efficiency": efficiency,
         }
+    if error_message:
+        record["schema_error"] = error_message
+    log_records.append(record)
+    atomic_write_json(output_path, log_records)
+    if prediction_path is not None:
+        if dataset_name is None or documents_dir is None:
+            raise ValueError("Unified prediction context is incomplete.")
+        prediction = build_prediction_from_native(
+            schema_record=record,
+            database_record=row,
+            source_record=source_record or row,
+            dataset_name=dataset_name,
+            method="table_to_column",
+            documents_dir=documents_dir,
+        )
+        upsert_prediction(prediction_path, prediction)
+    return record
+
+
+def process_table2column_sample(
+    *,
+    predict_db_id: str,
+    question: str,
+    hint: str,
+    prompt_templates: dict[str, str],
+    schema_store: DbInfoSchemaStore,
+    full_db_records: Sequence[dict[str, Any]],
+    db_counts: dict[str, int],
+    embedder: Any,
+    qdrant_client: Any,
+    qdrant_collection_name: str,
+    answer_llm: Any,
+    efficiency_tracker: SampleEfficiencyTracker,
+    table_filtering_enabled: bool,
+) -> tuple[list[str], dict[str, Any], str, str]:
+    if table_filtering_enabled:
+        table_schema_text, table_prompt_records = resolve_table_prompt_schema(
+            predict_db_id=predict_db_id,
+            question=question,
+            hint=hint,
+            prompt_template=prompt_templates["table"],
+            answer_llm=answer_llm,
+            embedder=embedder,
+            schema_store=schema_store,
+            qdrant_client=qdrant_client,
+            qdrant_collection_name=qdrant_collection_name,
+            db_counts=db_counts,
+        )
+        table_prompt = render_schema_prompt(
+            prompt_template=prompt_templates["table"],
+            schema_text=table_schema_text,
+            question=question,
+            hint=hint,
+        )
+        table_response_text, table_total_tokens = answer_llm.query_with_usage(table_prompt)
+        efficiency_tracker.add_llm_total_tokens(table_total_tokens)
+        relevant_table_list = normalize_relevant_tables(
+            parse_table_response(table_response_text), full_db_records
+        )
+        column_prompt_records = resolve_column_prompt_records(
+            predict_db_id=predict_db_id,
+            question=question,
+            hint=hint,
+            relevant_table_list=relevant_table_list,
+            table_prompt_records=table_prompt_records,
+            schema_store=schema_store,
+            answer_llm=answer_llm,
+            prompt_template=prompt_templates["column"],
+        )
+        column_schema_text = schema_store.render_schema_text(
+            predict_db_id, column_prompt_records
+        )
+    else:
+        table_response_text = "Table filtering disabled."
+        relevant_table_list = []
+        column_schema_text, _ = resolve_table_prompt_schema(
+            predict_db_id=predict_db_id,
+            question=question,
+            hint=hint,
+            prompt_template=prompt_templates["column"],
+            answer_llm=answer_llm,
+            embedder=embedder,
+            schema_store=schema_store,
+            qdrant_client=qdrant_client,
+            qdrant_collection_name=qdrant_collection_name,
+            db_counts=db_counts,
+        )
+    column_prompt = render_schema_prompt(
+        prompt_template=prompt_templates["column"],
+        schema_text=column_schema_text,
+        question=question,
+        hint=hint,
     )
-    output_path.write_text(json.dumps(log_records, ensure_ascii=False, indent=2), encoding="utf-8")
+    column_response_text, column_total_tokens = answer_llm.query_with_usage(column_prompt)
+    efficiency_tracker.add_llm_total_tokens(column_total_tokens)
+    return (
+        relevant_table_list,
+        parse_column_response(column_response_text),
+        table_response_text,
+        column_response_text,
+    )
 
 
 def run_table2column(
@@ -306,6 +371,8 @@ def run_table2column(
     answer_llm_name: str,
     provider: str,
     table_filtering_enabled: bool,
+    prediction_path: Path | None = None,
+    source_index: dict[str, dict[str, Any]] | None = None,
 ) -> int:
     from tqdm import tqdm
 
@@ -313,6 +380,8 @@ def run_table2column(
 
     for _, row in tqdm(dataset_df.iterrows(), total=len(dataset_df)):
         efficiency_tracker = SampleEfficiencyTracker()
+        sample_id = get_row_value(row, "id", "instance_id")
+        source_record = (source_index or {}).get(str(sample_id), {})
         predict_db_id = get_row_value(row, "predict_db_id")
         if predict_db_id is None or str(predict_db_id).strip() == "":
             append_log_entry(
@@ -327,17 +396,43 @@ def run_table2column(
                 provider=provider,
                 output_path=output_path,
                 table_filtering_enabled=table_filtering_enabled,
+                prediction_path=prediction_path,
+                source_record=source_record,
+                dataset_name=dataset_name,
+                documents_dir=documents_dir,
             )
             continue
 
         predict_db_id = str(predict_db_id)
-        question = str(row["question"])
-        hint = resolve_hint(
-            row,
-            dataset_name=dataset_name,
-            documents_dir=documents_dir,
-        )
-        full_db_records = schema_store.get_column_records(predict_db_id)
+        try:
+            question = str(row["question"])
+            hint = resolve_hint(
+                row,
+                dataset_name=dataset_name,
+                documents_dir=documents_dir,
+            )
+            full_db_records = schema_store.get_column_records(predict_db_id)
+        except Exception as exc:
+            error_message = f"{type(exc).__name__}: {exc}"
+            append_log_entry(
+                log_records=log_records,
+                row=row,
+                predict_tables=[],
+                predict_columns={},
+                table_response_text=error_message,
+                column_response_text=error_message,
+                efficiency_tracker=efficiency_tracker,
+                answer_llm_name=answer_llm_name,
+                provider=provider,
+                output_path=output_path,
+                table_filtering_enabled=table_filtering_enabled,
+                prediction_path=prediction_path,
+                source_record=source_record,
+                dataset_name=dataset_name,
+                documents_dir=documents_dir,
+                error_message=error_message,
+            )
+            continue
         if not full_db_records:
             append_log_entry(
                 log_records=log_records,
@@ -351,73 +446,41 @@ def run_table2column(
                 provider=provider,
                 output_path=output_path,
                 table_filtering_enabled=table_filtering_enabled,
+                prediction_path=prediction_path,
+                source_record=source_record,
+                dataset_name=dataset_name,
+                documents_dir=documents_dir,
             )
             continue
 
-        if table_filtering_enabled:
-            table_schema_text, table_prompt_records = resolve_table_prompt_schema(
+        try:
+            (
+                relevant_table_list,
+                predict_columns,
+                table_response_text,
+                column_response_text,
+            ) = process_table2column_sample(
                 predict_db_id=predict_db_id,
                 question=question,
                 hint=hint,
-                prompt_template=prompt_templates["table"],
-                answer_llm=answer_llm,
-                embedder=embedder,
+                prompt_templates=prompt_templates,
                 schema_store=schema_store,
+                full_db_records=full_db_records,
+                db_counts=db_counts,
+                embedder=embedder,
                 qdrant_client=qdrant_client,
                 qdrant_collection_name=qdrant_collection_name,
-                db_counts=db_counts,
-            )
-            table_prompt = render_schema_prompt(
-                prompt_template=prompt_templates["table"],
-                schema_text=table_schema_text,
-                question=question,
-                hint=hint,
-            )
-            table_response_text, table_total_tokens = answer_llm.query_with_usage(table_prompt)
-            efficiency_tracker.add_llm_total_tokens(table_total_tokens)
-            relevant_table_list = normalize_relevant_tables(
-                parse_table_response(table_response_text),
-                full_db_records,
-            )
-
-            column_prompt_records = resolve_column_prompt_records(
-                predict_db_id=predict_db_id,
-                question=question,
-                hint=hint,
-                relevant_table_list=relevant_table_list,
-                table_prompt_records=table_prompt_records,
-                schema_store=schema_store,
                 answer_llm=answer_llm,
-                prompt_template=prompt_templates["column"],
+                efficiency_tracker=efficiency_tracker,
+                table_filtering_enabled=table_filtering_enabled,
             )
-            column_schema_text = schema_store.render_schema_text(
-                predict_db_id,
-                column_prompt_records,
-            )
-        else:
-            table_response_text = "Table filtering disabled."
+            error_message = None
+        except Exception as exc:
+            error_message = f"{type(exc).__name__}: {exc}"
             relevant_table_list = []
-            column_schema_text, column_prompt_records = resolve_table_prompt_schema(
-                predict_db_id=predict_db_id,
-                question=question,
-                hint=hint,
-                prompt_template=prompt_templates["column"],
-                answer_llm=answer_llm,
-                embedder=embedder,
-                schema_store=schema_store,
-                qdrant_client=qdrant_client,
-                qdrant_collection_name=qdrant_collection_name,
-                db_counts=db_counts,
-            )
-        column_prompt = render_schema_prompt(
-            prompt_template=prompt_templates["column"],
-            schema_text=column_schema_text,
-            question=question,
-            hint=hint,
-        )
-        column_response_text, column_total_tokens = answer_llm.query_with_usage(column_prompt)
-        efficiency_tracker.add_llm_total_tokens(column_total_tokens)
-        predict_columns = parse_column_response(column_response_text)
+            predict_columns = {}
+            table_response_text = error_message
+            column_response_text = error_message
         append_log_entry(
             log_records=log_records,
             row=row,
@@ -430,6 +493,11 @@ def run_table2column(
             provider=provider,
             output_path=output_path,
             table_filtering_enabled=table_filtering_enabled,
+            prediction_path=prediction_path,
+            source_record=source_record,
+            dataset_name=dataset_name,
+            documents_dir=documents_dir,
+            error_message=error_message,
         )
 
     return len(log_records)
@@ -438,7 +506,9 @@ def run_table2column(
 def main() -> None:
     args = parse_args()
 
-    method_name = resolve_method(args.method)
+    method_name = resolve_supported_method(
+        args.method, default=DEFAULT_METHOD, supported=SUPPORTED_METHODS
+    )
     dataset_name = args.dataset_name or DATASET_NAME
     answer_llm_name = args.answer_llm_name or ANSWER_LLM_NAME
     provider = resolve_provider(args.provider or PROVIDER)
@@ -446,16 +516,16 @@ def main() -> None:
     max_generation_num = args.max_generation_num or MAX_GENERATEION_NUM
     table_filtering_enabled = not args.disable_table_filtering
 
-    dataset_root = PROJECT_ROOT / "Data" / dataset_name
-    documents_dir = dataset_root / "documents"
-    logs_dir = args.logs_dir or (PROJECT_ROOT / "Logs")
-    db_info_path = args.db_info_path or (dataset_root / "db_info.json")
-    qdrant_path = args.qdrant_path or (dataset_root / "qdrant_column_index")
+    current_dataset_root = dataset_root(dataset_name)
+    documents_dir = current_dataset_root / "documents"
+    logs_dir = resolve_project_path(args.logs_dir) if args.logs_dir else LOGS_ROOT
+    db_info_path = resolve_project_path(args.db_info_path) if args.db_info_path else current_dataset_root / "db_info.json"
+    qdrant_path = resolve_project_path(args.qdrant_path) if args.qdrant_path else current_dataset_root / "qdrant_column_index"
     db_info_index = load_db_info_index(db_info_path)
     db_counts = load_db_counts(db_info_index)
     qdrant_collection_name = load_qdrant_collection_name(qdrant_path)
     input_path = resolve_input_path(
-        input_path=args.input_path,
+        input_path=resolve_project_path(args.input_path) if args.input_path else None,
         logs_dir=logs_dir,
         answer_llm_name=answer_llm_name,
         dataset_name=dataset_name,
@@ -463,7 +533,7 @@ def main() -> None:
         timestamp_pattern_template=TIMESTAMP_PATTERN_TEMPLATE,
     )
     output_path = resolve_output_path(
-        output_path=args.output_path,
+        output_path=resolve_project_path(args.output_path) if args.output_path else None,
         answer_llm_name=answer_llm_name,
         dataset_name=dataset_name,
         output_stem=(
@@ -476,7 +546,33 @@ def main() -> None:
     logger, logger_path = setup_task_logger("table2column", output_path)
 
     dataset_df = load_dataset(input_path)
+    source_records = load_json_records(current_dataset_root / "gold_sl.json")
+    source_index = {
+        key: dict(value) for key, value in index_records_by_id(source_records).items()
+    }
     prompt_templates = load_prompt_templates(method_name)
+    database_model_name = (
+        str(dataset_df.iloc[0].get("model") or answer_llm_name)
+        if len(dataset_df)
+        else answer_llm_name
+    )
+    prediction_path: Path | None
+    if args.prediction_path:
+        prediction_path = resolve_project_path(args.prediction_path)
+    elif table_filtering_enabled:
+        prediction_path = build_prediction_path(
+            "table_to_column", dataset_name, answer_llm_name
+        )
+    else:
+        prediction_path = None
+    if prediction_path is not None:
+        initialize_prediction_file(
+            prediction_path,
+            dataset_name=dataset_name,
+            method="table_to_column",
+            database_selection_model_name=database_model_name,
+            schema_linking_model_name=answer_llm_name,
+        )
 
     log_run_configuration(
         logger,
@@ -490,8 +586,8 @@ def main() -> None:
             "Method": method_name,
             "Table filtering enabled": table_filtering_enabled,
             "Input path": input_path,
-            "Table prompt template": PROJECT_ROOT / "Templates" / method_name / "extract_relevant_tables.txt",
-            "Column prompt template": PROJECT_ROOT / "Templates" / method_name / "extract_relevant_columns.txt",
+            "Table prompt template": TEMPLATES_ROOT / method_name / "extract_relevant_tables.txt",
+            "Column prompt template": TEMPLATES_ROOT / method_name / "extract_relevant_columns.txt",
             "DB info path": db_info_path,
             "Qdrant path": qdrant_path,
             "Qdrant collection": qdrant_collection_name,
@@ -499,6 +595,7 @@ def main() -> None:
             "Max input length": max_input_length,
             "Max generation num": max_generation_num,
             "Logger path": logger_path,
+            "Unified prediction path": prediction_path,
         },
     )
 
@@ -534,6 +631,8 @@ def main() -> None:
         answer_llm_name=answer_llm_name,
         provider=provider,
         table_filtering_enabled=table_filtering_enabled,
+        prediction_path=prediction_path,
+        source_index=source_index,
     )
     logger.info("Completed %s records.", processed_count)
 

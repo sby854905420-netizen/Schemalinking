@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 from Utils.render_tools import SchemaTextRenderer
@@ -504,6 +505,57 @@ def resolve_schema_text_for_db(
     return schema_store.render_schema_text(db_id, selected_records), selected_records
 
 
+def select_predicted_column_records(
+    db_id: str,
+    predicted_columns: dict[str, list[str]],
+    predicted_tables: Sequence[str],
+    schema_store: DbInfoSchemaStore,
+    include_key_columns: bool,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Select schema records explicitly named by a linking prediction."""
+
+    all_records = schema_store.get_column_records(db_id)
+    predicted_table_set = set(predicted_columns)
+    predicted_table_set.update(
+        str(table).strip() for table in predicted_tables if str(table).strip()
+    )
+    selected_record_ids: set[str] = set()
+
+    if predicted_columns:
+        column_sets = {
+            table: set(columns) for table, columns in predicted_columns.items()
+        }
+        for record in all_records:
+            table = str(record.get("table_name", "")).strip()
+            column = str(record.get("column_name", "")).strip()
+            requested = column_sets.get(table)
+            if requested is not None and (column in requested or "*" in requested):
+                selected_record_ids.add(build_column_id(record))
+    elif predicted_table_set:
+        for record in all_records:
+            if str(record.get("table_name", "")).strip() in predicted_table_set:
+                selected_record_ids.add(build_column_id(record))
+
+    if include_key_columns and predicted_table_set:
+        for record in all_records:
+            table = str(record.get("table_name", "")).strip()
+            if table not in predicted_table_set:
+                continue
+            if is_truthy_flag(record.get("is_primary_key")) or is_truthy_flag(
+                record.get("is_foreign_key")
+            ):
+                selected_record_ids.add(build_column_id(record))
+
+    selected_records = [
+        record for record in all_records if build_column_id(record) in selected_record_ids
+    ]
+    return selected_records, {
+        "available_column_count": len(all_records),
+        "selected_column_count": len(selected_records),
+        "predicted_table_count": len(predicted_table_set),
+    }
+
+
 __all__ = [
     "DbInfoSchemaStore",
     "build_column_id",
@@ -519,4 +571,5 @@ __all__ = [
     "resolve_schema_text_for_db",
     "resolve_table_top_one_column_ids",
     "select_relevant_column_records_for_db",
+    "select_predicted_column_records",
 ]

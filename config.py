@@ -1,14 +1,43 @@
-from pathlib import Path
+"""Project-wide settings and filesystem locations.
 
+All repository-owned paths are derived from this file so commands do not
+depend on the caller's current working directory.
+"""
+
+from pathlib import Path
+from typing import Union
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+DATA_ROOT = PROJECT_ROOT / "Data"
+TEMPLATES_ROOT = PROJECT_ROOT / "Templates"
+LOGS_ROOT = PROJECT_ROOT / "Logs"
+RESULTS_ROOT = PROJECT_ROOT / "results"
+MODEL_CACHE_ROOT = PROJECT_ROOT / "Llm" / "cache"
+OPENAI_CREDENTIAL_PATH = PROJECT_ROOT / "gpt_credential.json"
+SNOWFLAKE_CREDENTIAL_PATH = PROJECT_ROOT / "snowflake_credential.json"
+
+DATABASE_RETRIEVAL_DIR_NAME = "database_retrieval"
+LEGACY_DATABASE_RETRIEVAL_DIR_NAME = "Database_Retrival"
+
+
+def dataset_root(dataset_name: str) -> Path:
+    """Return the repository data directory for one dataset."""
+
+    return DATA_ROOT / dataset_name
+
+
+def resolve_project_path(path: Union[str, Path]) -> Path:
+    """Resolve a CLI path relative to the repository root, not the shell cwd."""
+
+    candidate = Path(path).expanduser()
+    return candidate if candidate.is_absolute() else PROJECT_ROOT / candidate
 
 DATASET_NAME = "MMQA"
 
-DEFAULT_QDRANT_PATH = PROJECT_ROOT / "Data" / DATASET_NAME / "qdrant_column_index"
+DEFAULT_QDRANT_PATH = dataset_root(DATASET_NAME) / "qdrant_column_index"
 
-DEFAULT_DB_INFO_PATH = PROJECT_ROOT / "Data" / DATASET_NAME / "db_info.json"
+DEFAULT_DB_INFO_PATH = dataset_root(DATASET_NAME) / "db_info.json"
 
 DEVICE = "cuda"
 

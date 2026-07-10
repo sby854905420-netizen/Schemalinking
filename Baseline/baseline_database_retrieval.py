@@ -9,9 +9,10 @@ from tqdm import tqdm
 
 from Llm.llm_loader import LLM, resolve_provider
 from config import *
-from Run.logging_utils import log_run_configuration, setup_task_logger
+from Utils.json_utils import atomic_write_json, normalize_response_text
+from Utils.logging_utils import log_run_configuration, setup_task_logger
 from Utils.efficiency_utils import SampleEfficiencyTracker
-from Utils.tools import normalize_response_text, render_prompt, resolve_hint
+from Utils.tools import render_prompt, resolve_hint
 
 
 def parse_args() -> argparse.Namespace:
@@ -55,17 +56,17 @@ def parse_db_response(response_text:str) -> str:
         response_json = json.loads(nor_response_text)
     except json.JSONDecodeError:
         return ""
-    
+
     if not isinstance(response_json, dict):
         return ""
-    
+
     try:
         pred_db_id = response_json["relevant_database"]
     except KeyError:
         return ""
-    
+
     return pred_db_id
-    
+
 
 def append_log_entry(
     log_records: list[dict[str, Any]],
@@ -90,7 +91,7 @@ def append_log_entry(
             "efficiency": efficiency,
         }
     )
-    log_path.write_text(json.dumps(log_records, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(log_path, log_records)
 
 
 def database_schema_to_string(
@@ -154,12 +155,16 @@ def main() -> None:
     max_input_length = args.max_input_length or MAX_INPUT_LENGTH
     max_generation_num = args.max_generation_num or MAX_GENERATEION_NUM
 
-    dataset_root = PROJECT_ROOT / "Data" / dataset_name
-    documents_dir = dataset_root / "documents"
-    dataset_df = load_dataset(dataset_root)
-    database_schema_path = args.database_schema_path or (dataset_root / "Database_schemas_summary.json")
+    current_dataset_root = dataset_root(dataset_name)
+    documents_dir = current_dataset_root / "documents"
+    dataset_df = load_dataset(current_dataset_root)
+    database_schema_path = (
+        resolve_project_path(args.database_schema_path)
+        if args.database_schema_path
+        else current_dataset_root / "Database_schemas_summary.json"
+    )
 
-    prompt_path = PROJECT_ROOT / "Templates" / "zero_shot" / "find_relevant_database_baseline.txt"
+    prompt_path = TEMPLATES_ROOT / "zero_shot" / "find_relevant_database_baseline.txt"
     prompt_template = prompt_path.read_text(encoding="utf-8").strip()
 
     ranking_llm = LLM(
@@ -171,10 +176,10 @@ def main() -> None:
     )
 
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    logs_dir = PROJECT_ROOT / "Logs" / answer_llm_name / "Database_Retrival"
+    logs_dir = LOGS_ROOT / answer_llm_name / DATABASE_RETRIEVAL_DIR_NAME
     logs_dir.mkdir(parents=True, exist_ok=True)
-    log_path = logs_dir / f"baseline_database_retrival_{dataset_name}_{run_id}.json"
-    logger, logger_path = setup_task_logger("baseline_database_retrival", log_path)
+    log_path = logs_dir / f"baseline_database_retrieval_{dataset_name}_{run_id}.json"
+    logger, logger_path = setup_task_logger("baseline_database_retrieval", log_path)
 
     log_run_configuration(
         logger,

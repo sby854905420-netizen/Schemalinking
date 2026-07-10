@@ -1,823 +1,672 @@
 from __future__ import annotations
 
 import argparse
-import json
 import re
 from collections.abc import Mapping, Sequence
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from config import *
-from Llm.llm_loader import LLM, resolve_provider
-from Run.logging_utils import log_run_configuration, setup_task_logger
-from Utils.efficiency_utils import SampleEfficiencyTracker
+from Llm.llm_loader import FallbackTextTokenizer, LLM, resolve_provider
+from Utils.json_utils import atomic_write_json
+from Utils.prediction_store import (
+    METHOD_NAMES,
+    build_prediction_path,
+    unified_to_native_schema_records,
+    validate_prediction_file,
+)
+from Run import one_shot_sql_generator as legacy
+from Run.spider_agent_tc.agent import SpiderAgentTC
+from Run.spider_agent_tc.executors.factory import ExecutorFactory, executor_route_for_dataset
+from Run.spider_agent_tc.prompt_builder import PromptBuilder
+from Run.spider_agent_tc.schema_adapter import SchemaLinkingAdapter
+from Run.spider_agent_tc.transformers_backend import TransformersChatBackend
 from Utils.render_tools import SchemaTextRenderer
-from Utils.schema_selection import DbInfoSchemaStore, build_column_id, is_truthy_flag
-from Utils.tools import (
-    get_row_value,
-    load_db_info_index,
-    normalize_response_text,
-    render_prompt,
-    resolve_hint,
-    resolve_prompt_token_cap,
+from Utils.schema_selection import DbInfoSchemaStore
+from Utils.tools import load_db_info_index
+from Utils.value_utils import get_row_value
+from Utils.sql_prediction_store import (
+    build_sql_prediction_path,
+    initialize_sql_prediction_file,
+    upsert_sql_prediction,
 )
 
 
-DEFAULT_SQL_LLM_NAME = "mistralai/Ministral-3-14B-Instruct-2512"
-DEFAULT_SQL_PROMPT_PATH = PROJECT_ROOT / "Templates" / "sql_generation.txt"
+DEFAULT_SQL_LLM_NAME = "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+DEFAULT_AGENT_SYSTEM_PROMPT_PATH = (
+    TEMPLATES_ROOT / "sql_generation" / "spider_agent_tc_system.txt"
+)
+DEFAULT_MAX_INPUT_LENGTH = 24576
 DEFAULT_SQL_GENERATION_NUM = 4096
-SUPPORTED_SCHEMA_METHODS = {"zero_shot", "few_shot"}
-SUPPORTED_SCHEMA_TASKS = {"baseline_schema_linking", "table2column"}
-SQL_GENERATION_QUERY_SETTINGS = {
-    "temperature": 0.0,
-    "top_p": 1.0,
-    "repetition_penalty": 1.02,
-}
-SCHEMA_RESULT_PATTERN_TEMPLATE = (
-    r"(?P<method>zero_shot|few_shot)_(?P<task>baseline_schema_linking|table2column)_"
-    r"{dataset_name}_(?P<timestamp>\d{{8}}_\d{{6}})\.json$"
-)
+COMPLETED_STATUSES = {"success", "empty", "failed"}
 
 
-def safe_path_component(value: str) -> str:
-    component = re.sub(r"[^A-Za-z0-9._-]+", "__", str(value).strip())
-    return component.strip("._-") or "unknown"
-
-
-def sql_generation_query_settings(provider: str) -> dict[str, Any]:
-    settings = dict(SQL_GENERATION_QUERY_SETTINGS)
-    if provider == "openai":
-        settings["response_format"] = {"type": "text"}
-    return settings
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Generate SQL from schema-linking prediction logs."
+def _console_error(exc: Exception) -> str:
+    message = f"{type(exc).__name__}: {exc}"
+    message = re.sub(
+        r"(?i)(password|token|secret|credential)\s*[=:]\s*[^\s,;]+",
+        r"\1=[REDACTED]",
+        message,
     )
-    parser.add_argument("--dataset-name", dest="dataset_name", type=str, default=None)
-    parser.add_argument("--answer-llm-name", dest="answer_llm_name", type=str, default=None)
-    parser.add_argument("--provider", dest="provider", type=str, default=None)
-    parser.add_argument("--credential-path", dest="credential_path", type=Path, default=None)
-    parser.add_argument("--max-input-length", dest="max_input_length", type=int, default=None)
-    parser.add_argument("--max-generation-num", dest="max_generation_num", type=int, default=None)
-    parser.add_argument("--input-path", dest="input_path", type=Path, default=None)
-    parser.add_argument("--schema-llm-name", dest="schema_llm_name", type=str, default=None)
+    return message[:1000]
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Generate SQL from MDB-Link schema-linking prediction logs."
+    )
+    parser.add_argument("--dataset-name", type=str, default=None)
+    parser.add_argument(
+        "--generator-mode",
+        choices=("spider_agent_tc", "one_shot"),
+        default="spider_agent_tc",
+    )
+    parser.add_argument("--answer-llm-name", type=str, default=DEFAULT_SQL_LLM_NAME)
+    parser.add_argument("--provider", type=str, default="transformers")
+    parser.add_argument("--credential-path", type=Path, default=None)
+    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument(
+        "--torch-dtype",
+        choices=("bfloat16", "float16", "float32"),
+        default="bfloat16",
+    )
+    parser.add_argument(
+        "--attn-implementation",
+        choices=("sdpa", "flash_attention_2", "eager"),
+        default="sdpa",
+    )
+    parser.add_argument("--max-input-length", type=int, default=DEFAULT_MAX_INPUT_LENGTH)
+    parser.add_argument("--max-generation-num", type=int, default=DEFAULT_SQL_GENERATION_NUM)
+    parser.add_argument("--max-agent-rounds", type=int, default=10)
+    parser.add_argument("--max-llm-retries", type=int, default=2)
+    parser.add_argument("--rollout-number", type=int, default=1)
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--random-seed", type=int, default=42)
+    parser.add_argument("--execution-timeout-seconds", type=float, default=120)
+    parser.add_argument("--max-result-rows", type=int, default=20)
+    parser.add_argument("--max-observation-chars", type=int, default=12000)
+    parser.add_argument("--max-history-tokens", type=int, default=12000)
+    parser.add_argument("--snowflake-credential-path", type=Path, default=None)
+    parser.add_argument("--database-root", type=Path, default=None)
+    parser.add_argument("--input-path", type=Path, default=None)
+    parser.add_argument("--schema-llm-name", type=str, default=None)
+    parser.add_argument(
+        "--sl-method",
+        choices=("auto", *sorted(METHOD_NAMES)),
+        default="auto",
+    )
     parser.add_argument(
         "--schema-method",
-        dest="schema_method",
-        choices=("auto", *sorted(SUPPORTED_SCHEMA_METHODS)),
+        choices=("auto", *sorted(legacy.SUPPORTED_SCHEMA_METHODS)),
         default="auto",
     )
     parser.add_argument(
         "--schema-task",
-        dest="schema_task",
-        choices=("auto", *sorted(SUPPORTED_SCHEMA_TASKS)),
+        choices=("auto", *sorted(legacy.SUPPORTED_SCHEMA_TASKS)),
         default="auto",
     )
-    parser.add_argument("--logs-dir", dest="logs_dir", type=Path, default=None)
-    parser.add_argument("--db-info-path", dest="db_info_path", type=Path, default=None)
-    parser.add_argument("--dataset-path", dest="dataset_path", type=Path, default=None)
-    parser.add_argument("--documents-dir", dest="documents_dir", type=Path, default=None)
-    parser.add_argument("--prompt-path", dest="prompt_path", type=Path, default=None)
+    parser.add_argument("--logs-dir", type=Path, default=None)
+    parser.add_argument("--db-info-path", type=Path, default=None)
+    parser.add_argument("--dataset-path", type=Path, default=None)
+    parser.add_argument("--documents-dir", type=Path, default=None)
+    parser.add_argument("--prompt-path", type=Path, default=None)
+    parser.add_argument("--system-prompt-path", type=Path, default=None)
+    parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--output-path", type=Path, default=None)
+    parser.add_argument("--sql-prediction-path", type=Path, default=None)
+    parser.add_argument("--sql-dialect", type=str, default=None)
+    parser.add_argument("--start-index", type=int, default=0)
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--include-key-columns", action="store_true")
+    parser.add_argument("--resume", action="store_true")
     parser.add_argument(
-        "--output-dir",
-        dest="output_dir",
-        type=Path,
-        default=None,
-        help=(
-            "Directory for SQL generation results. If omitted, results are saved under "
-            "Logs/sql_results/<dataset_name>/<model_name>/."
-        ),
-    )
-    parser.add_argument("--output-path", dest="output_path", type=Path, default=None)
-    parser.add_argument("--sql-dialect", dest="sql_dialect", type=str, default=None)
-    parser.add_argument("--start-index", dest="start_index", type=int, default=0)
-    parser.add_argument("--limit", dest="limit", type=int, default=None)
-    parser.add_argument(
-        "--include-key-columns",
-        dest="include_key_columns",
+        "--dry-run",
         action="store_true",
-        help="Add primary-key and foreign-key columns from predicted tables to the rendered schema excerpt.",
+        help="Build Adapter inputs, route, and prompts without loading a model or database.",
     )
-    return parser.parse_args()
-
-
-def load_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def load_log_records(input_path: Path) -> list[dict[str, Any]]:
-    records = load_json(input_path)
-    if not isinstance(records, list):
-        raise ValueError(f"Expected a list of log records in {input_path}.")
-    return [record for record in records if isinstance(record, dict)]
-
-
-def load_dataset_index(dataset_path: Path) -> dict[str, dict[str, Any]]:
-    if not dataset_path.is_file():
-        return {}
-
-    rows = load_json(dataset_path)
-    if not isinstance(rows, list):
-        raise ValueError(f"Expected a list of dataset rows in {dataset_path}.")
-
-    index: dict[str, dict[str, Any]] = {}
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        sample_id = get_row_value(row, "id", "instance_id")
-        if sample_id is None:
-            continue
-        index[str(sample_id)] = row
-    return index
-
-
-def resolve_schema_result_regex(dataset_name: str) -> re.Pattern[str]:
-    return re.compile(
-        SCHEMA_RESULT_PATTERN_TEMPLATE.format(dataset_name=re.escape(dataset_name))
-    )
-
-
-def find_model_log_root(logs_dir: Path, model_name: str) -> Path:
-    direct_path = logs_dir / model_name
-    if direct_path.is_dir():
-        return direct_path
-
-    model_leaf_name = Path(model_name).name
-    matching_dirs = sorted(
-        path
-        for path in logs_dir.rglob(model_leaf_name)
-        if path.is_dir() and path.name == model_leaf_name
-    )
-    if not matching_dirs:
-        raise FileNotFoundError(
-            f"Could not find logs for model '{model_name}' under {logs_dir}."
-        )
-    if len(matching_dirs) > 1:
-        matched_paths = "\n".join(str(path) for path in matching_dirs)
-        raise ValueError(
-            f"Found multiple log directories for model '{model_name}'. Please disambiguate:\n{matched_paths}"
-        )
-    return matching_dirs[0]
-
-
-def find_latest_schema_result_file(
-    logs_dir: Path,
-    schema_llm_name: str,
-    dataset_name: str,
-    schema_method: str,
-    schema_task: str,
-) -> Path:
-    model_root = find_model_log_root(logs_dir=logs_dir, model_name=schema_llm_name)
-    result_regex = resolve_schema_result_regex(dataset_name)
-    candidates: list[tuple[str, Path]] = []
-
-    for path in model_root.glob(f"*_{dataset_name}_*.json"):
-        match = result_regex.match(path.name)
-        if match is None:
-            continue
-        if schema_method != "auto" and match.group("method") != schema_method:
-            continue
-        if schema_task != "auto" and match.group("task") != schema_task:
-            continue
-        candidates.append((match.group("timestamp"), path))
-
-    if not candidates:
-        raise FileNotFoundError(
-            f"Could not find schema prediction logs for dataset={dataset_name}, "
-            f"schema_method={schema_method}, schema_task={schema_task} under {model_root}."
-        )
-
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    return candidates[0][1]
-
-
-def resolve_input_path(
-    input_path: Path | None,
-    logs_dir: Path,
-    schema_llm_name: str,
-    dataset_name: str,
-    schema_method: str,
-    schema_task: str,
-) -> Path:
-    if input_path is not None:
-        return input_path
-
-    return find_latest_schema_result_file(
-        logs_dir=logs_dir,
-        schema_llm_name=schema_llm_name,
-        dataset_name=dataset_name,
-        schema_method=schema_method,
-        schema_task=schema_task,
-    )
-
-
-def resolve_output_path(
-    output_path: Path | None,
-    output_dir: Path | None,
-    logs_dir: Path,
-    dataset_name: str,
-    model_name: str,
-) -> Path:
-    if output_path is not None:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        return output_path
-
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_dir = output_dir or (
-        logs_dir
-        / "sql_results"
-        / safe_path_component(dataset_name)
-        / safe_path_component(model_name)
-    )
-    save_dir.mkdir(parents=True, exist_ok=True)
-    return save_dir / f"sql_generation_{dataset_name}_{run_id}.json"
+    return parser.parse_args(argv)
 
 
 def default_sql_dialect(dataset_name: str) -> str:
-    if dataset_name.lower() == "mmqa":
+    if dataset_name.lower() in {"mmqa", "bird"}:
         return (
-            "Use SQLite SQL for MMQA. MMQA uses compact Spider-style SQLite databases. "
-            "Use only SQLite-compatible syntax and functions. Use strftime/date/datetime "
-            "for date logic when needed. Use table and column names exactly as shown in "
-            "the schema excerpt. Do not use Snowflake-only features such as QUALIFY, ILIKE, "
-            "TRY_CAST, DATEADD, DATEDIFF, TO_DATE, TRUE/FALSE boolean literals, :: casts, "
-            "or warehouse-style DATABASE.SCHEMA.TABLE qualification unless that qualification "
-            "is literally part of a provided SQLite table name."
+            f"Use SQLite SQL for {dataset_name}. Preserve all supplied identifiers exactly. "
+            "Use SQLite-compatible functions and do not use Snowflake-only syntax."
         )
     if dataset_name.lower() == "spider2":
         return (
-            "Use Snowflake SQL for Spider2. Spider2 uses large Snowflake warehouse databases, "
-            "often with fully qualified table names. Preserve every table and column name exactly "
-            "as shown in the schema excerpt. Any Snowflake identifier containing lowercase letters, "
-            "mixed case, spaces, or special characters must be double-quoted. Quote each part of "
-            "a mixed-case fully qualified table name separately, for example "
-            "\"DATABASE\".\"SCHEMA\".\"MixedCaseTable\". Reference mixed-case columns as "
-            "alias.\"ColumnName\". Do not write DATABASE.SCHEMA.MixedCaseTable or alias.ColumnName "
-            "for mixed-case objects because Snowflake will uppercase unquoted identifiers. "
-            "Snowflake features such as CTEs, QUALIFY, ILIKE, DATEADD, DATEDIFF, TRY_CAST, "
-            "TO_DATE, TRUE/FALSE boolean literals, and :: casts are allowed when useful. "
-            "Do not write SQLite-specific SQL."
+            "Use Snowflake SQL for Spider2. Preserve fully qualified three-part names and "
+            "double-quote each identifier part when case or special characters require it."
         )
-    return "Use the dialect implied by the question, schema, and hint."
+    return legacy.default_sql_dialect(dataset_name)
 
 
-def normalize_predicted_columns(value: Any) -> dict[str, list[str]]:
-    if isinstance(value, str):
-        try:
-            value = json.loads(normalize_response_text(value))
-        except json.JSONDecodeError:
-            return {}
-
-    if isinstance(value, Mapping) and "relevant_columns" in value:
-        value = value.get("relevant_columns")
-
-    if not isinstance(value, Mapping):
-        return {}
-
-    normalized: dict[str, list[str]] = {}
-    for table_name, column_names in value.items():
-        normalized_table_name = str(table_name).strip()
-        if not normalized_table_name:
-            continue
-
-        if not isinstance(column_names, Sequence) or isinstance(column_names, (str, bytes)):
-            continue
-
-        seen: set[str] = set()
-        normalized_columns: list[str] = []
-        for column_name in column_names:
-            normalized_column_name = str(column_name).strip()
-            if not normalized_column_name or normalized_column_name in seen:
-                continue
-            seen.add(normalized_column_name)
-            normalized_columns.append(normalized_column_name)
-
-        if normalized_columns:
-            normalized[normalized_table_name] = normalized_columns
-    return normalized
-
-
-def parse_predicted_columns_from_text(response_text: Any) -> dict[str, list[str]]:
-    if not isinstance(response_text, str) or not response_text.strip():
-        return {}
-    return normalize_predicted_columns(response_text)
-
-
-def resolve_predicted_columns(row: Mapping[str, Any]) -> dict[str, list[str]]:
-    predicted_columns = normalize_predicted_columns(row.get("predict_columns"))
-    if predicted_columns:
-        return predicted_columns
-    return parse_predicted_columns_from_text(row.get("predict_columns_text"))
-
-
-def normalize_predicted_tables(value: Any) -> list[str]:
-    if isinstance(value, str):
-        try:
-            value = json.loads(normalize_response_text(value))
-        except json.JSONDecodeError:
-            return []
-
-    if isinstance(value, Mapping) and "relevant_tables" in value:
-        value = value.get("relevant_tables")
-
-    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
-        return []
-
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for table_name in value:
-        normalized_table_name = str(table_name).strip()
-        if not normalized_table_name or normalized_table_name in seen:
-            continue
-        seen.add(normalized_table_name)
-        normalized.append(normalized_table_name)
-    return normalized
-
-
-def resolve_predicted_tables(row: Mapping[str, Any]) -> list[str]:
-    predicted_tables = normalize_predicted_tables(row.get("predict_tables"))
-    if predicted_tables:
-        return predicted_tables
-    return normalize_predicted_tables(row.get("predict_tables_text"))
-
-
-def select_predicted_column_records(
-    db_id: str,
-    predicted_columns: dict[str, list[str]],
-    predicted_tables: Sequence[str],
-    schema_store: DbInfoSchemaStore,
-    include_key_columns: bool,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    all_records = schema_store.get_column_records(db_id)
-    predicted_table_set = set(predicted_columns)
-    predicted_table_set.update(str(table_name).strip() for table_name in predicted_tables)
-    selected_record_ids: set[str] = set()
-
-    if predicted_columns:
-        predicted_column_sets = {
-            table_name: set(column_names)
-            for table_name, column_names in predicted_columns.items()
-        }
-
-        for record in all_records:
-            table_name = str(record.get("table_name", "")).strip()
-            column_name = str(record.get("column_name", "")).strip()
-            if not table_name or not column_name:
-                continue
-            column_names = predicted_column_sets.get(table_name)
-            if column_names is None:
-                continue
-            if "*" in column_names or column_name in column_names:
-                selected_record_ids.add(build_column_id(record))
-    elif predicted_table_set:
-        for record in all_records:
-            table_name = str(record.get("table_name", "")).strip()
-            if table_name in predicted_table_set:
-                selected_record_ids.add(build_column_id(record))
-
-    if include_key_columns and predicted_table_set:
-        for record in all_records:
-            table_name = str(record.get("table_name", "")).strip()
-            if table_name not in predicted_table_set:
-                continue
-            if is_truthy_flag(record.get("is_primary_key")) or is_truthy_flag(record.get("is_foreign_key")):
-                selected_record_ids.add(build_column_id(record))
-
-    selected_records = [
-        record
-        for record in all_records
-        if build_column_id(record) in selected_record_ids
-    ]
-    metadata = {
-        "available_column_count": len(all_records),
-        "selected_column_count": len(selected_records),
-        "predicted_table_count": len(predicted_table_set),
+def minimal_result(
+    sample_id: str,
+    predict_db_id: str | None,
+    predict_sql: str,
+    status: str,
+) -> dict[str, Any]:
+    return {
+        "id": str(sample_id),
+        "predict_db_id": predict_db_id,
+        "predict_sql": predict_sql,
+        "status": status if status in COMPLETED_STATUSES else "failed",
     }
-    return selected_records, metadata
-
-
-def render_sql_prompt(
-    prompt_template: str,
-    schema_text: str,
-    question: str,
-    hint: str,
-    dataset_name: str,
-    sql_dialect: str,
-) -> str:
-    return render_prompt(
-        prompt_template,
-        DATABASE_SCHEMAS=schema_text,
-        QUESTION=question,
-        HINT=hint,
-        DATASET_NAME=dataset_name,
-        SQL_DIALECT=sql_dialect,
-    )
-
-
-def fit_prompt_to_budget(
-    prompt_template: str,
-    schema_text: str,
-    question: str,
-    hint: str,
-    dataset_name: str,
-    sql_dialect: str,
-    answer_llm: LLM,
-    renderer: SchemaTextRenderer,
-) -> tuple[str, str, str, int]:
-    target_prompt_cap = resolve_prompt_token_cap(answer_llm.max_input_length)
-    prompt = render_sql_prompt(
-        prompt_template=prompt_template,
-        schema_text=schema_text,
-        question=question,
-        hint=hint,
-        dataset_name=dataset_name,
-        sql_dialect=sql_dialect,
-    )
-    prompt_tokens = answer_llm.count_input_tokens(prompt)
-    if prompt_tokens <= target_prompt_cap:
-        return prompt, schema_text, hint, prompt_tokens
-
-    fitted_hint = hint
-    if hint != "No hint":
-        prompt_without_hint = render_sql_prompt(
-            prompt_template=prompt_template,
-            schema_text=schema_text,
-            question=question,
-            hint="",
-            dataset_name=dataset_name,
-            sql_dialect=sql_dialect,
-        )
-        tokens_without_hint = answer_llm.count_input_tokens(prompt_without_hint)
-        hint_budget = max(0, target_prompt_cap - tokens_without_hint)
-        fitted_hint = renderer.truncate_to_token_budget(hint, hint_budget)
-        prompt = render_sql_prompt(
-            prompt_template=prompt_template,
-            schema_text=schema_text,
-            question=question,
-            hint=fitted_hint or "No hint",
-            dataset_name=dataset_name,
-            sql_dialect=sql_dialect,
-        )
-        prompt_tokens = answer_llm.count_input_tokens(prompt)
-        if prompt_tokens <= target_prompt_cap:
-            return prompt, schema_text, fitted_hint or "No hint", prompt_tokens
-
-    prompt_without_schema = render_sql_prompt(
-        prompt_template=prompt_template,
-        schema_text="",
-        question=question,
-        hint=fitted_hint,
-        dataset_name=dataset_name,
-        sql_dialect=sql_dialect,
-    )
-    tokens_without_schema = answer_llm.count_input_tokens(prompt_without_schema)
-    schema_budget = max(0, target_prompt_cap - tokens_without_schema)
-    fitted_schema_text = renderer.truncate_to_token_budget(schema_text, schema_budget)
-    prompt = render_sql_prompt(
-        prompt_template=prompt_template,
-        schema_text=fitted_schema_text,
-        question=question,
-        hint=fitted_hint,
-        dataset_name=dataset_name,
-        sql_dialect=sql_dialect,
-    )
-    prompt_tokens = answer_llm.count_input_tokens(prompt)
-    return prompt, fitted_schema_text, fitted_hint, prompt_tokens
-
-
-def normalize_sql_response(response_text: str) -> str:
-    text = response_text.strip()
-    if "</think>" in text:
-        text = text.split("</think>")[-1].strip()
-
-    fenced_match = re.search(r"```(?:sql)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
-    if fenced_match is not None:
-        text = fenced_match.group(1).strip()
-    else:
-        text = text.replace("```", "").strip()
-
-    try:
-        response_json = json.loads(text)
-    except json.JSONDecodeError:
-        response_json = None
-    if isinstance(response_json, Mapping):
-        sql_value = response_json.get("sql")
-        if isinstance(sql_value, str):
-            text = sql_value.strip()
-
-    text = re.sub(r"^\s*SQL\s*:\s*", "", text, flags=re.IGNORECASE).strip()
-    return text
 
 
 def write_result_file(
     output_path: Path,
-    run_info: dict[str, Any],
-    result_records: list[dict[str, Any]],
+    run_info_or_records: dict[str, Any] | list[dict[str, Any]],
+    result_records: list[dict[str, Any]] | None = None,
 ) -> None:
-    output_path.write_text(
-        json.dumps(
-            {
-                "run_info": run_info,
-                "results": result_records,
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
+    """Atomically persist only the fields consumed by EX evaluation.
+
+    The legacy three-argument call remains accepted, but run_info is no longer
+    written into the prediction artifact.
+    """
+
+    records = result_records if result_records is not None else run_info_or_records
+    if not isinstance(records, list):
+        raise TypeError("result_records must be a list")
+    atomic_write_json(output_path, {"results": records})
+
+
+def load_resume_records(output_path: Path, resume: bool) -> list[dict[str, Any]]:
+    if not resume or not output_path.is_file():
+        return []
+    payload = legacy.load_json(output_path)
+    if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
+        raise ValueError(f"Cannot resume invalid SQL result file: {output_path}")
+    records: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in payload["results"]:
+        if not isinstance(raw, dict):
+            continue
+        sample_id = str(raw.get("id", "")).strip()
+        status = str(raw.get("status", "")).strip()
+        if not sample_id or status not in COMPLETED_STATUSES or sample_id in seen:
+            continue
+        seen.add(sample_id)
+        records.append(
+            minimal_result(
+                sample_id,
+                raw.get("predict_db_id"),
+                str(raw.get("predict_sql") or ""),
+                status,
+            )
+        )
+    return records
+
+
+def _selected_rows(
+    records: Sequence[dict[str, Any]], start_index: int, limit: int | None
+) -> list[tuple[int, dict[str, Any]]]:
+    selected = list(enumerate(records))[max(0, start_index):]
+    return selected if limit is None else selected[: max(0, limit)]
+
+
+def _source_row(
+    row: Mapping[str, Any], dataset_index: Mapping[str, dict[str, Any]]
+) -> dict[str, Any]:
+    sample_id = get_row_value(row, "id", "instance_id")
+    return dataset_index.get(str(sample_id), {}) if sample_id is not None else {}
+
+
+def _failure_record(
+    row: Mapping[str, Any], source: Mapping[str, Any], fallback_id: str
+) -> dict[str, Any]:
+    sample_id = get_row_value(row, "id", "instance_id")
+    if sample_id is None:
+        sample_id = get_row_value(source, "id", "instance_id")
+    predict_db_id = get_row_value(row, "predict_db_id")
+    return minimal_result(
+        str(sample_id if sample_id is not None else fallback_id),
+        None if predict_db_id is None else str(predict_db_id).strip(),
+        "",
+        "failed",
     )
 
 
-def append_log_entry(
-    result_records: list[dict[str, Any]],
-    output_path: Path,
+def resolve_sl_method(
+    requested: str,
     *,
-    run_info: dict[str, Any],
-    row: Mapping[str, Any],
-    source_row: Mapping[str, Any],
-    predict_db_id: str | None,
-    predicted_columns: dict[str, list[str]],
-    predicted_tables: list[str],
-    sql_response_text: str,
-    prompt_tokens: int,
-    schema_metadata: dict[str, Any],
-    efficiency_tracker: SampleEfficiencyTracker,
+    input_path: Path | None = None,
+    schema_task: str = "auto",
+) -> str:
+    if requested != "auto":
+        return requested
+    path_text = str(input_path or "").lower()
+    if "rag_column_retrieval" in path_text or "rag_baseline" in path_text:
+        return "rag_column_retrieval"
+    if schema_task == "baseline_schema_linking" or "baseline_schema_linking" in path_text:
+        return "prompt_baseline"
+    return "table_to_column"
+
+
+def load_schema_records(path: Path, dataset_name: str) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    payload = legacy.load_json(path)
+    if isinstance(payload, list):
+        return [record for record in payload if isinstance(record, dict)], None
+    unified = validate_prediction_file(payload)
+    return unified_to_native_schema_records(unified, dataset_name), unified
+
+
+def _write_standalone_sql(
+    prediction_path: Path | None,
+    record: Mapping[str, Any],
+    error: str | None,
 ) -> None:
-    efficiency = efficiency_tracker.finalize()
-    sample_id = get_row_value(row, "id", "instance_id")
-    if sample_id is None:
-        sample_id = get_row_value(source_row, "id", "instance_id")
-
-    normalized_sql = normalize_sql_response(sql_response_text)
-    error_message = schema_metadata.get("error")
-    result_record: dict[str, Any] = {
-        "id": None if sample_id is None else str(sample_id),
-        "question": row.get("question") or source_row.get("question"),
-        "gold_db_id": source_row.get("db_id") or row.get("gold_db_id") or row.get("spider_db_id"),
-        "predict_db_id": predict_db_id,
-        "schema_linking": {
-            "predict_tables": predicted_tables,
-            "predict_columns": predicted_columns,
-        },
-        "predict_sql": normalized_sql,
-        "status": "failed" if error_message else ("success" if normalized_sql else "empty"),
-        "efficiency": {
-            **efficiency,
-            "prompt_tokens": prompt_tokens,
-        },
-    }
-    if error_message:
-        result_record["error"] = error_message
-    if sql_response_text.strip() and sql_response_text.strip() != normalized_sql:
-        result_record["raw_response"] = sql_response_text
-    if schema_metadata.get("hint_truncated") or schema_metadata.get("schema_truncated"):
-        result_record["truncation"] = {
-            "hint_truncated": bool(schema_metadata.get("hint_truncated")),
-            "schema_truncated": bool(schema_metadata.get("schema_truncated")),
-        }
-
-    result_records.append(result_record)
-    write_result_file(output_path, run_info, result_records)
+    if prediction_path is None:
+        return
+    upsert_sql_prediction(
+        prediction_path,
+        sample_id=record["id"],
+        predicted_sql=str(record.get("predict_sql") or "") or None,
+        status=str(record.get("status") or "failed"),
+        error=error,
+    )
 
 
-def run_sql_generation(
+def run_one_shot_generation(
+    *,
     schema_log_records: Sequence[dict[str, Any]],
     dataset_index: dict[str, dict[str, Any]],
-    dataset_name: str,
-    documents_dir: Path,
+    adapter: SchemaLinkingAdapter,
     prompt_template: str,
     output_path: Path,
-    schema_store: DbInfoSchemaStore,
-    renderer: SchemaTextRenderer,
     answer_llm: LLM,
-    run_info: dict[str, Any],
-    sql_dialect: str,
+    renderer: SchemaTextRenderer,
     start_index: int,
     limit: int | None,
-    include_key_columns: bool,
+    resume: bool,
+    sql_prediction_path: Path | None = None,
 ) -> int:
     from tqdm import tqdm
 
-    selected_rows = list(schema_log_records[max(0, start_index):])
-    if limit is not None:
-        selected_rows = selected_rows[: max(0, limit)]
+    records = load_resume_records(output_path, resume)
+    for record in records:
+        _write_standalone_sql(sql_prediction_path, record, None)
+    completed = {record["id"] for record in records}
+    for index, row in tqdm(_selected_rows(schema_log_records, start_index, limit)):
+        fallback_id = f"row:{index}"
+        source = _source_row(row, dataset_index)
+        raw_id = get_row_value(row, "id", "instance_id")
+        stable_id = str(raw_id if raw_id is not None else fallback_id)
+        if stable_id in completed:
+            continue
+        error_message = None
+        try:
+            agent_input = adapter.adapt(row, source, fallback_sample_id=fallback_id)
+            prompt, _, _, _ = legacy.fit_prompt_to_budget(
+                prompt_template=prompt_template,
+                schema_text=agent_input.schema_text,
+                question=agent_input.question,
+                hint=agent_input.hint,
+                dataset_name=agent_input.dataset_name,
+                sql_dialect=agent_input.sql_dialect,
+                answer_llm=answer_llm,
+                renderer=renderer,
+            )
+            response, _ = answer_llm.query_with_usage(prompt)
+            sql = legacy.normalize_sql_response(response)
+            record = minimal_result(
+                agent_input.sample_id,
+                agent_input.predict_db_id,
+                sql,
+                "success" if sql else "empty",
+            )
+        except Exception as exc:
+            error_message = _console_error(exc)
+            tqdm.write(f"one_shot sample {stable_id} failed: {error_message}")
+            record = _failure_record(row, source, fallback_id)
+        records.append(record)
+        completed.add(record["id"])
+        write_result_file(output_path, records)
+        _write_standalone_sql(sql_prediction_path, record, error_message)
+    return len(records)
 
-    result_records: list[dict[str, Any]] = []
 
-    for row in tqdm(selected_rows, total=len(selected_rows)):
-        efficiency_tracker = SampleEfficiencyTracker()
-        sample_id = get_row_value(row, "id", "instance_id")
-        source_row = dataset_index.get(str(sample_id), {}) if sample_id is not None else {}
-        question = str(row.get("question") or source_row.get("question") or "").strip()
-        predict_db_id_value = get_row_value(row, "predict_db_id")
-        predict_db_id = None if predict_db_id_value is None else str(predict_db_id_value).strip()
-        predicted_columns = resolve_predicted_columns(row)
-        predicted_tables = resolve_predicted_tables(row)
-        hint = resolve_hint(
-            source_row or row,
+def run_spider_agent_generation(
+    *,
+    schema_log_records: Sequence[dict[str, Any]],
+    dataset_index: dict[str, dict[str, Any]],
+    adapter: SchemaLinkingAdapter,
+    executor_factory: ExecutorFactory,
+    prompt_builder: PromptBuilder,
+    backend: TransformersChatBackend,
+    output_path: Path,
+    args: argparse.Namespace,
+    sql_prediction_path: Path | None = None,
+) -> int:
+    from tqdm import tqdm
+
+    records = load_resume_records(output_path, args.resume)
+    for record in records:
+        _write_standalone_sql(sql_prediction_path, record, None)
+    completed = {record["id"] for record in records}
+    for index, row in tqdm(_selected_rows(schema_log_records, args.start_index, args.limit)):
+        fallback_id = f"row:{index}"
+        source = _source_row(row, dataset_index)
+        raw_id = get_row_value(row, "id", "instance_id")
+        stable_id = str(raw_id if raw_id is not None else fallback_id)
+        if stable_id in completed:
+            continue
+        executor = None
+        error_message = None
+        try:
+            agent_input = adapter.adapt(row, source, fallback_sample_id=fallback_id)
+            executor = executor_factory.create(agent_input.predict_db_id)
+            best = None
+            for _ in range(args.rollout_number):
+                candidate = SpiderAgentTC(
+                    backend=backend,
+                    executor=executor,
+                    prompt_builder=prompt_builder,
+                    max_agent_rounds=args.max_agent_rounds,
+                    max_llm_retries=args.max_llm_retries,
+                    max_observation_chars=args.max_observation_chars,
+                    generation_config={"temperature": args.temperature},
+                ).run(agent_input)
+                if best is None or candidate.execution_verified:
+                    best = candidate
+                if candidate.execution_verified:
+                    break
+            assert best is not None
+            if best.status != "success":
+                error_message = best.error[:1000] or f"Agent ended with status {best.status}."
+                tqdm.write(
+                    f"spider_agent_tc sample {stable_id} ended as {best.status}: "
+                    f"{best.error[:1000]}"
+                )
+            record = minimal_result(
+                agent_input.sample_id,
+                agent_input.predict_db_id,
+                best.sql,
+                best.status,
+            )
+        except Exception as exc:
+            error_message = _console_error(exc)
+            tqdm.write(f"spider_agent_tc sample {stable_id} failed: {error_message}")
+            record = _failure_record(row, source, fallback_id)
+        finally:
+            if executor is not None:
+                try:
+                    executor.close()
+                except Exception:
+                    pass
+        records.append(record)
+        completed.add(record["id"])
+        write_result_file(output_path, records)
+        _write_standalone_sql(sql_prediction_path, record, error_message)
+    return len(records)
+
+
+def run_dry_run(
+    *,
+    schema_log_records: Sequence[dict[str, Any]],
+    dataset_index: dict[str, dict[str, Any]],
+    adapter: SchemaLinkingAdapter,
+    executor_factory: ExecutorFactory,
+    prompt_builder: PromptBuilder,
+    start_index: int,
+    limit: int | None,
+) -> tuple[int, int]:
+    valid = failed = 0
+    for index, row in _selected_rows(schema_log_records, start_index, limit):
+        try:
+            agent_input = adapter.adapt(
+                row,
+                _source_row(row, dataset_index),
+                fallback_sample_id=f"row:{index}",
+            )
+            prompt_builder.build_fixed_messages(agent_input)
+            executor_factory.describe(agent_input.predict_db_id)
+            valid += 1
+        except Exception as exc:
+            failed += 1
+            print(f"DRY RUN record {index} failed: {type(exc).__name__}: {exc}")
+    print(
+        f"DRY RUN complete: valid={valid}, failed={failed}, "
+        "model_loaded=no, database_executed=no"
+    )
+    return valid, failed
+
+
+def _validate_args(args: argparse.Namespace) -> None:
+    positive = {
+        "max_input_length": args.max_input_length,
+        "max_generation_num": args.max_generation_num,
+        "max_agent_rounds": args.max_agent_rounds,
+        "rollout_number": args.rollout_number,
+        "execution_timeout_seconds": args.execution_timeout_seconds,
+        "max_result_rows": args.max_result_rows,
+        "max_observation_chars": args.max_observation_chars,
+        "max_history_tokens": args.max_history_tokens,
+    }
+    invalid = [name for name, value in positive.items() if value <= 0]
+    if invalid:
+        raise ValueError("Arguments must be positive: " + ", ".join(invalid))
+    if args.max_llm_retries < 0 or args.temperature < 0:
+        raise ValueError("Retries and temperature must be non-negative.")
+    if (
+        args.generator_mode == "spider_agent_tc"
+        and args.max_generation_num >= args.max_input_length
+    ):
+        raise ValueError(
+            "spider_agent_tc requires --max-generation-num to be smaller than "
+            "--max-input-length so output tokens can be reserved."
+        )
+    if args.generator_mode == "spider_agent_tc" and args.provider.lower() != "transformers":
+        raise ValueError("spider_agent_tc requires --provider transformers.")
+    if (
+        args.generator_mode == "spider_agent_tc"
+        and args.answer_llm_name != DEFAULT_SQL_LLM_NAME
+    ):
+        raise ValueError(
+            "spider_agent_tc baseline is fixed to "
+            f"--answer-llm-name {DEFAULT_SQL_LLM_NAME}."
+        )
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    args = parse_args(argv)
+    _validate_args(args)
+    dataset_name = args.dataset_name or DATASET_NAME
+    logs_dir = resolve_project_path(args.logs_dir) if args.logs_dir else LOGS_ROOT
+    current_dataset_root = dataset_root(dataset_name)
+    dataset_path = resolve_project_path(args.dataset_path) if args.dataset_path else current_dataset_root / "gold_sl.json"
+    db_info_path = resolve_project_path(args.db_info_path) if args.db_info_path else current_dataset_root / "db_info.json"
+    documents_dir = resolve_project_path(args.documents_dir) if args.documents_dir else current_dataset_root / "documents"
+    prompt_path = resolve_project_path(args.prompt_path) if args.prompt_path else legacy.DEFAULT_SQL_PROMPT_PATH
+    system_prompt_path = resolve_project_path(args.system_prompt_path) if args.system_prompt_path else DEFAULT_AGENT_SYSTEM_PROMPT_PATH
+    sql_dialect = args.sql_dialect or default_sql_dialect(dataset_name)
+    schema_llm_name = args.schema_llm_name or args.answer_llm_name
+    executor_route_for_dataset(dataset_name)
+
+    explicit_input_path = resolve_project_path(args.input_path) if args.input_path else None
+    if explicit_input_path is not None:
+        input_path = explicit_input_path
+    elif args.sl_method != "auto":
+        input_path = build_prediction_path(args.sl_method, dataset_name, schema_llm_name)
+        if not input_path.is_file():
+            raise FileNotFoundError(f"Could not find unified SL prediction: {input_path}")
+    else:
+        input_path = legacy.resolve_input_path(
+            None,
+            logs_dir,
+            schema_llm_name,
+            dataset_name,
+            args.schema_method,
+            args.schema_task,
+        )
+    output_path = legacy.resolve_output_path(
+        resolve_project_path(args.output_path) if args.output_path else None,
+        resolve_project_path(args.output_dir) if args.output_dir else None,
+        logs_dir,
+        dataset_name,
+        args.answer_llm_name,
+    )
+    schema_records, unified_sl_payload = load_schema_records(input_path, dataset_name)
+    sl_method = (
+        str(unified_sl_payload["method"])
+        if unified_sl_payload is not None
+        else resolve_sl_method(
+            args.sl_method,
+            input_path=input_path,
+            schema_task=args.schema_task,
+        )
+    )
+    if unified_sl_payload is not None:
+        schema_llm_name = unified_sl_payload["model_names"]["schema_linking"]
+    elif schema_records:
+        native_model = schema_records[0].get("model")
+        if isinstance(native_model, str) and native_model.strip():
+            schema_llm_name = native_model.strip()
+    dataset_index = legacy.load_dataset_index(dataset_path)
+    db_info_index = load_db_info_index(db_info_path)
+    executor_factory = ExecutorFactory(
+        dataset_name=dataset_name,
+        database_root=resolve_project_path(args.database_root) if args.database_root else None,
+        snowflake_credential_path=(
+            resolve_project_path(args.snowflake_credential_path)
+            if args.snowflake_credential_path
+            else None
+        ),
+        timeout_seconds=args.execution_timeout_seconds,
+        max_result_rows=args.max_result_rows,
+    )
+
+    sql_prediction_path = (
+        resolve_project_path(args.sql_prediction_path)
+        if args.sql_prediction_path
+        else build_sql_prediction_path(
+            args.generator_mode,
+            dataset_name,
+            args.answer_llm_name,
+            sl_method,
+            schema_llm_name,
+        )
+    )
+
+    if args.dry_run:
+        tokenizer = FallbackTextTokenizer()
+        renderer = SchemaTextRenderer(tokenizer=tokenizer)
+        schema_store = DbInfoSchemaStore(db_info_index=db_info_index, renderer=renderer)
+        adapter = SchemaLinkingAdapter(
             dataset_name=dataset_name,
             documents_dir=documents_dir,
-        )
-
-        if not question or not predict_db_id:
-            append_log_entry(
-                result_records=result_records,
-                output_path=output_path,
-                run_info=run_info,
-                row=row,
-                source_row=source_row,
-                predict_db_id=predict_db_id,
-                predicted_columns=predicted_columns,
-                predicted_tables=predicted_tables,
-                sql_response_text="",
-                prompt_tokens=0,
-                schema_metadata={"error": "Missing question or predicted database."},
-                efficiency_tracker=efficiency_tracker,
-            )
-            continue
-
-        selected_records, schema_metadata = select_predicted_column_records(
-            db_id=predict_db_id,
-            predicted_columns=predicted_columns,
-            predicted_tables=predicted_tables,
             schema_store=schema_store,
-            include_key_columns=include_key_columns,
-        )
-        if not selected_records:
-            append_log_entry(
-                result_records=result_records,
-                output_path=output_path,
-                run_info=run_info,
-                row=row,
-                source_row=source_row,
-                predict_db_id=predict_db_id,
-                predicted_columns=predicted_columns,
-                predicted_tables=predicted_tables,
-                sql_response_text="",
-                prompt_tokens=0,
-                schema_metadata={**schema_metadata, "error": "No selected schema columns."},
-                efficiency_tracker=efficiency_tracker,
-            )
-            continue
-
-        schema_text = schema_store.render_schema_text(predict_db_id, selected_records)
-        prompt, fitted_schema_text, fitted_hint, prompt_tokens = fit_prompt_to_budget(
-            prompt_template=prompt_template,
-            schema_text=schema_text,
-            question=question,
-            hint=hint,
-            dataset_name=dataset_name,
             sql_dialect=sql_dialect,
+            include_key_columns=args.include_key_columns,
+        )
+        prompt_builder = PromptBuilder(
+            system_template=system_prompt_path.read_text(encoding="utf-8").strip(),
+            tokenizer=tokenizer,
+            renderer=renderer,
+            max_input_length=args.max_input_length,
+            max_history_tokens=args.max_history_tokens,
+            reserved_output_tokens=args.max_generation_num,
+        )
+        run_dry_run(
+            schema_log_records=schema_records,
+            dataset_index=dataset_index,
+            adapter=adapter,
+            executor_factory=executor_factory,
+            prompt_builder=prompt_builder,
+            start_index=args.start_index,
+            limit=args.limit,
+        )
+        return
+
+    initialize_sql_prediction_file(
+        sql_prediction_path,
+        dataset_name=dataset_name,
+        sql_method=args.generator_mode,
+        sql_model_name=args.answer_llm_name,
+        schema_linking_method=sl_method,
+        schema_linking_model_name=schema_llm_name,
+    )
+
+    if args.generator_mode == "one_shot":
+        provider = resolve_provider(args.provider)
+        answer_llm = LLM(
+            model_name=args.answer_llm_name,
+            provider=provider,
+            max_input_length=args.max_input_length,
+            max_generation_num=args.max_generation_num,
+            query_settings=legacy.sql_generation_query_settings(provider),
+            credential_path=(
+                resolve_project_path(args.credential_path)
+                if args.credential_path
+                else None
+            ),
+        )
+        renderer = SchemaTextRenderer(tokenizer=answer_llm.tokenizer)
+        schema_store = DbInfoSchemaStore(db_info_index=db_info_index, renderer=renderer)
+        adapter = SchemaLinkingAdapter(
+            dataset_name=dataset_name,
+            documents_dir=documents_dir,
+            schema_store=schema_store,
+            sql_dialect=sql_dialect,
+            include_key_columns=args.include_key_columns,
+        )
+        processed = run_one_shot_generation(
+            schema_log_records=schema_records,
+            dataset_index=dataset_index,
+            adapter=adapter,
+            prompt_template=prompt_path.read_text(encoding="utf-8").strip(),
+            output_path=output_path,
             answer_llm=answer_llm,
             renderer=renderer,
+            start_index=args.start_index,
+            limit=args.limit,
+            resume=args.resume,
+            sql_prediction_path=sql_prediction_path,
         )
-        schema_metadata = {
-            **schema_metadata,
-            "prompt_tokens": prompt_tokens,
-            "hint_truncated": fitted_hint != hint,
-            "schema_truncated": fitted_schema_text != schema_text,
-        }
-
-        sql_response_text, total_tokens = answer_llm.query_with_usage(prompt)
-        efficiency_tracker.add_llm_total_tokens(total_tokens)
-        append_log_entry(
-            result_records=result_records,
+    else:
+        backend = TransformersChatBackend(
+            model_name=args.answer_llm_name,
+            device=args.device,
+            torch_dtype=args.torch_dtype,
+            attn_implementation=args.attn_implementation,
+            max_input_length=args.max_input_length,
+            max_new_tokens=args.max_generation_num,
+            temperature=args.temperature,
+            random_seed=args.random_seed,
+        )
+        renderer = SchemaTextRenderer(tokenizer=backend.tokenizer)
+        schema_store = DbInfoSchemaStore(db_info_index=db_info_index, renderer=renderer)
+        adapter = SchemaLinkingAdapter(
+            dataset_name=dataset_name,
+            documents_dir=documents_dir,
+            schema_store=schema_store,
+            sql_dialect=sql_dialect,
+            include_key_columns=args.include_key_columns,
+        )
+        prompt_builder = PromptBuilder(
+            system_template=system_prompt_path.read_text(encoding="utf-8").strip(),
+            tokenizer=backend.tokenizer,
+            renderer=renderer,
+            max_input_length=args.max_input_length,
+            max_history_tokens=args.max_history_tokens,
+            reserved_output_tokens=args.max_generation_num,
+        )
+        processed = run_spider_agent_generation(
+            schema_log_records=schema_records,
+            dataset_index=dataset_index,
+            adapter=adapter,
+            executor_factory=executor_factory,
+            prompt_builder=prompt_builder,
+            backend=backend,
             output_path=output_path,
-            run_info=run_info,
-            row=row,
-            source_row=source_row,
-            predict_db_id=predict_db_id,
-            predicted_columns=predicted_columns,
-            predicted_tables=predicted_tables,
-            sql_response_text=sql_response_text,
-            prompt_tokens=prompt_tokens,
-            schema_metadata=schema_metadata,
-            efficiency_tracker=efficiency_tracker,
+            args=args,
+            sql_prediction_path=sql_prediction_path,
         )
-
-    return len(result_records)
-
-
-def main() -> None:
-    args = parse_args()
-
-    dataset_name = args.dataset_name or DATASET_NAME
-    answer_llm_name = args.answer_llm_name or DEFAULT_SQL_LLM_NAME
-    provider = resolve_provider(args.provider or PROVIDER)
-    max_input_length = args.max_input_length or MAX_INPUT_LENGTH
-    max_generation_num = args.max_generation_num or max(MAX_GENERATEION_NUM, DEFAULT_SQL_GENERATION_NUM)
-    logs_dir = args.logs_dir or (PROJECT_ROOT / "Logs")
-    schema_llm_name = args.schema_llm_name or answer_llm_name
-    dataset_root = PROJECT_ROOT / "Data" / dataset_name
-    dataset_path = args.dataset_path or (dataset_root / "gold_sl.json")
-    db_info_path = args.db_info_path or (dataset_root / "db_info.json")
-    documents_dir = args.documents_dir or (dataset_root / "documents")
-    prompt_path = args.prompt_path or DEFAULT_SQL_PROMPT_PATH
-    sql_dialect = args.sql_dialect or default_sql_dialect(dataset_name)
-
-    input_path = resolve_input_path(
-        input_path=args.input_path,
-        logs_dir=logs_dir,
-        schema_llm_name=schema_llm_name,
-        dataset_name=dataset_name,
-        schema_method=args.schema_method,
-        schema_task=args.schema_task,
+    print(
+        f"Completed {processed} records: native={output_path}, "
+        f"standalone={sql_prediction_path}"
     )
-    output_path = resolve_output_path(
-        output_path=args.output_path,
-        output_dir=args.output_dir,
-        logs_dir=logs_dir,
-        dataset_name=dataset_name,
-        model_name=answer_llm_name,
-    )
-    logger, logger_path = setup_task_logger("sql_generation", output_path)
-
-    schema_log_records = load_log_records(input_path)
-    dataset_index = load_dataset_index(dataset_path)
-    prompt_template = prompt_path.read_text(encoding="utf-8").strip()
-    db_info_index = load_db_info_index(db_info_path)
-    run_info = {
-        "task": "sql_generation",
-        "dataset_name": dataset_name,
-        "model": answer_llm_name,
-        "provider": provider,
-        "credential_path": None if args.credential_path is None else str(args.credential_path),
-        "schema_source_model": schema_llm_name,
-        "schema_input_path": str(input_path),
-        "prompt_template": str(prompt_path),
-        "dataset_path": str(dataset_path),
-        "db_info_path": str(db_info_path),
-        "documents_dir": str(documents_dir),
-        "sql_dialect": sql_dialect,
-        "max_input_length": max_input_length,
-        "max_generation_num": max_generation_num,
-        "start_index": args.start_index,
-        "limit": args.limit,
-        "include_key_columns": args.include_key_columns,
-        "created_at": datetime.now().isoformat(timespec="seconds"),
-    }
-
-    log_run_configuration(
-        logger,
-        task_name="SQL Generation",
-        dataset_name=dataset_name,
-        data_count=len(schema_log_records),
-        model_name=answer_llm_name,
-        provider=provider,
-        result_path=output_path,
-        extra_fields={
-            "Schema input path": input_path,
-            "Schema source model": schema_llm_name,
-            "Credential path": args.credential_path,
-            "Schema method": args.schema_method,
-            "Schema task": args.schema_task,
-            "Prompt template": prompt_path,
-            "Dataset path": dataset_path,
-            "DB info path": db_info_path,
-            "Documents dir": documents_dir,
-            "SQL dialect": sql_dialect,
-            "Max input length": max_input_length,
-            "Max generation num": max_generation_num,
-            "Start index": args.start_index,
-            "Limit": args.limit,
-            "Include key columns": args.include_key_columns,
-            "Logger path": logger_path,
-        },
-    )
-
-    answer_llm = LLM(
-        model_name=answer_llm_name,
-        provider=provider,
-        max_input_length=max_input_length,
-        max_generation_num=max_generation_num,
-        query_settings=sql_generation_query_settings(provider),
-        credential_path=args.credential_path,
-    )
-    renderer = SchemaTextRenderer(tokenizer=answer_llm.tokenizer)
-    schema_store = DbInfoSchemaStore(
-        db_info_index=db_info_index,
-        renderer=renderer,
-    )
-
-    processed_count = run_sql_generation(
-        schema_log_records=schema_log_records,
-        dataset_index=dataset_index,
-        dataset_name=dataset_name,
-        documents_dir=documents_dir,
-        prompt_template=prompt_template,
-        output_path=output_path,
-        schema_store=schema_store,
-        renderer=renderer,
-        answer_llm=answer_llm,
-        run_info=run_info,
-        sql_dialect=sql_dialect,
-        start_index=args.start_index,
-        limit=args.limit,
-        include_key_columns=args.include_key_columns,
-    )
-    logger.info("Completed %s records.", processed_count)
 
 
 if __name__ == "__main__":

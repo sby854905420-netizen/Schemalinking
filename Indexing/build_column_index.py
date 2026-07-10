@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a Qdrant column-level vector index directly from dataset-specific db_info.json files."""
+"""Build a Qdrant column-level vector index from a dataset's db_info.json."""
 
 from __future__ import annotations
 
@@ -18,6 +18,12 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from Llm.embedding_model_loader import EmbeddingModelLoader
 from Utils.render_tools import SchemaTextRenderer
+from Utils.tools import (
+    build_foreign_key_map,
+    clean_text,
+    flatten_primary_keys,
+    get_indexed_value,
+)
 
 MAX_EMBEDDING_INPUT_TOKENS = 8096
 
@@ -27,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--db-info-path",
         type=Path,
-        default=PROJECT_ROOT / "Data" / DATASET_NAME / "db_info.json",
+        default=DEFAULT_DB_INFO_PATH,
         help="Path to the dataset db_info.json file.",
     )
     parser.add_argument(
@@ -49,7 +55,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cache-dir",
         type=Path,
-        default=PROJECT_ROOT / "Llm" / "cache",
+        default=MODEL_CACHE_ROOT,
         help="Embedding model cache directory.",
     )
     parser.add_argument("--batch-size", type=int, default=32, help="Embedding batch size.")
@@ -78,7 +84,7 @@ def resolve_collection_name(collection_name: str | None, db_info_path: Path) -> 
 
 def resolve_qdrant_path(qdrant_path: Path | None, db_info_path: Path) -> Path:
     if qdrant_path is not None:
-        return qdrant_path
+        return resolve_project_path(qdrant_path)
     return db_info_path.parent / "qdrant_column_index"
 
 
@@ -90,24 +96,6 @@ def load_db_infos(db_info_path: Path) -> list[dict[str, Any]]:
         raise TypeError(f"Expected db_info.json to contain a list, got {type(db_infos)!r}")
 
     return [entry for entry in db_infos if isinstance(entry, dict)]
-
-
-def clean_text(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value.strip()
-    if isinstance(value, (dict, list)):
-        return json.dumps(value, ensure_ascii=False, sort_keys=True)
-    return str(value).strip()
-
-
-def get_indexed_value(values: Any, index: int, default: Any = None) -> Any:
-    if not isinstance(values, list):
-        return default
-    if index < 0 or index >= len(values):
-        return default
-    return values[index]
 
 
 def build_sample_values(
@@ -135,39 +123,6 @@ def build_sample_values(
         values.append(value)
 
     return values
-
-
-def flatten_primary_keys(primary_keys: Any) -> set[int]:
-    primary_key_indices: set[int] = set()
-    if not isinstance(primary_keys, list):
-        return primary_key_indices
-
-    for entry in primary_keys:
-        if isinstance(entry, list):
-            for index in entry:
-                if isinstance(index, int):
-                    primary_key_indices.add(index)
-            continue
-        if isinstance(entry, int):
-            primary_key_indices.add(entry)
-
-    return primary_key_indices
-
-
-def build_foreign_key_map(foreign_keys: Any) -> dict[int, int]:
-    foreign_key_map: dict[int, int] = {}
-    if not isinstance(foreign_keys, list):
-        return foreign_key_map
-
-    for entry in foreign_keys:
-        if not isinstance(entry, list) or len(entry) != 2:
-            continue
-        source_idx, target_idx = entry
-        if not isinstance(source_idx, int) or not isinstance(target_idx, int):
-            continue
-        foreign_key_map[source_idx] = target_idx
-
-    return foreign_key_map
 
 
 def build_foreign_key_text(
@@ -360,7 +315,7 @@ def truncate_text_by_tokens(text: str, tokenizer, max_tokens: int) -> tuple[str,
 
 
 def build_index(args: argparse.Namespace) -> None:
-    db_info_path = args.db_info_path.resolve()
+    db_info_path = resolve_project_path(args.db_info_path).resolve()
     if not db_info_path.is_file():
         raise FileNotFoundError(f"db_info.json file does not exist: {db_info_path}")
 
@@ -374,7 +329,7 @@ def build_index(args: argparse.Namespace) -> None:
 
     embedder = EmbeddingModelLoader(
         model_name=args.model_name,
-        cache_dir=str(args.cache_dir),
+        cache_dir=str(resolve_project_path(args.cache_dir)),
         device=args.device,
         trust_remote_code=True,
     )
