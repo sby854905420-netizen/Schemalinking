@@ -1,4 +1,4 @@
-# Schemalinking
+# MDB-link
 
 本仓库实现了一个两阶段的 schema linking 流程：
 

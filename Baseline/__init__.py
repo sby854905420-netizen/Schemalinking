@@ -1,1 +1,1 @@
-"""Baseline modules for Schemalinking."""
+"""Baseline modules for MDB-link."""
