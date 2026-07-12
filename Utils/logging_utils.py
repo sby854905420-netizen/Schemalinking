@@ -1,13 +1,28 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from config import LOGS_ROOT
+from Utils.prediction_store import safe_path_component
 
-def setup_task_logger(task_name: str, result_path: Path) -> tuple[logging.Logger, Path]:
-    log_file_path = result_path.with_suffix(".log")
-    logger_name = f"{task_name}.{result_path.stem}"
+
+def build_run_log_path(task_name: str, dataset_name: str, model_name: str) -> Path:
+    """Return a timestamped text-log path; Logs never contain prediction JSON."""
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    directory = LOGS_ROOT / safe_path_component(model_name) / safe_path_component(task_name)
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / f"{safe_path_component(task_name)}_{safe_path_component(dataset_name)}_{run_id}.log"
+
+
+def setup_task_logger(task_name: str, log_file_path: Path) -> tuple[logging.Logger, Path]:
+    """Create a console/file logger for an explicit runtime ``.log`` path."""
+    if log_file_path.suffix != ".log":
+        raise ValueError(f"Runtime log path must end in .log: {log_file_path}")
+    log_file_path.parent.mkdir(parents=True, exist_ok=True)
+    logger_name = f"{task_name}.{log_file_path.stem}"
     logger = logging.getLogger(logger_name)
 
     if logger.handlers:

@@ -17,8 +17,6 @@ MODEL_CACHE_ROOT = PROJECT_ROOT / "Llm" / "cache"
 OPENAI_CREDENTIAL_PATH = PROJECT_ROOT / "gpt_credential.json"
 SNOWFLAKE_CREDENTIAL_PATH = PROJECT_ROOT / "snowflake_credential.json"
 
-DATABASE_RETRIEVAL_DIR_NAME = "database_retrieval"
-LEGACY_DATABASE_RETRIEVAL_DIR_NAME = "Database_Retrival"
 
 
 def dataset_root(dataset_name: str) -> Path:

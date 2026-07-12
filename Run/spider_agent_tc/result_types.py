@@ -46,4 +46,4 @@ class AgentResult:
     execution_verified: bool
     rounds: int = 0
     error: str = ""
-    messages: tuple[dict[str, str], ...] = field(default_factory=tuple, repr=False)
+    messages: tuple[dict[str, Any], ...] = field(default_factory=tuple, repr=False)

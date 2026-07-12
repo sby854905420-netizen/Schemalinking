@@ -27,6 +27,7 @@ class TransformersChatBackend:
         max_new_tokens: int = 4096,
         temperature: float = 0.0,
         random_seed: int = 42,
+        tools: Sequence[Mapping[str, Any]] | None = None,
     ) -> None:
         try:
             import torch
@@ -56,6 +57,7 @@ class TransformersChatBackend:
         self.max_new_tokens = int(max_new_tokens)
         self.temperature = float(temperature)
         self.random_seed = int(random_seed)
+        self.tools = tuple(deepcopy(dict(tool)) for tool in (tools or ()))
         self._generation_lock = threading.Lock()
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
@@ -72,10 +74,11 @@ class TransformersChatBackend:
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-    def _model_inputs(self, messages: Sequence[Mapping[str, str]]) -> dict[str, Any]:
+    def _model_inputs(self, messages: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         try:
             inputs = self.tokenizer.apply_chat_template(
                 list(messages),
+                tools=list(self.tools),
                 tokenize=True,
                 add_generation_prompt=True,
                 return_dict=True,
@@ -84,6 +87,7 @@ class TransformersChatBackend:
         except TypeError:
             input_ids = self.tokenizer.apply_chat_template(
                 list(messages),
+                tools=list(self.tools),
                 tokenize=True,
                 add_generation_prompt=True,
                 return_tensors="pt",
@@ -98,9 +102,12 @@ class TransformersChatBackend:
             inputs["attention_mask"] = self.torch.ones_like(inputs["input_ids"])
         return inputs
 
-    def count_messages_tokens(self, messages: Sequence[Mapping[str, str]]) -> int:
+    def count_messages_tokens(self, messages: Sequence[Mapping[str, Any]]) -> int:
         token_ids = self.tokenizer.apply_chat_template(
-            list(messages), tokenize=True, add_generation_prompt=True
+            list(messages),
+            tools=list(self.tools),
+            tokenize=True,
+            add_generation_prompt=True,
         )
         if hasattr(token_ids, "shape"):
             return int(token_ids.shape[-1])
@@ -108,7 +115,7 @@ class TransformersChatBackend:
 
     def generate(
         self,
-        messages: Sequence[Mapping[str, str]],
+        messages: Sequence[Mapping[str, Any]],
         generation_config: Mapping[str, Any] | None = None,
     ) -> str:
         inputs = self._model_inputs(messages)
@@ -121,6 +128,7 @@ class TransformersChatBackend:
 
         kwargs = deepcopy(dict(generation_config or {}))
         temperature = float(kwargs.pop("temperature", self.temperature))
+        seed_offset = int(kwargs.pop("seed_offset", 0))
         kwargs.setdefault("max_new_tokens", self.max_new_tokens)
         kwargs.setdefault("pad_token_id", self.tokenizer.pad_token_id)
         kwargs.setdefault("eos_token_id", self.tokenizer.eos_token_id)
@@ -133,9 +141,10 @@ class TransformersChatBackend:
             kwargs.pop("top_k", None)
 
         with self._generation_lock:
-            self.torch.manual_seed(self.random_seed)
+            generation_seed = self.random_seed + seed_offset
+            self.torch.manual_seed(generation_seed)
             if self.device.startswith("cuda"):
-                self.torch.cuda.manual_seed_all(self.random_seed)
+                self.torch.cuda.manual_seed_all(generation_seed)
             with self.torch.inference_mode():
                 outputs = self.model.generate(**inputs, use_cache=True, **kwargs)
         generated = outputs[0, input_length:]

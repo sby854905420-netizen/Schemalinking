@@ -148,7 +148,7 @@ python -m Baseline.baseline_schema_linking \
   --provider transformers
 ```
 
-`baseline_schema_linking.py` 如果不传 `--input-path`，会自动在 `Logs/<answer_llm_name>/database_retrieval/` 下寻找当前数据集最近一次数据库检索结果。
+数据库检索把运行期文本写入 `Logs/`，稳定预测写入 `results/db/baseline/<dataset>/<model>/prediction.json`。`baseline_schema_linking.py` 只读取后者，不会扫描 `Logs/`。
 
 ### 3.3 检索增强流程
 
@@ -168,6 +168,8 @@ python -m Run.table_to_column \
   --provider transformers
 ```
 
+默认衔接文件为 `results/db/global_coarse_rerank/<dataset>/<model>/prediction.json`。如果粗检索使用 `--db-selection-mode pruning`，Schema Linking 需要相应传入 `--database-method global_coarse_pruning`。
+
 `global_coarse_retrieval.py` 的粗检索逻辑：
 
 1. 对问题做 embedding，检索全局高相关列。
@@ -175,41 +177,47 @@ python -m Run.table_to_column \
 3. 对候选数据库逐个构造二分类 prompt，通过 yes/no 下一 token 概率重排。
 4. 如果第一轮候选数大于 `--candidate-db-top-k`，会在 top-k 数据库内再做一轮召回、剪枝和重排。
 
-### 3.4 手动指定上一步结果
+### 3.4 指定数据库预测方法或文件
 
-两个 Schema Linking 脚本都支持显式传入数据库检索结果：
+数据库预测模型与 Schema Linking 模型不同时，使用独立的 `--database-model-name`，不再依赖 Schema Linking 模型名定位输入：
 
 ```bash
-python -m Baseline.baseline_schema_linking \
-  --method few_shot \
-  --input-path Logs/mistralai/Ministral-3-8B-Instruct-2512/database_retrieval/iterative_database_retrieval_MMQA_20260416_120000.json
-
 python -m Run.table_to_column \
   --method few_shot \
-  --input-path Logs/mistralai/Ministral-3-8B-Instruct-2512/database_retrieval/iterative_database_retrieval_MMQA_20260416_120000.json
+  --answer-llm-name mistralai/Ministral-3-14B-Instruct-2512 \
+  --database-method global_coarse_rerank \
+  --database-model-name mistralai/Ministral-3-8B-Instruct-2512
 ```
 
-连续跑不同模型或不同数据集时，建议显式指定 `--input-path`，避免自动读取到旧结果。
+`--input-path` 可显式读取某个统一 DB prediction，并具有最高优先级；旧的 Logs JSON 格式不再接受。
 
 ## 4. 输出文件
 
-各阶段脚本都会生成 `.json` 结果文件；检索与 Schema Linking 脚本还会通过 [`Utils/logging_utils.py`](Utils/logging_utils.py) 生成同名 `.log` 日志文件。
+各阶段的 `.json` 预测全部写入 `results/`；检索与 Schema Linking 脚本还会通过 [`Utils/logging_utils.py`](Utils/logging_utils.py) 在 `Logs/` 生成独立的 `.log` 文本日志。
 
 | 脚本 | 默认输出位置 |
 | --- | --- |
-| `baseline_database_retrieval.py` | `Logs/<answer_llm_name>/database_retrieval/baseline_database_retrieval_<dataset>_<timestamp>.json` |
-| `global_coarse_retrieval.py` | `Logs/<answer_llm_name>/database_retrieval/iterative_database_retrieval_<dataset>_<timestamp>.json` |
-| `baseline_schema_linking.py` | `Logs/<answer_llm_name>/<method>_baseline_schema_linking_<dataset>_<timestamp>.json` |
-| `table_to_column.py` | `Logs/<answer_llm_name>/<method>_table2column_<dataset>_<timestamp>.json` |
-| `sql_generator.py` | 原生兼容输出：`Logs/sql_results/<dataset>/<model>/sql_generation_<dataset>_<timestamp>.json`；统一输出：`results/sql/<sql_method>/<dataset>/<sql_model>/<sl_method>/<sl_model>.json` |
+| `baseline_database_retrieval.py` | `results/db/baseline/<dataset>/<model>/prediction.json` |
+| `global_coarse_retrieval.py` | `results/db/global_coarse_<mode>/<dataset>/<model>/prediction.json` |
+| `baseline_schema_linking.py` | `results/sl/prompt_baseline/<dataset>/<model>/prediction.json` |
+| `table_to_column.py` | `results/sl/table_to_column/<dataset>/<model>/prediction.json` |
+| `rag_column_retrieval.py` | `results/sl/rag_column_retrieval/<dataset>/<model>/prediction.json` |
+| `sql_generator.py` | `results/sql/<sql_method>/<dataset>/<sql_model>/<sl_method>/<sl_model>.json` |
 
 说明：
 
-- `<answer_llm_name>` 会按模型名原样展开。
-- 如果模型名包含 `/`，例如 `mistralai/Ministral-3-8B-Instruct-2512`，日志目录会自然变成多级路径。
-- 检索与 Schema Linking 输出记录包含 `efficiency` 字段；SQL 预测文件按 EX 契约只保留 4 个最小字段。
+- 模型名中的 `/` 会被安全转换为 `__`，不会产生意外的多级预测目录。
+- `Logs/` 仅包含 `.log` 文本，不包含任何供下游消费的预测结果。
 
-上述 `Logs/` 文件是保留的 MDBlink 原生输出。Schema Linking 完成后还会立即写入统一、原子更新的结果：
+数据库检索写入统一、原子更新的预测：
+
+```text
+results/db/<db_method>/<dataset>/<db_model>/prediction.json
+```
+
+其中 `db_method` 为 `baseline`、`global_coarse_rerank` 或 `global_coarse_pruning`。
+
+Schema Linking 完成后会写入：
 
 ```text
 results/sl/<sl_method>/<dataset>/<sl_model>/prediction.json
@@ -221,16 +229,6 @@ SQL 统一结果独立保存，不修改 Schema Linking 文件：
 
 ```text
 results/sql/<sql_method>/<dataset>/<sql_model>/<sl_method>/<sl_model>.json
-```
-
-离线转换已有原生日志的示例：
-
-```bash
-python -m Run.export_prediction \
-  --dataset-name MMQA \
-  --method table_to_column \
-  --database-results Logs/<model>/database_retrieval/iterative_database_retrieval_MMQA_<timestamp>.json \
-  --schema-results Logs/<model>/few_shot_table2column_MMQA_<timestamp>.json
 ```
 
 SQL generator 可通过 `--input-path` 直接读取统一 SL 文件，也可同时指定 `--sl-method` 和 `--schema-llm-name` 使用默认统一路径。
@@ -267,6 +265,7 @@ SQL generator 可通过 `--input-path` 直接读取统一 SL 文件，也可同�
 | `--max-input-length` | 最大输入 token 数 | `MAX_INPUT_LENGTH` |
 | `--max-generation-num` | 最大生成 token 数 | `MAX_GENERATEION_NUM` |
 | `--database-schema-path` | 数据库摘要文件路径 | `Data/<dataset>/Database_schemas_summary.json` |
+| `--prediction-path` | 统一 DB prediction 输出路径 | `results/db/baseline/<dataset>/<model>/prediction.json` |
 
 固定输入为 `Data/<dataset>/gold_sl.json`，固定 prompt 模板为 `Templates/zero_shot/find_relevant_database_baseline.txt`。
 
@@ -280,7 +279,7 @@ SQL generator 可通过 `--input-path` 直接读取统一 SL 文件，也可同�
 | `--answer-llm-name` | LLM 名称 | `ANSWER_LLM_NAME` |
 | `--provider` | 当前实际需要 `transformers` | `PROVIDER` |
 | `--input-path` | 输入样本文件路径 | `Data/<dataset>/gold_sl.json` |
-| `--output-path` | 结果输出路径 | 自动生成 |
+| `--prediction-path` | 统一 DB prediction 输出路径 | `results/db/global_coarse_<mode>/<dataset>/<model>/prediction.json` |
 | `--max-input-length` | 最大输入 token 数 | `MAX_INPUT_LENGTH` |
 | `--max-generation-num` | 最大生成 token 数 | `MAX_GENERATEION_NUM` |
 | `--candidate-db-top-k` | 第一轮重排后保留的候选数据库数量 | `CANDIDATE_DB_TOP_K` |
@@ -305,10 +304,11 @@ SQL generator 可通过 `--input-path` 直接读取统一 SL 文件，也可同�
 | `--provider` | 当前实际需要 `transformers` | `PROVIDER` |
 | `--max-input-length` | 最大输入 token 数 | `MAX_INPUT_LENGTH` |
 | `--max-generation-num` | 最大生成 token 数 | `MAX_GENERATEION_NUM` |
-| `--input-path` | 数据库检索结果路径 | 自动寻找最新结果 |
-| `--logs-dir` | 日志根目录，用于自动寻找输入 | `PROJECT_ROOT/Logs` |
+| `--input-path` | 显式数据库预测路径，优先级最高 | 未设置 |
+| `--database-method` | 统一数据库预测方法 | `baseline` |
+| `--database-model-name` | 数据库预测模型 | 与 `--answer-llm-name` 相同 |
 | `--db-info-path` | `db_info.json` 路径 | `Data/<dataset>/db_info.json` |
-| `--output-path` | 输出文件路径 | 自动生成 |
+| `--prediction-path` | 统一 SL prediction 输出路径 | `results/sl/prompt_baseline/<dataset>/<model>/prediction.json` |
 
 补充说明：
 
@@ -329,11 +329,12 @@ SQL generator 可通过 `--input-path` 直接读取统一 SL 文件，也可同�
 | `--provider` | 当前实际需要 `transformers` | `PROVIDER` |
 | `--max-input-length` | 最大输入 token 数 | `MAX_INPUT_LENGTH` |
 | `--max-generation-num` | 最大生成 token 数 | `MAX_GENERATEION_NUM` |
-| `--input-path` | 数据库检索结果路径 | 自动寻找最新结果 |
-| `--logs-dir` | 日志根目录，用于自动寻找输入 | `PROJECT_ROOT/Logs` |
+| `--input-path` | 显式数据库预测路径，优先级最高 | 未设置 |
+| `--database-method` | 统一数据库预测方法 | `global_coarse_rerank` |
+| `--database-model-name` | 数据库预测模型 | 与 `--answer-llm-name` 相同 |
 | `--db-info-path` | `db_info.json` 路径 | `Data/<dataset>/db_info.json` |
 | `--qdrant-path` | 本地 Qdrant 索引目录 | `Data/<dataset>/qdrant_column_index` |
-| `--output-path` | 输出文件路径 | 自动生成 |
+| `--prediction-path` | 统一 SL prediction 输出路径 | `results/sl/table_to_column/<dataset>/<model>/prediction.json` |
 
 补充说明：
 
@@ -342,10 +343,13 @@ SQL generator 可通过 `--input-path` 直接读取统一 SL 文件，也可同�
 - 列级 prompt 使用 `Templates/<method>/extract_relevant_columns.txt`。
 - 表筛选阶段会优先尝试渲染完整目标数据库；如果 prompt 超过预算，会用 Qdrant 排名结果裁剪 schema。
 - 列筛选阶段会优先使用预测相关表中的全部列；如果仍超预算，会回退到表筛选阶段已经裁剪过的列集合。
+- 使用 `--disable-table-filtering` 时，预测写入 `results/ablation/wo_table_filtering/sl/table_to_column/<dataset>/<model>/prediction.json`，不会覆盖标准结果。
 
 ## 6. SQL Generator：Spider-Agent-TC 与 one-shot 对比
 
 [`Run/sql_generator.py`](Run/sql_generator.py) 默认使用 `spider_agent_tc`：Qwen3-Coder 先输出 XML tool call，执行候选 SQL，再根据 SQLite/Snowflake 返回的样例行或错误迭代修正，最后以 `terminate` 提交 SQL。原有一次提示、一次生成的完整实现保留在 [`Run/one_shot_sql_generator.py`](Run/one_shot_sql_generator.py)，可通过 `--generator-mode one_shot` 继续运行并做消融对比。两种模式共享同一个 `SchemaLinkingAdapter`，只接收 `predict_db_id`、`predict_tables` 和 `predict_columns` 指定的 schema。
+
+Spider-Agent-TC 会把当前数据集的执行函数和 `terminate` 作为原生 tools 传入 Qwen chat template，并用结构化 tool-call/tool-response 消息维护多轮历史。协议保持严格：不带 `<tool_call>` 的裸 SQL 或 Markdown SQL 不会作为候选查询执行。未通过 `terminate` 验证的运行会在统一 SQL 预测文件旁写入 `<stem>_agent_failures.json`，保存逐轮原始回复和错误，同时不改变预测文件的 schema。
 
 主实验配置固定为 `Qwen/Qwen3-Coder-30B-A3B-Instruct`、Transformers BF16、单张 A100 80GB、`cuda:0`、SDPA、输入上限 24576 tokens、输出上限 4096 tokens。默认最多 10 个 Agent round，每次模型调用失败后额外重试 2 次；Spider2、MMQA 和 BIRD 使用同一套生成超参数。
 
@@ -360,7 +364,7 @@ Spider2 示例：
 python -m Run.sql_generator \
   --dataset-name Spider2 \
   --generator-mode spider_agent_tc \
-  --input-path <schema_linking_log.json> \
+  --input-path <results/sl/.../prediction.json> \
   --snowflake-credential-path <snowflake_credential.json> \
   --resume
 ```
@@ -371,20 +375,20 @@ MMQA 示例：
 python -m Run.sql_generator \
   --dataset-name MMQA \
   --generator-mode spider_agent_tc \
-  --input-path <schema_linking_log.json> \
+  --input-path <results/sl/.../prediction.json> \
   --database-root Data/MMQA/Sqlite_database \
   --resume
 ```
 
 运行旧方法时只需改为 `--generator-mode one_shot`。`--dry-run --limit 1` 只检查输入、Adapter、executor 路由和 prompt 预算，不加载 30B 模型，也不连接数据库。
 
-预测文件保留顶层 `results`，每条记录严格只有 `id`、`predict_db_id`、`predict_sql`、`status`。`status` 为 `success`、`empty` 或 `failed`；执行是否正确仍由独立 EX evaluator 根据 `id` 回查 gold 数据。结果逐样本原子写入，`--resume` 会按稳定 id 跳过已经完成的记录。
+SQL 预测文件使用统一 `predictions` 契约，每条记录包含 `id`、`predicted_sql`、`status` 和 `error`。结果逐样本原子写入，`--resume` 会按稳定 id 跳过已经完成的记录。
 
 ## 7. 常见注意事项
 
 1. `build_column_index.py` 可通过 `--model-name` 指定 embedding 模型，但查询阶段使用 [`config.py`](config.py) 中的 `EMBEDDING_MODEL_NAME`，两者应保持一致。
 2. `global_coarse_retrieval.py` 当前没有读取 Qdrant `meta.json`，collection 名必须和 `--dataset-name` 一致。
-3. `baseline_schema_linking.py` 和 `table_to_column.py` 默认会回溯最近一次数据库检索结果；实验较多时建议显式传入 `--input-path`。
+3. `baseline_schema_linking.py` 和 `table_to_column.py` 只读取 `results/db` 或显式统一输入；跨模型组合请传入 `--database-model-name`。
 4. `Spider2` 的 hint 读取方式和其他数据集不同：`external_knowledge` 会优先作为文档文件名解析。
 5. 如果使用 `openai` provider，可以导出 `OPENAI_API_KEY`，或通过 `OPENAI_CREDENTIAL_PATH` / `--credential-path` 指向 JSON 凭据文件；代码不会自动加载 `.env`。
 6. 当前环境若缺少依赖，甚至 `--help` 也可能因为顶层 import 失败而无法打印；请先完成 `pip install -r requirements.txt`。

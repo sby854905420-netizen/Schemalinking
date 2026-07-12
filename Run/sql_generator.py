@@ -8,7 +8,6 @@ from typing import Any
 
 from config import *
 from Llm.llm_loader import FallbackTextTokenizer, LLM, resolve_provider
-from Utils.json_utils import atomic_write_json
 from Utils.prediction_store import (
     METHOD_NAMES,
     build_prediction_path,
@@ -18,17 +17,21 @@ from Utils.prediction_store import (
 from Run import one_shot_sql_generator as legacy
 from Run.spider_agent_tc.agent import SpiderAgentTC
 from Run.spider_agent_tc.executors.factory import ExecutorFactory, executor_route_for_dataset
-from Run.spider_agent_tc.prompt_builder import PromptBuilder
+from Run.spider_agent_tc.prompt_builder import PromptBuilder, build_tool_schemas
 from Run.spider_agent_tc.schema_adapter import SchemaLinkingAdapter
 from Run.spider_agent_tc.transformers_backend import TransformersChatBackend
+from Run.spider_agent_tc.trace_store import write_agent_failure_trace
 from Utils.render_tools import SchemaTextRenderer
 from Utils.schema_selection import DbInfoSchemaStore
 from Utils.tools import load_db_info_index
 from Utils.value_utils import get_row_value
+from Utils.artifact_paths import reject_logs_prediction_input, require_results_output
 from Utils.sql_prediction_store import (
     build_sql_prediction_path,
     initialize_sql_prediction_file,
+    replace_sql_predictions,
     upsert_sql_prediction,
+    validate_sql_prediction_file,
 )
 
 
@@ -53,7 +56,7 @@ def _console_error(exc: Exception) -> str:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate SQL from MDB-Link schema-linking prediction logs."
+        description="Generate SQL from unified MDB-Link schema-linking predictions."
     )
     parser.add_argument("--dataset-name", type=str, default=None)
     parser.add_argument(
@@ -92,27 +95,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--schema-llm-name", type=str, default=None)
     parser.add_argument(
         "--sl-method",
-        choices=("auto", *sorted(METHOD_NAMES)),
-        default="auto",
+        choices=sorted(METHOD_NAMES),
+        default="table_to_column",
     )
-    parser.add_argument(
-        "--schema-method",
-        choices=("auto", *sorted(legacy.SUPPORTED_SCHEMA_METHODS)),
-        default="auto",
-    )
-    parser.add_argument(
-        "--schema-task",
-        choices=("auto", *sorted(legacy.SUPPORTED_SCHEMA_TASKS)),
-        default="auto",
-    )
-    parser.add_argument("--logs-dir", type=Path, default=None)
     parser.add_argument("--db-info-path", type=Path, default=None)
     parser.add_argument("--dataset-path", type=Path, default=None)
     parser.add_argument("--documents-dir", type=Path, default=None)
     parser.add_argument("--prompt-path", type=Path, default=None)
     parser.add_argument("--system-prompt-path", type=Path, default=None)
-    parser.add_argument("--output-dir", type=Path, default=None)
-    parser.add_argument("--output-path", type=Path, default=None)
     parser.add_argument("--sql-prediction-path", type=Path, default=None)
     parser.add_argument("--sql-dialect", type=str, default=None)
     parser.add_argument("--start-index", type=int, default=0)
@@ -155,34 +145,13 @@ def minimal_result(
     }
 
 
-def write_result_file(
-    output_path: Path,
-    run_info_or_records: dict[str, Any] | list[dict[str, Any]],
-    result_records: list[dict[str, Any]] | None = None,
-) -> None:
-    """Atomically persist only the fields consumed by EX evaluation.
-
-    The legacy three-argument call remains accepted, but run_info is no longer
-    written into the prediction artifact.
-    """
-
-    records = result_records if result_records is not None else run_info_or_records
-    if not isinstance(records, list):
-        raise TypeError("result_records must be a list")
-    atomic_write_json(output_path, {"results": records})
-
-
-def load_resume_records(output_path: Path, resume: bool) -> list[dict[str, Any]]:
-    if not resume or not output_path.is_file():
+def load_resume_records(prediction_path: Path, resume: bool) -> list[dict[str, Any]]:
+    if not resume or not prediction_path.is_file():
         return []
-    payload = legacy.load_json(output_path)
-    if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
-        raise ValueError(f"Cannot resume invalid SQL result file: {output_path}")
+    payload = validate_sql_prediction_file(prediction_path)
     records: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for raw in payload["results"]:
-        if not isinstance(raw, dict):
-            continue
+    for raw in payload["predictions"]:
         sample_id = str(raw.get("id", "")).strip()
         status = str(raw.get("status", "")).strip()
         if not sample_id or status not in COMPLETED_STATUSES or sample_id in seen:
@@ -191,8 +160,8 @@ def load_resume_records(output_path: Path, resume: bool) -> list[dict[str, Any]]
         records.append(
             minimal_result(
                 sample_id,
-                raw.get("predict_db_id"),
-                str(raw.get("predict_sql") or ""),
+                None,
+                str(raw.get("predicted_sql") or ""),
                 status,
             )
         )
@@ -228,37 +197,17 @@ def _failure_record(
     )
 
 
-def resolve_sl_method(
-    requested: str,
-    *,
-    input_path: Path | None = None,
-    schema_task: str = "auto",
-) -> str:
-    if requested != "auto":
-        return requested
-    path_text = str(input_path or "").lower()
-    if "rag_column_retrieval" in path_text or "rag_baseline" in path_text:
-        return "rag_column_retrieval"
-    if schema_task == "baseline_schema_linking" or "baseline_schema_linking" in path_text:
-        return "prompt_baseline"
-    return "table_to_column"
-
-
-def load_schema_records(path: Path, dataset_name: str) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+def load_schema_records(path: Path, dataset_name: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     payload = legacy.load_json(path)
-    if isinstance(payload, list):
-        return [record for record in payload if isinstance(record, dict)], None
     unified = validate_prediction_file(payload)
     return unified_to_native_schema_records(unified, dataset_name), unified
 
 
-def _write_standalone_sql(
-    prediction_path: Path | None,
+def _write_sql_prediction(
+    prediction_path: Path,
     record: Mapping[str, Any],
     error: str | None,
 ) -> None:
-    if prediction_path is None:
-        return
     upsert_sql_prediction(
         prediction_path,
         sample_id=record["id"],
@@ -270,25 +219,22 @@ def _write_standalone_sql(
 
 def run_one_shot_generation(
     *,
-    schema_log_records: Sequence[dict[str, Any]],
+    schema_records: Sequence[dict[str, Any]],
     dataset_index: dict[str, dict[str, Any]],
     adapter: SchemaLinkingAdapter,
     prompt_template: str,
-    output_path: Path,
     answer_llm: LLM,
     renderer: SchemaTextRenderer,
     start_index: int,
     limit: int | None,
     resume: bool,
-    sql_prediction_path: Path | None = None,
+    sql_prediction_path: Path,
 ) -> int:
     from tqdm import tqdm
 
-    records = load_resume_records(output_path, resume)
-    for record in records:
-        _write_standalone_sql(sql_prediction_path, record, None)
+    records = load_resume_records(sql_prediction_path, resume)
     completed = {record["id"] for record in records}
-    for index, row in tqdm(_selected_rows(schema_log_records, start_index, limit)):
+    for index, row in tqdm(_selected_rows(schema_records, start_index, limit)):
         fallback_id = f"row:{index}"
         source = _source_row(row, dataset_index)
         raw_id = get_row_value(row, "id", "instance_id")
@@ -322,30 +268,26 @@ def run_one_shot_generation(
             record = _failure_record(row, source, fallback_id)
         records.append(record)
         completed.add(record["id"])
-        write_result_file(output_path, records)
-        _write_standalone_sql(sql_prediction_path, record, error_message)
+        _write_sql_prediction(sql_prediction_path, record, error_message)
     return len(records)
 
 
 def run_spider_agent_generation(
     *,
-    schema_log_records: Sequence[dict[str, Any]],
+    schema_records: Sequence[dict[str, Any]],
     dataset_index: dict[str, dict[str, Any]],
     adapter: SchemaLinkingAdapter,
     executor_factory: ExecutorFactory,
     prompt_builder: PromptBuilder,
     backend: TransformersChatBackend,
-    output_path: Path,
     args: argparse.Namespace,
-    sql_prediction_path: Path | None = None,
+    sql_prediction_path: Path,
 ) -> int:
     from tqdm import tqdm
 
-    records = load_resume_records(output_path, args.resume)
-    for record in records:
-        _write_standalone_sql(sql_prediction_path, record, None)
+    records = load_resume_records(sql_prediction_path, args.resume)
     completed = {record["id"] for record in records}
-    for index, row in tqdm(_selected_rows(schema_log_records, args.start_index, args.limit)):
+    for index, row in tqdm(_selected_rows(schema_records, args.start_index, args.limit)):
         fallback_id = f"row:{index}"
         source = _source_row(row, dataset_index)
         raw_id = get_row_value(row, "id", "instance_id")
@@ -358,7 +300,7 @@ def run_spider_agent_generation(
             agent_input = adapter.adapt(row, source, fallback_sample_id=fallback_id)
             executor = executor_factory.create(agent_input.predict_db_id)
             best = None
-            for _ in range(args.rollout_number):
+            for rollout_index in range(args.rollout_number):
                 candidate = SpiderAgentTC(
                     backend=backend,
                     executor=executor,
@@ -366,13 +308,40 @@ def run_spider_agent_generation(
                     max_agent_rounds=args.max_agent_rounds,
                     max_llm_retries=args.max_llm_retries,
                     max_observation_chars=args.max_observation_chars,
-                    generation_config={"temperature": args.temperature},
+                    generation_config={
+                        "temperature": args.temperature,
+                        "seed_offset": rollout_index,
+                    },
                 ).run(agent_input)
-                if best is None or candidate.execution_verified:
+                candidate_rank = (
+                    int(candidate.execution_verified),
+                    int(candidate.status == "success"),
+                    int(bool(candidate.sql)),
+                )
+                best_rank = (
+                    (
+                        int(best.execution_verified),
+                        int(best.status == "success"),
+                        int(bool(best.sql)),
+                    )
+                    if best is not None
+                    else (-1, -1, -1)
+                )
+                if best is None or candidate_rank > best_rank:
                     best = candidate
                 if candidate.execution_verified:
                     break
             assert best is not None
+            if not best.execution_verified:
+                trace_error = best.error[:1000] or (
+                    f"Agent stopped without a verified terminate call: {best.stop_reason}."
+                )
+                write_agent_failure_trace(
+                    sql_prediction_path,
+                    sample_id=stable_id,
+                    error=trace_error,
+                    trace=best.messages,
+                )
             if best.status != "success":
                 error_message = best.error[:1000] or f"Agent ended with status {best.status}."
                 tqdm.write(
@@ -397,14 +366,13 @@ def run_spider_agent_generation(
                     pass
         records.append(record)
         completed.add(record["id"])
-        write_result_file(output_path, records)
-        _write_standalone_sql(sql_prediction_path, record, error_message)
+        _write_sql_prediction(sql_prediction_path, record, error_message)
     return len(records)
 
 
 def run_dry_run(
     *,
-    schema_log_records: Sequence[dict[str, Any]],
+    schema_records: Sequence[dict[str, Any]],
     dataset_index: dict[str, dict[str, Any]],
     adapter: SchemaLinkingAdapter,
     executor_factory: ExecutorFactory,
@@ -413,7 +381,7 @@ def run_dry_run(
     limit: int | None,
 ) -> tuple[int, int]:
     valid = failed = 0
-    for index, row in _selected_rows(schema_log_records, start_index, limit):
+    for index, row in _selected_rows(schema_records, start_index, limit):
         try:
             agent_input = adapter.adapt(
                 row,
@@ -473,7 +441,6 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
     _validate_args(args)
     dataset_name = args.dataset_name or DATASET_NAME
-    logs_dir = resolve_project_path(args.logs_dir) if args.logs_dir else LOGS_ROOT
     current_dataset_root = dataset_root(dataset_name)
     dataset_path = resolve_project_path(args.dataset_path) if args.dataset_path else current_dataset_root / "gold_sl.json"
     db_info_path = resolve_project_path(args.db_info_path) if args.db_info_path else current_dataset_root / "db_info.json"
@@ -483,46 +450,21 @@ def main(argv: Sequence[str] | None = None) -> None:
     sql_dialect = args.sql_dialect or default_sql_dialect(dataset_name)
     schema_llm_name = args.schema_llm_name or args.answer_llm_name
     executor_route_for_dataset(dataset_name)
+    tool_schemas = build_tool_schemas(dataset_name)
 
-    explicit_input_path = resolve_project_path(args.input_path) if args.input_path else None
-    if explicit_input_path is not None:
-        input_path = explicit_input_path
-    elif args.sl_method != "auto":
-        input_path = build_prediction_path(args.sl_method, dataset_name, schema_llm_name)
-        if not input_path.is_file():
-            raise FileNotFoundError(f"Could not find unified SL prediction: {input_path}")
-    else:
-        input_path = legacy.resolve_input_path(
-            None,
-            logs_dir,
-            schema_llm_name,
-            dataset_name,
-            args.schema_method,
-            args.schema_task,
-        )
-    output_path = legacy.resolve_output_path(
-        resolve_project_path(args.output_path) if args.output_path else None,
-        resolve_project_path(args.output_dir) if args.output_dir else None,
-        logs_dir,
-        dataset_name,
-        args.answer_llm_name,
+    explicit_input_path = (
+        reject_logs_prediction_input(resolve_project_path(args.input_path))
+        if args.input_path
+        else None
     )
+    input_path = explicit_input_path or build_prediction_path(
+        args.sl_method, dataset_name, schema_llm_name
+    )
+    if not input_path.is_file():
+        raise FileNotFoundError(f"Could not find unified SL prediction: {input_path}")
     schema_records, unified_sl_payload = load_schema_records(input_path, dataset_name)
-    sl_method = (
-        str(unified_sl_payload["method"])
-        if unified_sl_payload is not None
-        else resolve_sl_method(
-            args.sl_method,
-            input_path=input_path,
-            schema_task=args.schema_task,
-        )
-    )
-    if unified_sl_payload is not None:
-        schema_llm_name = unified_sl_payload["model_names"]["schema_linking"]
-    elif schema_records:
-        native_model = schema_records[0].get("model")
-        if isinstance(native_model, str) and native_model.strip():
-            schema_llm_name = native_model.strip()
+    sl_method = str(unified_sl_payload["method"])
+    schema_llm_name = unified_sl_payload["model_names"]["schema_linking"]
     dataset_index = legacy.load_dataset_index(dataset_path)
     db_info_index = load_db_info_index(db_info_path)
     executor_factory = ExecutorFactory(
@@ -537,7 +479,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         max_result_rows=args.max_result_rows,
     )
 
-    sql_prediction_path = (
+    sql_prediction_path = require_results_output(
         resolve_project_path(args.sql_prediction_path)
         if args.sql_prediction_path
         else build_sql_prediction_path(
@@ -567,9 +509,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             max_input_length=args.max_input_length,
             max_history_tokens=args.max_history_tokens,
             reserved_output_tokens=args.max_generation_num,
+            tools=tool_schemas,
         )
         run_dry_run(
-            schema_log_records=schema_records,
+            schema_records=schema_records,
             dataset_index=dataset_index,
             adapter=adapter,
             executor_factory=executor_factory,
@@ -587,6 +530,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         schema_linking_method=sl_method,
         schema_linking_model_name=schema_llm_name,
     )
+    if not args.resume:
+        replace_sql_predictions(sql_prediction_path, [])
 
     if args.generator_mode == "one_shot":
         provider = resolve_provider(args.provider)
@@ -612,11 +557,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             include_key_columns=args.include_key_columns,
         )
         processed = run_one_shot_generation(
-            schema_log_records=schema_records,
+            schema_records=schema_records,
             dataset_index=dataset_index,
             adapter=adapter,
             prompt_template=prompt_path.read_text(encoding="utf-8").strip(),
-            output_path=output_path,
             answer_llm=answer_llm,
             renderer=renderer,
             start_index=args.start_index,
@@ -634,6 +578,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             max_new_tokens=args.max_generation_num,
             temperature=args.temperature,
             random_seed=args.random_seed,
+            tools=tool_schemas,
         )
         renderer = SchemaTextRenderer(tokenizer=backend.tokenizer)
         schema_store = DbInfoSchemaStore(db_info_index=db_info_index, renderer=renderer)
@@ -651,22 +596,19 @@ def main(argv: Sequence[str] | None = None) -> None:
             max_input_length=args.max_input_length,
             max_history_tokens=args.max_history_tokens,
             reserved_output_tokens=args.max_generation_num,
+            tools=tool_schemas,
         )
         processed = run_spider_agent_generation(
-            schema_log_records=schema_records,
+            schema_records=schema_records,
             dataset_index=dataset_index,
             adapter=adapter,
             executor_factory=executor_factory,
             prompt_builder=prompt_builder,
             backend=backend,
-            output_path=output_path,
             args=args,
             sql_prediction_path=sql_prediction_path,
         )
-    print(
-        f"Completed {processed} records: native={output_path}, "
-        f"standalone={sql_prediction_path}"
-    )
+    print(f"Completed {processed} records: {sql_prediction_path}")
 
 
 if __name__ == "__main__":

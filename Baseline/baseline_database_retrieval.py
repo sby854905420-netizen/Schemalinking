@@ -1,18 +1,24 @@
 import argparse
 import json
-from datetime import datetime
 from pathlib import Path
-from typing import Any
 
 import pandas as pd
 from tqdm import tqdm
 
 from Llm.llm_loader import LLM, resolve_provider
 from config import *
-from Utils.json_utils import atomic_write_json, normalize_response_text
-from Utils.logging_utils import log_run_configuration, setup_task_logger
+from Utils.json_utils import normalize_response_text
+from Utils.logging_utils import build_run_log_path, log_run_configuration, setup_task_logger
 from Utils.efficiency_utils import SampleEfficiencyTracker
+from Utils.database_prediction_store import (
+    build_database_prediction,
+    build_database_prediction_path,
+    initialize_database_prediction_file,
+    replace_database_predictions,
+    upsert_database_prediction,
+)
 from Utils.tools import render_prompt, resolve_hint
+from Utils.artifact_paths import require_results_output
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,6 +44,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
     )
+    parser.add_argument("--prediction-path", type=Path, default=None)
     return parser.parse_args()
 
 
@@ -68,30 +75,23 @@ def parse_db_response(response_text:str) -> str:
     return pred_db_id
 
 
-def append_log_entry(
-    log_records: list[dict[str, Any]],
+def save_prediction(
     row: pd.Series,
     response_text: str,
     efficiency_tracker: SampleEfficiencyTracker,
-    answer_llm_name: str,
-    provider: str,
-    log_path: Path,
+    prediction_path: Path,
 ) -> None:
     predict_db_id = parse_db_response(response_text)
     efficiency = efficiency_tracker.finalize()
-    log_records.append(
-        {
-            "model": answer_llm_name,
-            "provider": provider,
-            "id": f"{row['id']}",
-            "spider_db_id": row["db_id"],
-            "question": row["question"],
-            "pre_db_response": response_text,
-            "predict_db_id": predict_db_id,
-            "efficiency": efficiency,
-        }
+    upsert_database_prediction(
+        prediction_path,
+        build_database_prediction(
+            sample_id=row["id"],
+            question=row["question"],
+            predicted_db_id=predict_db_id,
+            efficiency=efficiency,
+        ),
     )
-    atomic_write_json(log_path, log_records)
 
 
 def database_schema_to_string(
@@ -106,14 +106,11 @@ def run_baseline_retrieval(
     dataset_name: str,
     documents_dir: Path,
     prompt_template: str,
-    log_path: Path,
     database_schema_path: Path,
     ranking_llm: LLM,
-    answer_llm_name: str,
-    provider: str,
+    prediction_path: Path,
 ) -> int:
     database_schemas = load_database_schema(database_schema_path)
-    log_records: list[dict[str, Any]] = []
     database_count = len(database_schemas)
 
     for _, row in tqdm(dataset_df.iterrows(), total=len(dataset_df)):
@@ -133,14 +130,11 @@ def run_baseline_retrieval(
         # print(f"[Baseline] id={row['id']} prompt_tokens={prompt_token_count}")
         response_text, total_tokens = ranking_llm.query_with_usage(prompt)
         efficiency_tracker.add_llm_total_tokens(total_tokens)
-        append_log_entry(
-            log_records=log_records,
+        save_prediction(
             row=row,
             response_text=response_text,
             efficiency_tracker=efficiency_tracker,
-            answer_llm_name=answer_llm_name,
-            provider=provider,
-            log_path=log_path,
+            prediction_path=prediction_path,
         )
 
     return database_count
@@ -175,11 +169,22 @@ def main() -> None:
         query_settings=BASELINE_DATABASE_RETRIVAL_QUERY_SETTINGS,
     )
 
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    logs_dir = LOGS_ROOT / answer_llm_name / DATABASE_RETRIEVAL_DIR_NAME
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    log_path = logs_dir / f"baseline_database_retrieval_{dataset_name}_{run_id}.json"
+    log_path = build_run_log_path(
+        "baseline_database_retrieval", dataset_name, answer_llm_name
+    )
     logger, logger_path = setup_task_logger("baseline_database_retrieval", log_path)
+    prediction_path = require_results_output(
+        resolve_project_path(args.prediction_path)
+        if args.prediction_path
+        else build_database_prediction_path("baseline", dataset_name, answer_llm_name)
+    )
+    initialize_database_prediction_file(
+        prediction_path,
+        dataset_name=dataset_name,
+        method="baseline",
+        model_name=answer_llm_name,
+    )
+    replace_database_predictions(prediction_path, [])
 
     log_run_configuration(
         logger,
@@ -188,7 +193,7 @@ def main() -> None:
         data_count=len(dataset_df),
         model_name=answer_llm_name,
         provider=provider,
-        result_path=log_path,
+        result_path=prediction_path,
         extra_fields={
             "Prompt template": prompt_path,
             "Database schema path": database_schema_path,
@@ -196,6 +201,7 @@ def main() -> None:
             "Max input length": max_input_length,
             "Max generation num": max_generation_num,
             "Logger path": logger_path,
+            "Prediction path": prediction_path,
         },
     )
 
@@ -204,11 +210,9 @@ def main() -> None:
         dataset_name=dataset_name,
         documents_dir=documents_dir,
         prompt_template=prompt_template,
-        log_path=log_path,
         database_schema_path=database_schema_path,
         ranking_llm=ranking_llm,
-        answer_llm_name=answer_llm_name,
-        provider=provider,
+        prediction_path=prediction_path,
     )
     logger.info("Loaded database schema count: %s", database_count)
     logger.info("Completed %s records.", len(dataset_df))

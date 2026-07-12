@@ -6,16 +6,21 @@ from typing import Any, Optional
 from pathlib import Path
 from tqdm import tqdm
 import torch
-from datetime import datetime
 import logging
 
 
 from Llm.embedding_model_loader import EmbeddingModelLoader
 from config import *
 from Llm.llm_loader import LLM, resolve_provider
-from Utils.json_utils import atomic_write_json
-from Utils.logging_utils import log_run_configuration, setup_task_logger
+from Utils.logging_utils import build_run_log_path, log_run_configuration, setup_task_logger
 from Utils.efficiency_utils import SampleEfficiencyTracker
+from Utils.database_prediction_store import (
+    build_database_prediction,
+    build_database_prediction_path,
+    initialize_database_prediction_file,
+    replace_database_predictions,
+    upsert_database_prediction,
+)
 from Utils.render_tools import SchemaTextRenderer
 from Utils.schema_selection import (
     DbInfoSchemaStore,
@@ -33,6 +38,7 @@ from Utils.tools import (
     resolve_hint,
     resolve_prompt_token_cap,
 )
+from Utils.artifact_paths import require_results_output
 
 PROMPT_BUDGET_BUFFER = 512
 PROMPT_BUDGET_RATIO = 0.8
@@ -79,7 +85,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--answer-llm-name", dest="answer_llm_name", type=str, default=None)
     parser.add_argument("--provider", dest="provider", type=str, default=None)
     parser.add_argument("--input-path", dest="input_path", type=Path, default=None)
-    parser.add_argument("--output-path", dest="output_path", type=Path, default=None)
+    parser.add_argument("--prediction-path", dest="prediction_path", type=Path, default=None)
     parser.add_argument(
         "--max-input-length",
         dest="max_input_length",
@@ -486,7 +492,6 @@ def main() -> None:
     db_selection_mode = args.db_selection_mode
     enable_progress_log = args.enable_progress_log
 
-    run_id = datetime.now().strftime('%Y%m%d_%H%M%S')
     current_dataset_root = dataset_root(dataset_name)
     qdrant_path = current_dataset_root / "qdrant_column_index"
     db_info_path = current_dataset_root / "db_info.json"
@@ -499,14 +504,25 @@ def main() -> None:
     prompt_path = TEMPLATES_ROOT / "zero_shot" / "binary_classification_database.txt"
     prompt_template = prompt_path.read_text(encoding='utf-8').strip()
 
-    if args.output_path is None:
-        logs_dir = LOGS_ROOT / answer_llm_name / DATABASE_RETRIEVAL_DIR_NAME
-        logs_dir.mkdir(parents=True, exist_ok=True)
-        log_path = logs_dir / f'iterative_database_retrieval_{dataset_name}_{run_id}.json'
-    else:
-        log_path = resolve_project_path(args.output_path)
-        log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path = build_run_log_path(
+        "global_coarse_retrieval", dataset_name, answer_llm_name
+    )
     logger, logger_path = setup_task_logger("iterative_database_retrieval", log_path)
+    database_method = f"global_coarse_{db_selection_mode}"
+    prediction_path = require_results_output(
+        resolve_project_path(args.prediction_path)
+        if args.prediction_path
+        else build_database_prediction_path(
+            database_method, dataset_name, answer_llm_name
+        )
+    )
+    initialize_database_prediction_file(
+        prediction_path,
+        dataset_name=dataset_name,
+        method=database_method,
+        model_name=answer_llm_name,
+    )
+    replace_database_predictions(prediction_path, [])
 
     client = get_qdrant_client(qdrant_path)
     collection_name = dataset_name
@@ -518,7 +534,7 @@ def main() -> None:
         data_count=len(dataset_df),
         model_name=answer_llm_name,
         provider=provider,
-        result_path=log_path,
+        result_path=prediction_path,
         extra_fields={
             "Embedding model": EMBEDDING_MODEL_NAME,
             "Input path": dataset_path,
@@ -537,6 +553,7 @@ def main() -> None:
             "Max generation num": max_generation_num,
             "Enable progress log": enable_progress_log,
             "Logger path": logger_path,
+            "Prediction path": prediction_path,
         },
     )
 
@@ -558,9 +575,6 @@ def main() -> None:
             db_info_index=db_info_index,
             renderer=renderer,
         )
-
-    log_records = []
-
 
     total_samples = len(dataset_df)
     for sample_index, (_, row) in enumerate(tqdm(dataset_df.iterrows(), total=total_samples)):
@@ -630,7 +644,6 @@ def main() -> None:
             ",".join(first_round_cfcd_db_ids) if first_round_cfcd_db_ids else "NONE",
         )
 
-        final_cfcd_db_ids = list(first_round_cfcd_db_ids)
         if len(first_round_cfcd_db_ids) <= candidate_db_top_k:
             log_progress(
                 logger,
@@ -741,7 +754,6 @@ def main() -> None:
                 "Pruning databases from second-round HRC results.",
             )
             second_round_cfcd_db_ids = database_pruning(last_hrc_points, min_hit_count=2, min_sim_ratio=0.8)
-            final_cfcd_db_ids = list(second_round_cfcd_db_ids)
             log_progress(
                 logger,
                 enable_progress_log,
@@ -787,32 +799,32 @@ def main() -> None:
                 target_db_id[0] if target_db_id else "NONE",
             )
         # save the predict results
-        log_records.append(
-            {
-                'model': answer_llm_name,
-                'provider': provider,
-                'id': f"{row['id']}",
-                'gold_db_id': row['db_id'],
-                'question': row['question'],
-                'FCD_ids': ",".join(FCD_db_ids),
-                'CFCD_db_ids': ",".join(final_cfcd_db_ids),
-                'predict_db_id': target_db_id[0] if target_db_id else None,
-                'db_selection_mode': db_selection_mode,
-                'efficiency': efficiency_tracker.finalize(),
-            }
+        record = {
+            'id': f"{row['id']}",
+            'question': row['question'],
+            'predict_db_id': target_db_id[0] if target_db_id else None,
+            'efficiency': efficiency_tracker.finalize(),
+        }
+        upsert_database_prediction(
+            prediction_path,
+            build_database_prediction(
+                sample_id=record["id"],
+                question=record["question"],
+                predicted_db_id=record["predict_db_id"],
+                efficiency=record["efficiency"],
+            ),
         )
-        atomic_write_json(log_path, log_records)
         log_progress(
             logger,
             enable_progress_log,
             sample_tag,
             "finish",
-            "Saved sample result to %s. processed_records=%s",
-            log_path,
-            len(log_records),
+            "Saved sample prediction to %s. processed_records=%s",
+            prediction_path,
+            sample_index + 1,
         )
 
-    logger.info("Completed %s records.", len(log_records))
+    logger.info("Completed %s records.", total_samples)
 
 
 if __name__ == "__main__":

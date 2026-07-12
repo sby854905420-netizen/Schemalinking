@@ -5,7 +5,6 @@ import json
 import sys
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Sequence
@@ -18,26 +17,26 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from config import (
     DATASET_NAME,
-    LOGS_ROOT,
     MODEL_CACHE_ROOT,
     dataset_root,
     resolve_project_path,
 )
-from Utils.json_utils import atomic_write_json
 from Utils.prediction_adapter import build_prediction_from_native
 from Utils.prediction_store import (
     build_prediction_path,
     initialize_prediction_file,
+    replace_predictions,
     upsert_prediction,
 )
 from Utils.value_utils import get_row_value
-from Utils.logging_utils import log_run_configuration, setup_task_logger
+from Utils.logging_utils import build_run_log_path, log_run_configuration, setup_task_logger
 from Utils.tools import (
     build_db_id_filter,
     get_qdrant_client,
     query_qdrant,
     resolve_hint,
 )
+from Utils.artifact_paths import require_results_output
 
 
 BASELINE_NAME = "rag_column_retrieval"
@@ -69,7 +68,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-path", dest="input_path", type=Path, default=None)
     parser.add_argument("--qdrant-path", dest="qdrant_path", type=Path, default=None)
     parser.add_argument("--collection-name", dest="collection_name", type=str, default=None)
-    parser.add_argument("--output-path", dest="output_path", type=Path, default=None)
     parser.add_argument("--prediction-path", dest="prediction_path", type=Path, default=None)
     parser.add_argument("--top-k", dest="top_k", type=int, default=DEFAULT_TOP_K)
     parser.add_argument("--global-top-k", dest="global_top_k", type=int, default=None)
@@ -104,17 +102,6 @@ def load_qdrant_collection_name(qdrant_path: Path, fallback: str) -> str:
     if isinstance(collections, dict) and collections:
         return str(next(iter(collections)))
     return fallback
-
-
-def resolve_output_path(output_path: Path | None, dataset_name: str) -> Path:
-    if output_path is not None:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        return output_path
-
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_dir = LOGS_ROOT / BASELINE_NAME
-    save_dir.mkdir(parents=True, exist_ok=True)
-    return save_dir / f"zero_shot_table2column_{dataset_name}_{run_id}.json"
 
 
 def point_payload(point: Any) -> dict[str, Any]:
@@ -244,8 +231,6 @@ def resolve_query_text(row: Any, dataset_name: str, documents_dir: Path) -> tupl
 
 
 def append_result(
-    records: list[dict[str, Any]],
-    output_path: Path,
     row: Any,
     *,
     predicted_db_id: str | None,
@@ -255,9 +240,9 @@ def append_result(
     elapsed_seconds: float,
     database_elapsed_seconds: float | None = None,
     schema_elapsed_seconds: float | None = None,
-    prediction_path: Path | None = None,
-    dataset_name: str | None = None,
-    documents_dir: Path | None = None,
+    prediction_path: Path,
+    dataset_name: str,
+    documents_dir: Path,
     error_message: str | None = None,
 ) -> dict[str, Any]:
     predict_columns = group_columns_by_table(local_columns)
@@ -307,35 +292,29 @@ def append_result(
         }
     if error_message:
         record["database_error"] = error_message
-    records.append(record)
-    atomic_write_json(output_path, records)
-    if prediction_path is not None:
-        if dataset_name is None or documents_dir is None:
-            raise ValueError("Unified prediction context is incomplete.")
-        prediction = build_prediction_from_native(
-            schema_record=record,
-            database_record=record,
-            source_record=row,
-            dataset_name=dataset_name,
-            method="rag_column_retrieval",
-            documents_dir=documents_dir,
-            database_usage={
-                "elapsed_seconds": database_elapsed_seconds,
-                "total_tokens": None,
-            },
-            schema_usage={
-                "elapsed_seconds": schema_elapsed_seconds,
-                "total_tokens": None,
-            },
-        )
-        upsert_prediction(prediction_path, prediction)
+    prediction = build_prediction_from_native(
+        schema_record=record,
+        database_record=record,
+        source_record=row,
+        dataset_name=dataset_name,
+        method="rag_column_retrieval",
+        documents_dir=documents_dir,
+        database_usage={
+            "elapsed_seconds": database_elapsed_seconds,
+            "total_tokens": None,
+        },
+        schema_usage={
+            "elapsed_seconds": schema_elapsed_seconds,
+            "total_tokens": None,
+        },
+    )
+    upsert_prediction(prediction_path, prediction)
     return record
 
 
 def run_baseline(
     *,
     dataset_df: pd.DataFrame,
-    output_path: Path,
     dataset_name: str,
     documents_dir: Path,
     embedder: Any,
@@ -345,11 +324,11 @@ def run_baseline(
     local_top_k: int,
     start_index: int,
     limit: int | None,
-    prediction_path: Path | None = None,
+    prediction_path: Path,
 ) -> int:
     from tqdm import tqdm
 
-    result_records: list[dict[str, Any]] = []
+    processed_count = 0
     selected_df = dataset_df.iloc[max(0, start_index) :]
     if limit is not None:
         selected_df = selected_df.iloc[: max(0, limit)]
@@ -396,8 +375,6 @@ def run_baseline(
             schema_elapsed_seconds = None
         elapsed_seconds = database_elapsed_seconds + (schema_elapsed_seconds or 0.0)
         append_result(
-            records=result_records,
-            output_path=output_path,
             row=row,
             predicted_db_id=predicted_db_id,
             global_columns=global_columns,
@@ -411,8 +388,9 @@ def run_baseline(
             documents_dir=documents_dir,
             error_message=error_message,
         )
+        processed_count += 1
 
-    return len(result_records)
+    return processed_count
 
 
 def main() -> None:
@@ -423,10 +401,6 @@ def main() -> None:
     input_path = resolve_project_path(args.input_path) if args.input_path else current_dataset_root / "gold_sl.json"
     qdrant_path = resolve_project_path(args.qdrant_path) if args.qdrant_path else current_dataset_root / "qdrant_column_index"
     documents_dir = current_dataset_root / "documents"
-    output_path = resolve_output_path(
-        resolve_project_path(args.output_path) if args.output_path else None,
-        dataset_name,
-    )
     collection_name = args.collection_name or load_qdrant_collection_name(
         qdrant_path=qdrant_path,
         fallback=dataset_name,
@@ -444,7 +418,7 @@ def main() -> None:
     cache_dir = resolve_project_path(args.cache_dir) if args.cache_dir else MODEL_CACHE_ROOT
 
     dataset_df = load_dataset(input_path)
-    prediction_path = (
+    prediction_path = require_results_output(
         resolve_project_path(args.prediction_path)
         if args.prediction_path
         else build_prediction_path(
@@ -458,7 +432,9 @@ def main() -> None:
         database_selection_model_name=embedding_model_name,
         schema_linking_model_name=embedding_model_name,
     )
-    logger, logger_path = setup_task_logger(BASELINE_NAME, output_path)
+    replace_predictions(prediction_path, [])
+    log_path = build_run_log_path(BASELINE_NAME, dataset_name, embedding_model_name)
+    logger, logger_path = setup_task_logger(BASELINE_NAME, log_path)
     log_run_configuration(
         logger,
         task_name="RAG Column Retrieval Baseline",
@@ -466,7 +442,7 @@ def main() -> None:
         data_count=len(dataset_df),
         model_name=BASELINE_NAME,
         provider=BASELINE_PROVIDER,
-        result_path=output_path,
+        result_path=prediction_path,
         extra_fields={
             "Input path": input_path,
             "Qdrant path": qdrant_path,
@@ -494,7 +470,6 @@ def main() -> None:
     qdrant_client = get_qdrant_client(qdrant_path)
     processed_count = run_baseline(
         dataset_df=dataset_df,
-        output_path=output_path,
         dataset_name=dataset_name,
         documents_dir=documents_dir,
         embedder=embedder,

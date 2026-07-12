@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -97,6 +97,18 @@ def upsert_sql_prediction(
     atomic_write_json(output_path, payload)
 
 
+def replace_sql_predictions(
+    path: Path | str, predictions: Sequence[Mapping[str, Any]]
+) -> None:
+    """Atomically replace all SQL prediction records."""
+
+    output_path = Path(path)
+    payload = validate_sql_prediction_file(output_path)
+    payload["predictions"] = [dict(prediction) for prediction in predictions]
+    validate_sql_prediction_file(payload)
+    atomic_write_json(output_path, payload)
+
+
 def validate_sql_prediction_file(
     path_or_payload: Path | str | Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -162,6 +174,7 @@ def validate_sql_prediction_file(
 __all__ = [
     "build_sql_prediction_path",
     "initialize_sql_prediction_file",
+    "replace_sql_predictions",
     "upsert_sql_prediction",
     "validate_sql_prediction_file",
 ]

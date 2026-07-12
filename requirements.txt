@@ -8,7 +8,8 @@
 # Make sure the host NVIDIA driver is new enough for CUDA 12.8.
 --extra-index-url https://download.pytorch.org/whl/cu128
 
-numpy==2.4.4
+# mistral-common 1.11.2 requires numpy<2.4 on the recommended Python 3.11.
+numpy==2.3.5
 pandas==3.0.3
 tqdm==4.67.3
 sqlparse==0.5.3
@@ -24,9 +25,16 @@ sentence-transformers==5.4.1
 qdrant-client==1.18.0
 
 openai==2.36.0
+# Used for accurate OpenAI prompt token counting and by mistral-common.
+tiktoken==0.12.0
 
 # Optional at runtime; required for Spider2 execution feedback.
 snowflake-connector-python==4.6.0
 
 # Required by MistralCommonBackend for the current Ministral loading path.
 mistral-common==1.11.2
+
+# Optional: required only with --attn-implementation flash_attention_2.
+# Install a flash-attn build compatible with the active PyTorch/CUDA stack;
+# the default sdpa attention backend does not require it.
+# flash-attn

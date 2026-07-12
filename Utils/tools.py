@@ -2,17 +2,11 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
 import pandas as pd
 
-from config import (
-    DATABASE_RETRIEVAL_DIR_NAME,
-    LEGACY_DATABASE_RETRIEVAL_DIR_NAME,
-    resolve_project_path,
-)
 from Utils.value_utils import resolve_external_knowledge
 
 
@@ -259,152 +253,6 @@ def load_column_records_from_db_info(
     if db_entry is None:
         raise FileNotFoundError(f"Could not find schema for database '{predict_db_id}' in db_info.json.")
     return list(iter_column_records_from_db_info(db_entry))
-
-
-def extract_timestamp(path: Path, dataset_name: str, timestamp_pattern_template: str) -> str | None:
-    timestamp_pattern = re.compile(
-        timestamp_pattern_template.format(dataset_name=re.escape(dataset_name))
-    )
-    match = timestamp_pattern.search(path.name)
-    if match is None:
-        return None
-    return match.group(1)
-
-
-def find_model_dir(
-    logs_dir: Path,
-    model_name: str,
-    task_dir_name: str = DATABASE_RETRIEVAL_DIR_NAME,
-) -> Path:
-    task_dir_names = [task_dir_name]
-    if task_dir_name == DATABASE_RETRIEVAL_DIR_NAME:
-        task_dir_names.append(LEGACY_DATABASE_RETRIEVAL_DIR_NAME)
-
-    for candidate_name in task_dir_names:
-        direct_path = logs_dir / model_name / candidate_name
-        if direct_path.is_dir():
-            return direct_path
-
-    model_leaf_name = Path(model_name).name
-    matching_dirs = sorted({
-        path
-        for candidate_name in task_dir_names
-        for path in logs_dir.rglob(candidate_name)
-        if path.is_dir() and path.parent.name == model_leaf_name
-    })
-    if not matching_dirs:
-        raise FileNotFoundError(
-            f"Could not find any of {task_dir_names} for model '{model_name}' under {logs_dir}."
-        )
-    if len(matching_dirs) > 1:
-        matched_paths = "\n".join(str(path) for path in matching_dirs)
-        raise ValueError(
-            f"Found multiple {task_dir_name} directories for model '{model_name}'. Please disambiguate:\n{matched_paths}"
-        )
-    return matching_dirs[0]
-
-
-def find_result_file(
-    model_dir: Path,
-    dataset_name: str,
-    input_file_patterns: tuple[str, ...],
-    timestamp_pattern_template: str,
-) -> Path:
-    candidate_files: list[tuple[str, Path]] = []
-
-    for pattern_template in input_file_patterns:
-        pattern = pattern_template.format(dataset_name=dataset_name, timestamp="*")
-        for path in model_dir.glob(pattern):
-            file_timestamp = extract_timestamp(path, dataset_name, timestamp_pattern_template)
-            if file_timestamp is None:
-                continue
-            candidate_files.append((file_timestamp, path))
-
-    if not candidate_files:
-        expected_patterns = ", ".join(
-            pattern_template.format(dataset_name=dataset_name, timestamp="*")
-            for pattern_template in input_file_patterns
-        )
-        raise FileNotFoundError(f"Could not find any of [{expected_patterns}] under {model_dir}.")
-
-    candidate_files.sort(key=lambda item: item[0], reverse=True)
-    return candidate_files[0][1]
-
-
-def resolve_input_path(
-    input_path: Path | None,
-    logs_dir: Path,
-    answer_llm_name: str,
-    dataset_name: str,
-    input_file_patterns: tuple[str, ...],
-    timestamp_pattern_template: str,
-    task_dir_name: str = DATABASE_RETRIEVAL_DIR_NAME,
-) -> Path:
-    if input_path is not None:
-        return resolve_project_path(input_path)
-
-    task_dir_names = [task_dir_name]
-    if task_dir_name == DATABASE_RETRIEVAL_DIR_NAME:
-        task_dir_names.append(LEGACY_DATABASE_RETRIEVAL_DIR_NAME)
-
-    model_leaf_name = Path(answer_llm_name).name
-    candidate_dirs = {
-        logs_dir / answer_llm_name / candidate_name
-        for candidate_name in task_dir_names
-        if (logs_dir / answer_llm_name / candidate_name).is_dir()
-    }
-    candidate_dirs.update(
-        path
-        for candidate_name in task_dir_names
-        for path in logs_dir.rglob(candidate_name)
-        if path.is_dir() and path.parent.name == model_leaf_name
-    )
-
-    candidates: list[tuple[str, Path]] = []
-    for model_dir in candidate_dirs:
-        try:
-            result_path = find_result_file(
-                model_dir=model_dir,
-                dataset_name=dataset_name,
-                input_file_patterns=input_file_patterns,
-                timestamp_pattern_template=timestamp_pattern_template,
-            )
-        except FileNotFoundError:
-            continue
-        timestamp = extract_timestamp(
-            result_path,
-            dataset_name,
-            timestamp_pattern_template,
-        )
-        if timestamp is not None:
-            candidates.append((timestamp, result_path))
-
-    if not candidates:
-        searched = ", ".join(str(path) for path in sorted(candidate_dirs)) or str(logs_dir)
-        raise FileNotFoundError(
-            f"Could not find a database-retrieval result for dataset '{dataset_name}' "
-            f"and model '{answer_llm_name}'. Searched: {searched}."
-        )
-
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    return candidates[0][1]
-
-
-def resolve_output_path(
-    output_path: Path | None,
-    answer_llm_name: str,
-    dataset_name: str,
-    output_stem: str,
-    project_root: Path,
-) -> Path:
-    if output_path is not None:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        return output_path
-
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_dir = project_root / "Logs" / answer_llm_name
-    save_dir.mkdir(parents=True, exist_ok=True)
-    return save_dir / f"{output_stem}_{dataset_name}_{run_id}.json"
 
 
 def resolve_hint(

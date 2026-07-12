@@ -17,6 +17,50 @@ def execute_tool_for_dataset(dataset_name: str) -> str:
     return executor_route_for_dataset(dataset_name).execute_function
 
 
+def build_tool_schemas(dataset_name: str) -> tuple[dict[str, Any], ...]:
+    """Return the native Qwen tool definitions for one dataset route."""
+    execute_function = execute_tool_for_dataset(dataset_name)
+    dialect = executor_route_for_dataset(dataset_name).dialect_name
+    return (
+        {
+            "type": "function",
+            "function": {
+                "name": execute_function,
+                "description": (
+                    f"Execute one read-only {dialect} SQL query and return a result preview."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "required": ["sql"],
+                    "properties": {
+                        "sql": {
+                            "type": "string",
+                            "description": "Exactly one executable read-only SQL statement.",
+                        }
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "terminate",
+                "description": "Submit the final verified SQL query and stop the agent.",
+                "parameters": {
+                    "type": "object",
+                    "required": ["answer"],
+                    "properties": {
+                        "answer": {
+                            "type": "string",
+                            "description": "Exactly one final read-only SQL statement.",
+                        }
+                    },
+                },
+            },
+        },
+    )
+
+
 def build_compact_schema(agent_input: AgentInput) -> str:
     tables: dict[str, list[tuple[str, str]]] = {}
     for record in agent_input.selected_column_records:
@@ -44,6 +88,7 @@ class PromptBuilder:
         max_input_length: int,
         max_history_tokens: int,
         reserved_output_tokens: int = 0,
+        tools: Sequence[Mapping[str, Any]] | None = None,
     ) -> None:
         self.system_template = system_template
         self.tokenizer = tokenizer
@@ -51,17 +96,21 @@ class PromptBuilder:
         self.max_input_length = max_input_length
         self.max_history_tokens = max_history_tokens
         self.reserved_output_tokens = reserved_output_tokens
+        self.tools = tuple(dict(tool) for tool in (tools or ()))
         self.input_token_budget = max_input_length - reserved_output_tokens
         if self.input_token_budget <= 0:
             raise ValueError(
                 "reserved_output_tokens must be smaller than max_input_length."
             )
 
-    def count_messages(self, messages: Sequence[Mapping[str, str]]) -> int:
+    def count_messages(self, messages: Sequence[Mapping[str, Any]]) -> int:
         if hasattr(self.tokenizer, "apply_chat_template"):
             try:
                 token_ids = self.tokenizer.apply_chat_template(
-                    list(messages), tokenize=True, add_generation_prompt=True
+                    list(messages),
+                    tools=list(self.tools),
+                    tokenize=True,
+                    add_generation_prompt=True,
                 )
                 if hasattr(token_ids, "shape"):
                     return int(token_ids.shape[-1])
@@ -157,7 +206,7 @@ class PromptBuilder:
     def build_messages(
         self,
         agent_input: AgentInput,
-        history: Sequence[Mapping[str, str]],
+        history: Sequence[Mapping[str, Any]],
     ) -> list[dict[str, str]]:
         fixed = self.build_fixed_messages(agent_input)
         if not history:
@@ -215,5 +264,6 @@ __all__ = [
     "PromptBuilder",
     "SchemaOverBudgetError",
     "build_compact_schema",
+    "build_tool_schemas",
     "execute_tool_for_dataset",
 ]

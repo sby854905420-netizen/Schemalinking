@@ -11,10 +11,16 @@ from .result_types import AgentInput, AgentResult, ExecutionResult
 from .tool_call_parser import ToolCallParseError, parse_tool_call
 
 
-FORMAT_CORRECTION = (
-    "FORMAT_ERROR: Output exactly one valid <tool_call> using an available function "
-    "and its required parameter."
-)
+def format_correction(execute_function: str, error: str) -> str:
+    return (
+        f"FORMAT_ERROR: {error}\n"
+        "Reply with exactly one tool call and no suffix. Use one of:\n"
+        f"<tool_call>\n<function={execute_function}>\n"
+        "<parameter=sql>SELECT ...;</parameter>\n</function>\n</tool_call>\n"
+        "or\n"
+        "<tool_call>\n<function=terminate>\n"
+        "<parameter=answer>SELECT ...;</parameter>\n</function>\n</tool_call>"
+    )
 
 
 def _safe_error(exc: Exception, limit: int = 1000) -> str:
@@ -72,7 +78,7 @@ class SpiderAgentTC:
         self.max_observation_chars = max_observation_chars
         self.generation_config = dict(generation_config or {})
 
-    def _generate_with_retries(self, messages: list[dict[str, str]]) -> str:
+    def _generate_with_retries(self, messages: list[dict[str, Any]]) -> str:
         last_error: Exception | None = None
         for _ in range(self.max_llm_retries + 1):
             try:
@@ -85,7 +91,8 @@ class SpiderAgentTC:
         ) from last_error
 
     def run(self, agent_input: AgentInput) -> AgentResult:
-        history: list[dict[str, str]] = []
+        history: list[dict[str, Any]] = []
+        trace: list[dict[str, Any]] = []
         last_legal_sql = ""
         last_error = ""
         execute_function = execute_tool_for_dataset(agent_input.dataset_name)
@@ -96,6 +103,9 @@ class SpiderAgentTC:
                 response = self._generate_with_retries(messages)
             except Exception as exc:
                 last_error = _safe_error(exc)
+                trace.append(
+                    {"round": round_number, "outcome": "llm_error", "error": last_error}
+                )
                 if last_legal_sql:
                     return AgentResult(
                         sql=last_legal_sql,
@@ -104,6 +114,7 @@ class SpiderAgentTC:
                         execution_verified=False,
                         rounds=round_number,
                         error=last_error,
+                        messages=tuple(trace),
                     )
                 return AgentResult(
                     sql="",
@@ -112,24 +123,61 @@ class SpiderAgentTC:
                     execution_verified=False,
                     rounds=round_number,
                     error=last_error,
+                    messages=tuple(trace),
                 )
 
-            history.append({"role": "assistant", "content": response})
+            round_trace: dict[str, Any] = {
+                "round": round_number,
+                "response": response,
+            }
             try:
                 tool_call = parse_tool_call(response, execute_function=execute_function)
             except ToolCallParseError as exc:
                 last_error = _safe_error(exc)
-                history.append({"role": "user", "content": FORMAT_CORRECTION})
+                round_trace.update({"outcome": "format_error", "error": last_error})
+                trace.append(round_trace)
+                history.append({"role": "assistant", "content": response})
+                history.append(
+                    {
+                        "role": "user",
+                        "content": format_correction(execute_function, str(exc)),
+                    }
+                )
                 continue
+
+            history.append(
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": tool_call.function,
+                                "arguments": {
+                                    tool_call.parameter_name: tool_call.value,
+                                },
+                            },
+                        }
+                    ],
+                }
+            )
+            round_trace["tool_call"] = {
+                "function": tool_call.function,
+                "parameter": tool_call.parameter_name,
+                "value": tool_call.value,
+            }
 
             try:
                 candidate_sql = validate_readonly_sql(tool_call.value)
                 last_legal_sql = candidate_sql
             except Exception as exc:
                 last_error = _safe_error(exc)
+                round_trace.update({"outcome": "sql_safety_error", "error": last_error})
+                trace.append(round_trace)
                 history.append(
                     {
-                        "role": "user",
+                        "role": "tool",
                         "content": f"SQL_SAFETY_ERROR: {last_error}",
                     }
                 )
@@ -139,29 +187,42 @@ class SpiderAgentTC:
                 execution_result = self.executor.execute(candidate_sql)
             except Exception as exc:
                 last_error = _safe_error(exc)
+                round_trace.update({"outcome": "execution_error", "error": last_error})
+                trace.append(round_trace)
                 history.append(
                     {
-                        "role": "user",
+                        "role": "tool",
                         "content": f"EXECUTION_ERROR: {last_error}",
                     }
                 )
                 continue
 
             if tool_call.function == "terminate":
+                round_trace["outcome"] = "terminate"
+                trace.append(round_trace)
                 return AgentResult(
                     sql=candidate_sql,
                     status="success",
                     stop_reason="terminate",
                     execution_verified=True,
                     rounds=round_number,
+                    messages=tuple(trace),
                 )
 
+            observation = format_execution_observation(
+                execution_result, self.max_observation_chars
+            )
+            round_trace.update(
+                {
+                    "outcome": "execution_success",
+                    "observation": observation,
+                }
+            )
+            trace.append(round_trace)
             history.append(
                 {
-                    "role": "user",
-                    "content": format_execution_observation(
-                        execution_result, self.max_observation_chars
-                    ),
+                    "role": "tool",
+                    "content": observation,
                 }
             )
 
@@ -173,6 +234,7 @@ class SpiderAgentTC:
                 execution_verified=False,
                 rounds=self.max_agent_rounds,
                 error=last_error,
+                messages=tuple(trace),
             )
         return AgentResult(
             sql="",
@@ -181,11 +243,12 @@ class SpiderAgentTC:
             execution_verified=False,
             rounds=self.max_agent_rounds,
             error=last_error,
+            messages=tuple(trace),
         )
 
 
 __all__ = [
-    "FORMAT_CORRECTION",
     "SpiderAgentTC",
+    "format_correction",
     "format_execution_observation",
 ]
