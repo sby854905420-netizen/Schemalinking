@@ -16,8 +16,11 @@ from Utils.prediction_store import (
     replace_predictions,
     upsert_prediction,
 )
-from Utils.value_utils import index_records_by_id
-from Utils.logging_utils import build_run_log_path, log_run_configuration, setup_task_logger
+from Utils.value_utils import (
+    choose_external_knowledge_source,
+    get_row_value,
+    index_records_by_id,
+)
 from Utils.efficiency_utils import SampleEfficiencyTracker
 from Utils.database_prediction_store import (
     DATABASE_METHODS,
@@ -27,7 +30,6 @@ from Utils.database_prediction_store import (
 from Utils.render_tools import SchemaTextRenderer
 from Utils.schema_selection import DbInfoSchemaStore
 from Utils.schema_prediction_utils import normalize_predicted_columns
-from Utils.value_utils import get_row_value
 from Utils.tools import (
     load_db_info_index,
     render_prompt,
@@ -168,7 +170,7 @@ def run_baseline_schema_linking(
                 DATABASE_SCHEMAS=database_schema,
                 QUESTION=row["question"],
                 HINT=resolve_hint(
-                    row,
+                    choose_external_knowledge_source(source_record, row),
                     dataset_name=dataset_name,
                     documents_dir=documents_dir,
                 ),
@@ -225,11 +227,6 @@ def main() -> None:
         dataset_name=dataset_name,
         model_name=database_model_name,
     )
-    log_path = build_run_log_path(
-        "baseline_schema_linking", dataset_name, answer_llm_name
-    )
-    logger, logger_path = setup_task_logger("baseline_schema_linking", log_path)
-
     dataset_df = load_dataset(input_path)
     source_records = load_json_records(current_dataset_root / "gold_sl.json")
     source_index = {
@@ -256,27 +253,6 @@ def main() -> None:
     )
     replace_predictions(prediction_path, [])
 
-    log_run_configuration(
-        logger,
-        task_name="Baseline Schema Linking",
-        dataset_name=dataset_name,
-        data_count=len(dataset_df),
-        model_name=answer_llm_name,
-        provider=provider,
-        result_path=prediction_path,
-        extra_fields={
-            "Method": method_name,
-            "Input path": input_path,
-            "Prompt template": prompt_path,
-            "DB info path": db_info_path,
-            "Documents dir": documents_dir,
-            "Max input length": max_input_length,
-            "Max generation num": max_generation_num,
-            "Logger path": logger_path,
-            "Unified prediction path": prediction_path,
-        },
-    )
-
     answer_llm = LLM(
         model_name=answer_llm_name,
         provider=provider,
@@ -302,7 +278,7 @@ def main() -> None:
         prediction_path=prediction_path,
         source_index=source_index,
     )
-    logger.info("Completed %s records.", processed_count)
+    print(f"Completed {processed_count} prompt-baseline schema-linking records.")
 
 
 if __name__ == "__main__":

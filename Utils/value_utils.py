@@ -42,6 +42,21 @@ def index_records_by_id(
     return indexed
 
 
+def choose_external_knowledge_source(
+    source_record: Any,
+    fallback_source: Any,
+    *,
+    key: str = "external_knowledge",
+) -> Any:
+    """Prefer the authoritative source row when it defines the hint field."""
+
+    try:
+        has_source_key = key in source_record
+    except (TypeError, AttributeError):
+        has_source_key = False
+    return source_record if has_source_key else fallback_source
+
+
 def resolve_external_knowledge(
     source: Any,
     *,
@@ -75,6 +90,7 @@ def resolve_external_knowledge(
 
 
 __all__ = [
+    "choose_external_knowledge_source",
     "get_row_value",
     "index_records_by_id",
     "is_missing_value",

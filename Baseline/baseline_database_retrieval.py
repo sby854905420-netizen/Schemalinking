@@ -8,7 +8,6 @@ from tqdm import tqdm
 from Llm.llm_loader import LLM, resolve_provider
 from config import *
 from Utils.json_utils import normalize_response_text
-from Utils.logging_utils import build_run_log_path, log_run_configuration, setup_task_logger
 from Utils.efficiency_utils import SampleEfficiencyTracker
 from Utils.database_prediction_store import (
     build_database_prediction,
@@ -169,10 +168,6 @@ def main() -> None:
         query_settings=BASELINE_DATABASE_RETRIVAL_QUERY_SETTINGS,
     )
 
-    log_path = build_run_log_path(
-        "baseline_database_retrieval", dataset_name, answer_llm_name
-    )
-    logger, logger_path = setup_task_logger("baseline_database_retrieval", log_path)
     prediction_path = require_results_output(
         resolve_project_path(args.prediction_path)
         if args.prediction_path
@@ -186,25 +181,6 @@ def main() -> None:
     )
     replace_database_predictions(prediction_path, [])
 
-    log_run_configuration(
-        logger,
-        task_name="Baseline Database Retrieval",
-        dataset_name=dataset_name,
-        data_count=len(dataset_df),
-        model_name=answer_llm_name,
-        provider=provider,
-        result_path=prediction_path,
-        extra_fields={
-            "Prompt template": prompt_path,
-            "Database schema path": database_schema_path,
-            "Documents dir": documents_dir,
-            "Max input length": max_input_length,
-            "Max generation num": max_generation_num,
-            "Logger path": logger_path,
-            "Prediction path": prediction_path,
-        },
-    )
-
     database_count = run_baseline_retrieval(
         dataset_df=dataset_df,
         dataset_name=dataset_name,
@@ -214,8 +190,10 @@ def main() -> None:
         ranking_llm=ranking_llm,
         prediction_path=prediction_path,
     )
-    logger.info("Loaded database schema count: %s", database_count)
-    logger.info("Completed %s records.", len(dataset_df))
+    print(
+        f"Completed {len(dataset_df)} baseline database records "
+        f"across {database_count} schemas."
+    )
 
 
 if __name__ == "__main__":

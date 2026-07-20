@@ -74,6 +74,7 @@ def _schema_state(
     *,
     method: str,
     db_id: str,
+    dataset_name: str,
 ) -> tuple[
     str,
     list[dict[str, Any]],
@@ -115,8 +116,17 @@ def _schema_state(
         if not isinstance(table_names, list):
             table_names = []
 
-    final_tables = normalize_tables(db_id, table_names)
-    final_columns = normalize_columns(db_id, columns_by_table)
+    snowflake_three_part = str(dataset_name).strip().lower() == "spider2"
+    final_tables = normalize_tables(
+        db_id,
+        table_names,
+        snowflake_three_part=snowflake_three_part,
+    )
+    final_columns = normalize_columns(
+        db_id,
+        columns_by_table,
+        snowflake_three_part=snowflake_three_part,
+    )
     if method == "table_to_column" and record.get("table_filtering_enabled", True):
         table_status = "failed" if table_error else ("success" if final_tables else "empty")
         stages.append(
@@ -155,6 +165,7 @@ def build_prediction_from_native(
         schema_record,
         method=method,
         db_id=db_id,
+        dataset_name=dataset_name,
     )
 
     if database_status != "success":

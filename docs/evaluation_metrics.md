@@ -22,6 +22,11 @@ LA = \frac{\text{数据库预测正确的样本数}}{\text{样本总数}}
 EM = \frac{\text{预测列集合与标准答案列集合完全一致的样本数}}{\text{样本总数}}
 \]
 
+Spider2 比较前会把 gold 的 `DB.SCHEMA.TABLE` 规范为 `SCHEMA.TABLE`；统一预测
+不会再次删除同名 schema。为兼容旧产物中已丢失 schema 的裸 `TABLE`，评测器
+只在 `db_info.json` 的预测数据库内存在唯一候选时补全，多义或跨数据库名称仍
+视为不匹配。可用 `--strict-spider2-table-names` 关闭该兼容解析。
+
 ## 3. Recall
 
 `Recall` 用于计算 schema linking 预测列的 Micro Recall。

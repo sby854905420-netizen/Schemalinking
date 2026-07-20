@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
+from Utils.prediction_store import snowflake_identifier_key, split_qualified_identifier
 from Utils.render_tools import SchemaTextRenderer
 from Utils.tools import (
     build_db_id_filter,
@@ -505,6 +506,179 @@ def resolve_schema_text_for_db(
     return schema_store.render_schema_text(db_id, selected_records), selected_records
 
 
+def _snowflake_table_candidates(
+    requested_table: str,
+    *,
+    db_id: str,
+    full_name_index: dict[tuple[str, ...], set[str]],
+    suffix_index: dict[tuple[str, ...], set[str]],
+    basename_index: dict[str, set[str]],
+) -> set[str]:
+    """Resolve one table reference within a selected Spider2 database."""
+
+    parts = split_qualified_identifier(requested_table)
+    key = snowflake_identifier_key(requested_table)
+    if not parts or not key:
+        return set()
+    if len(parts) >= 3:
+        # Never suffix-match a fully qualified name whose outer database is
+        # wrong.  This keeps cross-database predictions fail-closed.
+        return set(full_name_index.get(key, set()))
+    if len(parts) == 2:
+        suffix_matches = set(suffix_index.get(key, set()))
+        if suffix_matches:
+            return suffix_matches
+        db_key = snowflake_identifier_key(db_id)
+        if db_key and key[0] == db_key[0]:
+            # Historical unified artifacts may contain DB.TABLE here because
+            # a bare TABLE was prefixed before db_info was available.
+            return set(basename_index.get(key[-1], set()))
+        return set()
+    return set(basename_index.get(key[0], set()))
+
+
+def canonicalize_snowflake_schema_predictions(
+    *,
+    db_id: str,
+    predicted_columns: dict[str, list[str]],
+    predicted_tables: Sequence[str],
+    schema_store: DbInfoSchemaStore,
+) -> tuple[dict[str, list[str]], list[str], dict[str, Any]]:
+    """Map Spider2 table aliases to canonical db_info three-part names.
+
+    Resolution is restricted to ``db_id`` and only accepts a unique match.
+    Fully qualified references are matched semantically with Snowflake's
+    quoted/unquoted case rules; partial references use schema/table suffixes or
+    a unique basename.  Ambiguous basenames remain unresolved.
+    """
+
+    all_records = schema_store.get_column_records(db_id)
+    available_tables = list(
+        dict.fromkeys(
+            table
+            for record in all_records
+            if (table := get_record_table_name(record))
+        )
+    )
+    available_table_set = set(available_tables)
+    full_name_index: dict[tuple[str, ...], set[str]] = {}
+    suffix_index: dict[tuple[str, ...], set[str]] = {}
+    basename_index: dict[str, set[str]] = {}
+    column_name_index: dict[str, dict[str, set[str]]] = {}
+    for table in available_tables:
+        key = snowflake_identifier_key(table)
+        if not key:
+            continue
+        full_name_index.setdefault(key, set()).add(table)
+        if len(key) >= 2:
+            suffix_index.setdefault(key[-2:], set()).add(table)
+        basename_index.setdefault(key[-1], set()).add(table)
+    for record in all_records:
+        table = get_record_table_name(record)
+        column = clean_text(record.get("column_name"))
+        column_key = snowflake_identifier_key(column)
+        if table and len(column_key) == 1:
+            column_name_index.setdefault(table, {}).setdefault(
+                column_key[0], set()
+            ).add(column)
+
+    def candidates(table: str) -> set[str]:
+        return _snowflake_table_candidates(
+            table,
+            db_id=db_id,
+            full_name_index=full_name_index,
+            suffix_index=suffix_index,
+            basename_index=basename_index,
+        )
+
+    resolved_tables: list[str] = []
+    resolved_table_context: set[str] = set()
+    resolved_alias_count = 0
+    unresolved_tables: list[str] = []
+    ambiguous_tables: list[str] = []
+    for raw_table in predicted_tables:
+        table = str(raw_table).strip()
+        matches = candidates(table)
+        if len(matches) == 1:
+            resolved = next(iter(matches))
+            if resolved != table:
+                resolved_alias_count += 1
+            resolved_table_context.add(resolved)
+        else:
+            resolved = table
+            target = ambiguous_tables if len(matches) > 1 else unresolved_tables
+            if table and table not in target:
+                target.append(table)
+        if resolved and resolved not in resolved_tables:
+            resolved_tables.append(resolved)
+
+    resolved_columns: dict[str, list[str]] = {}
+    unresolved_column_tables: list[str] = []
+    ambiguous_column_tables: list[str] = []
+    resolved_column_alias_count = 0
+    unresolved_columns: list[str] = []
+    ambiguous_columns: list[str] = []
+    for raw_table, raw_columns in predicted_columns.items():
+        table = str(raw_table).strip()
+        matches = candidates(table)
+        if len(matches) > 1 and resolved_table_context:
+            contextual_matches = matches & resolved_table_context
+            if len(contextual_matches) == 1:
+                matches = contextual_matches
+        if len(matches) == 1:
+            resolved = next(iter(matches))
+            if resolved != table:
+                resolved_alias_count += 1
+        else:
+            resolved = table
+            target = (
+                ambiguous_column_tables
+                if len(matches) > 1
+                else unresolved_column_tables
+            )
+            if table and table not in target:
+                target.append(table)
+
+        columns = resolved_columns.setdefault(resolved, [])
+        for raw_column in raw_columns:
+            column = str(raw_column).strip()
+            canonical_column = column
+            if column != "*" and resolved in available_table_set:
+                column_key = snowflake_identifier_key(column)
+                column_matches = (
+                    column_name_index.get(resolved, {}).get(column_key[0], set())
+                    if len(column_key) == 1
+                    else set()
+                )
+                if len(column_matches) == 1:
+                    canonical_column = next(iter(column_matches))
+                    if canonical_column != column:
+                        resolved_column_alias_count += 1
+                else:
+                    identifier = f"{resolved}.{column}"
+                    target = (
+                        ambiguous_columns
+                        if len(column_matches) > 1
+                        else unresolved_columns
+                    )
+                    if identifier not in target:
+                        target.append(identifier)
+            if canonical_column and canonical_column not in columns:
+                columns.append(canonical_column)
+
+    return resolved_columns, resolved_tables, {
+        "available_table_count": len(available_table_set),
+        "resolved_table_alias_count": resolved_alias_count,
+        "resolved_column_alias_count": resolved_column_alias_count,
+        "unresolved_tables": unresolved_tables,
+        "ambiguous_tables": ambiguous_tables,
+        "unresolved_column_tables": unresolved_column_tables,
+        "ambiguous_column_tables": ambiguous_column_tables,
+        "unresolved_columns": unresolved_columns,
+        "ambiguous_columns": ambiguous_columns,
+    }
+
+
 def select_predicted_column_records(
     db_id: str,
     predicted_columns: dict[str, list[str]],
@@ -559,6 +733,7 @@ def select_predicted_column_records(
 __all__ = [
     "DbInfoSchemaStore",
     "build_column_id",
+    "canonicalize_snowflake_schema_predictions",
     "count_prompt_tokens",
     "count_valid_columns",
     "get_ranked_db_column_candidates",

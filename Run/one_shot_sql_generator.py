@@ -1,7 +1,7 @@
 """Reusable helpers for the one-shot mode of :mod:`Run.sql_generator`.
 
-The executable entry point delegates to the unified SQL generator so this
-module cannot read predictions from, or write prediction artifacts to, Logs.
+The executable entry point delegates prediction I/O to the unified SQL
+generator; this module only contains reusable generation helpers.
 """
 
 from __future__ import annotations

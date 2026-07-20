@@ -3,10 +3,14 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from Utils.schema_selection import DbInfoSchemaStore, select_predicted_column_records
+from Utils.schema_selection import (
+    DbInfoSchemaStore,
+    canonicalize_snowflake_schema_predictions,
+    select_predicted_column_records,
+)
 from Utils.schema_prediction_utils import resolve_predicted_columns, resolve_predicted_tables
 from Utils.tools import resolve_hint
-from Utils.value_utils import get_row_value
+from Utils.value_utils import choose_external_knowledge_source, get_row_value
 
 from .result_types import AgentInput
 
@@ -43,6 +47,9 @@ class SchemaLinkingAdapter:
         fallback_sample_id: str = "",
     ) -> AgentInput:
         source = source_row or {}
+        schema_input_error = str(row.get("schema_input_error") or "").strip()
+        if schema_input_error:
+            raise AdapterError("schema_input_error", schema_input_error)
         sample_id_value = get_row_value(row, "id", "instance_id") or get_row_value(
             source, "id", "instance_id"
         )
@@ -58,6 +65,18 @@ class SchemaLinkingAdapter:
 
         predicted_columns = resolve_predicted_columns(row)
         predicted_tables = resolve_predicted_tables(row)
+        name_diagnostics: dict[str, Any] = {}
+        if self.dataset_name.strip().lower() == "spider2":
+            (
+                predicted_columns,
+                predicted_tables,
+                name_diagnostics,
+            ) = canonicalize_snowflake_schema_predictions(
+                db_id=predict_db_id,
+                predicted_columns=predicted_columns,
+                predicted_tables=predicted_tables,
+                schema_store=self.schema_store,
+            )
         selected_records, _ = select_predicted_column_records(
             db_id=predict_db_id,
             predicted_columns=predicted_columns,
@@ -71,11 +90,24 @@ class SchemaLinkingAdapter:
                     "invalid_predict_db_id",
                     f"Predicted database '{predict_db_id}' is absent from db_info.json.",
                 )
-            raise AdapterError("empty_predicted_schema", "No selected schema columns.")
+            unresolved = [
+                *name_diagnostics.get("unresolved_column_tables", []),
+                *name_diagnostics.get("ambiguous_column_tables", []),
+            ]
+            detail = (
+                f" Unresolved or ambiguous table identifiers: {unresolved!r}."
+                if unresolved
+                else ""
+            )
+            raise AdapterError(
+                "empty_predicted_schema",
+                f"No selected schema columns.{detail}",
+            )
 
-        # Only question/hint/id are read from source data. Gold db/schema/SQL never
-        # become fields of AgentInput or influence executor routing.
-        hint_source = source if "external_knowledge" in source else row
+        # Only question/hint/id are read from source data here. Any method-specific
+        # preparation (including AutoLink's explicit oracle-database filtering) has
+        # already been materialized in the prediction row.
+        hint_source = choose_external_knowledge_source(source, row)
         hint = resolve_hint(
             hint_source,
             dataset_name=self.dataset_name,

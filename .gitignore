@@ -9,6 +9,7 @@ __pycache__/
 # Local experiment artifacts
 Logs/
 results/
+tests/
 
 # Large local datasets
 Data/

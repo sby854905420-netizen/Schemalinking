@@ -54,8 +54,9 @@ def snowflake_connection_params(
     if missing:
         raise ValueError("Missing Snowflake credential fields: " + ", ".join(missing))
 
-    # The database is deliberately forced from predict_db_id. A credential-file
-    # default database and every gold database field are ignored.
+    # The database is deliberately forced from the prepared predict_db_id; a
+    # credential-file default database is never used. AutoLink's explicit oracle
+    # filtering, when selected, materializes the gold database upstream.
     return {
         "account": account,
         "user": user,

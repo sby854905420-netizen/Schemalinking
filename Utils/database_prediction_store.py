@@ -1,4 +1,4 @@
-"""Stable database-selection predictions, separate from timestamped run logs."""
+"""Stable database-selection prediction artifacts."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ from config import RESULTS_ROOT
 from Utils.json_utils import atomic_write_json, load_json, upsert_ordered_record
 from Utils.prediction_store import safe_path_component, usage_from_efficiency
 from Utils.value_utils import get_row_value
-from Utils.artifact_paths import reject_logs_prediction_input
 
 
 DATABASE_METHODS = {
@@ -60,9 +59,9 @@ def resolve_database_prediction_input(
     model_name: str,
     results_root: Path | str | None = None,
 ) -> Path:
-    """Resolve an explicit or canonical DB prediction; Logs are never inputs."""
+    """Resolve an explicit or canonical unified database prediction."""
     if explicit_path is not None:
-        return reject_logs_prediction_input(explicit_path)
+        return explicit_path
     unified_path = build_database_prediction_path(
         method,
         dataset_name,

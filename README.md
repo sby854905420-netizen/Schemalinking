@@ -5,7 +5,7 @@
 1. 数据库检索：根据自然语言问题预测最相关的数据库 `predict_db_id`。
 2. Schema Linking：在预测数据库中定位相关表或相关列。
 
-当前代码中主要有 7 个可运行入口：
+当前代码中主要有 9 个可运行入口：
 
 | 阶段 | 脚本 | 作用 |
 | --- | --- | --- |
@@ -16,6 +16,8 @@
 | Schema Linking | [`Baseline/rag_column_retrieval.py`](Baseline/rag_column_retrieval.py) | 纯向量检索 baseline |
 | Schema Linking | [`Run/table_to_column.py`](Run/table_to_column.py) | 先预测相关表，再在候选表范围内预测相关列 |
 | SQL 生成 | [`Run/sql_generator.py`](Run/sql_generator.py) | Spider-Agent-TC 与 one-shot SQL 生成统一入口 |
+| 评估 | [`Evaluation/evaluate_metrics.py`](Evaluation/evaluate_metrics.py) | 计算 LA、EM、Recall、Avg_Ratio、Avg_token、Avg_time |
+| 评估 | [`Evaluation/evaluate_ex.py`](Evaluation/evaluate_ex.py) | 执行预测/gold SQL 并计算 EX |
 
 目录职责和新增文件放置规则见 [`docs/project_structure.md`](docs/project_structure.md)。新结果使用正确拼写的 `database_retrieval`；读取阶段仍兼容历史 `Database_Retrival` 目录及 `*_retrival_*.json` 文件。
 
@@ -39,8 +41,11 @@ pip install -r requirements.txt
 | `PROVIDER` | `transformers` |
 | `MAX_INPUT_LENGTH` | `110000` |
 | `MAX_GENERATEION_NUM` | `2048` |
-| `TOP_KD_CAP` | `512` |
-| `CANDIDATE_DB_TOP_K` | `3` |
+| `HRC_RETRIEVAL_RATIO` | `0.1` |
+| `ROUND1_HRC_RETRIEVAL_CAP` | `500` |
+| `ROUND2_HRC_RETRIEVAL_CAP` | `50` |
+| `ROUND1_DATABASE_TOP_K` | `10` |
+| `ROUND1_RERANK_TOP_K` | `3` |
 
 ### Provider 兼容性
 
@@ -107,6 +112,8 @@ python -m Run.sql_generator \
 
 - `external_knowledge`：作为 hint 注入 prompt。
 - 对 `Spider2`，`external_knowledge` 会被当作 `Data/Spider2/documents/` 下的文件名；如果找不到对应文件，则保留原值作为 hint。
+- `table_to_column.py` 和 prompt schema baseline 会按样本 id 从 `gold_sl.json` 恢复 hint；统一数据库预测文件不需要重复保存该字段。
+- HRC 向量检索始终只编码 question，`external_knowledge` 不参与 HRC 选取；纯 RAG baseline 同样不使用该字段。
 
 ## 3. 推荐运行流程
 
@@ -125,11 +132,33 @@ python -m Indexing.build_column_index \
 
 默认 collection 名称会从 `db_info.json` 的父目录推断，例如 `Data/MMQA/db_info.json` 对应 `MMQA`。
 
-重要限制：
+注意事项：
 
-- `global_coarse_retrieval.py` 当前固定使用 `dataset_name` 作为 Qdrant collection 名称，所以构建索引时建议保持 `--collection-name` 与 `--dataset-name` 一致。
-- `table_to_column.py` 会读取 `qdrant_column_index/meta.json` 中的 collection 名称。
+- 三个 Qdrant 检索入口都支持 `--qdrant-path` 和 `--collection-name`。collection 名称的解析优先级为：显式 `--collection-name`、索引目录中的 `meta.json`、`--dataset-name`。
 - 构建索引时的 embedding 模型应与 [`config.py`](config.py) 中的 `EMBEDDING_MODEL_NAME` 保持一致，否则查询阶段可能出现向量维度不匹配或效果异常。
+
+#### 在 Slurm job 中使用节点本地索引
+
+多个 job 不应直接打开 Lustre 上的同一个嵌入式 Qdrant 目录。每个 job 启动后，先把已经构建完成且不会再写入的索引复制到节点本地临时目录，再把该目录传给检索入口：
+
+```bash
+DATASET_NAME=Spider2
+SOURCE_INDEX="Data/${DATASET_NAME}/qdrant_column_index"
+LOCAL_BASE="${SLURM_TMPDIR:-${TMPDIR:-/tmp}}/mdb-link-${SLURM_JOB_ID:-$$}"
+LOCAL_INDEX="${LOCAL_BASE}/${DATASET_NAME}/qdrant_column_index"
+
+mkdir -p "${LOCAL_INDEX}"
+rsync -a --delete --exclude='.lock' "${SOURCE_INDEX}/" "${LOCAL_INDEX}/"
+
+python -m Run.global_coarse_retrieval \
+  --dataset-name "${DATASET_NAME}" \
+  --qdrant-path "${LOCAL_INDEX}" \
+  --collection-name "${DATASET_NAME}" \
+  --answer-llm-name mistralai/Ministral-3-8B-Instruct-2512 \
+  --provider transformers
+```
+
+`table_to_column.py` 和 `rag_column_retrieval.py` 使用相同的 `--qdrant-path "${LOCAL_INDEX}"` 参数。任务结束后，Slurm 通常会清理节点临时目录；不要把运行时产生的 `.lock` 同步回源索引。
 
 ### 3.2 基线流程
 
@@ -148,7 +177,7 @@ python -m Baseline.baseline_schema_linking \
   --provider transformers
 ```
 
-数据库检索把运行期文本写入 `Logs/`，稳定预测写入 `results/db/baseline/<dataset>/<model>/prediction.json`。`baseline_schema_linking.py` 只读取后者，不会扫描 `Logs/`。
+Baseline 只写稳定预测 `results/db/baseline/<dataset>/<model>/prediction.json`；不会创建文本日志或结构化决策轨迹。`baseline_schema_linking.py` 读取该预测文件。
 
 ### 3.3 检索增强流程
 
@@ -158,8 +187,7 @@ python -m Baseline.baseline_schema_linking \
 python -m Run.global_coarse_retrieval \
   --dataset-name MMQA \
   --answer-llm-name mistralai/Ministral-3-8B-Instruct-2512 \
-  --provider transformers \
-  --candidate-db-top-k 3
+  --provider transformers
 
 python -m Run.table_to_column \
   --method few_shot \
@@ -172,10 +200,10 @@ python -m Run.table_to_column \
 
 `global_coarse_retrieval.py` 的粗检索逻辑：
 
-1. 对问题做 embedding，检索全局高相关列。
-2. 按数据库聚合检索命中，做基于命中数和相似度的剪枝。
-3. 对候选数据库逐个构造二分类 prompt，通过 yes/no 下一 token 概率重排。
-4. 如果第一轮候选数大于 `--candidate-db-top-k`，会在 top-k 数据库内再做一轮召回、剪枝和重排。
+1. 对问题做 embedding。第一轮 HRC 数量为 `ceil(全部数据库总列数 × 10%)`，上限为 500；检索在全部数据库列组成的联合空间中进行。
+2. 按数据库聚合 HRC 命中，使用命中阈值/相似度 80% 分位数规则过滤，再按照 `max_score`、`score_sum`、`hit_count` 依次降序排序，最多保留 Top-10 进入第一轮 LLM 重排。
+3. 如果第一轮候选数据库不超过 3 个，第一轮 LLM 直接选择 Top-1，并跳过第二轮；否则第一轮 LLM 选择 Top-3。
+4. 第二轮仅在该 Top-3 数据库的联合列空间中检索，HRC 数量为 `ceil(Top-3 数据库总列数 × 10%)`，上限为 50。对结果再次做数据库剪枝后，LLM 重排选出最终 Top-1。
 
 ### 3.4 指定数据库预测方法或文件
 
@@ -189,11 +217,11 @@ python -m Run.table_to_column \
   --database-model-name mistralai/Ministral-3-8B-Instruct-2512
 ```
 
-`--input-path` 可显式读取某个统一 DB prediction，并具有最高优先级；旧的 Logs JSON 格式不再接受。
+`--input-path` 可显式读取某个统一 DB prediction，并具有最高优先级；输入内容仍须满足统一预测契约。
 
 ## 4. 输出文件
 
-各阶段的 `.json` 预测全部写入 `results/`；检索与 Schema Linking 脚本还会通过 [`Utils/logging_utils.py`](Utils/logging_utils.py) 在 `Logs/` 生成独立的 `.log` 文本日志。
+各阶段的 `.json` 预测全部写入 `results/`。检索增强主流程另外写入稳定、覆盖式的结构化决策轨迹；相同方法、数据集和模型再次运行时会直接替换上一次轨迹，不创建 `run_id` 子目录。
 
 | 脚本 | 默认输出位置 |
 | --- | --- |
@@ -207,7 +235,27 @@ python -m Run.table_to_column \
 说明：
 
 - 模型名中的 `/` 会被安全转换为 `__`，不会产生意外的多级预测目录。
-- `Logs/` 仅包含 `.log` 文本，不包含任何供下游消费的预测结果。
+- 所有入口都不创建运行期文本日志。`baseline_database_retrieval.py`、`baseline_schema_linking.py` 和 `rag_column_retrieval.py` 也不写结构化决策轨迹，只保存稳定预测结果。
+
+结构化轨迹使用以下稳定目录：
+
+```text
+results/traces/db/global_coarse_<mode>/<dataset>/<db_model>/
+├── metadata.json
+├── events.jsonl
+└── summary.json
+
+results/traces/sl/table_to_column/<dataset>/<sl_model>/
+├── metadata.json
+├── events.jsonl
+└── summary.json
+```
+
+- `metadata.json` 记录数据集、方法、模型、输入和索引等实验身份信息以及运行状态；运行级失败时额外记录精简的 `error={type,message}`。
+- `events.jsonl` 逐样本记录 HRC 数量、数据库剪枝结果、LLM 重排结果、表预测、列预测、诊断字段和异常。它不记录运行时间、token 花费、HRC 的具体列、embedding、完整 prompt 或代码中固定的筛选参数。
+- `summary.json` 汇总数据库、表和列阶段的保留率、准确率、召回率及首次错误阶段。
+- `first_error_stage` 表示最早出现的中间退化阶段；即使下游模型偶然恢复出完整正确结果，该早期候选范围损失仍会被保留。第二轮 HRC/剪枝召回率只以实际进入第二轮的样本为分母。
+- 当上游方法为 `global_coarse_rerank` 或 `global_coarse_pruning` 时，`table_to_column.py` 会校验并复制对应数据库事件，再追加表预测、列预测和样本最终结果，因此可以沿同一条轨迹定位数据库、表和列阶段的错误。以 baseline 数据库预测为输入时不创建结构化轨迹。
 
 数据库检索写入统一、原子更新的预测：
 
@@ -223,7 +271,7 @@ Schema Linking 完成后会写入：
 results/sl/<sl_method>/<dataset>/<sl_model>/prediction.json
 ```
 
-其中 `sl_method` 为 `prompt_baseline`、`table_to_column` 或 `rag_column_retrieval`。表名前缀严格匹配 `predict_db_id + "."` 时会在统一结果中去掉；SQL generator 读取 Spider2 统一结果时会重新组合 Snowflake 三段表名。
+其中本项目生成的 `sl_method` 为 `prompt_baseline`、`table_to_column` 或 `rag_column_retrieval`；SQL generator 也接受统一契约下的 `linkalign` 和 `autolink` 外部结果。SQLite 数据集会去掉严格匹配的 `predict_db_id + "."` 前缀；Spider2 只会从真正的 `DB.SCHEMA.TABLE` 三段名中去掉最外层 DB，已经是 `SCHEMA.TABLE` 的两段名保持不变。SQL generator 使用 `db_info.json` 将 Spider2 表名保守解析回 canonical 三段名；裸表名仅在目标数据库内唯一时补全，歧义时不会猜测。
 
 SQL 统一结果独立保存，不修改 Schema Linking 文件：
 
@@ -232,6 +280,8 @@ results/sql/<sql_method>/<dataset>/<sql_model>/<sl_method>/<sl_model>.json
 ```
 
 SQL generator 可通过 `--input-path` 直接读取统一 SL 文件，也可同时指定 `--sl-method` 和 `--schema-llm-name` 使用默认统一路径。
+
+`method: autolink` 是显式的 oracle-database 对比模式。SQL generator 使用 `Data/<dataset>/gold_sl.json` 按稳定样本 ID 定位 gold `db_id`（MMQA 将 `mmqa_N` 映射到 gold ID `N`，校验 question 完全一致，并以 gold ID 写出 SQL 结果），只保留 AutoLink `schema_linking.final.columns` 中属于该数据库的列；其他数据库的表列全部丢弃。若样本无法可靠匹配 gold 记录，或 gold 数据库没有任何预测列，该样本会在调用 SQL 模型前直接写为 `failed`。为保证不引入预测之外的列，该模式拒绝 `--include-key-columns`。
 
 ## 5. 脚本参数
 
@@ -279,18 +329,17 @@ SQL generator 可通过 `--input-path` 直接读取统一 SL 文件，也可同�
 | `--answer-llm-name` | LLM 名称 | `ANSWER_LLM_NAME` |
 | `--provider` | 当前实际需要 `transformers` | `PROVIDER` |
 | `--input-path` | 输入样本文件路径 | `Data/<dataset>/gold_sl.json` |
+| `--qdrant-path` | 本地 Qdrant 索引目录 | `Data/<dataset>/qdrant_column_index` |
+| `--collection-name` | Qdrant collection 名称 | `meta.json` 中的名称，缺失时使用 dataset 名 |
 | `--prediction-path` | 统一 DB prediction 输出路径 | `results/db/global_coarse_<mode>/<dataset>/<model>/prediction.json` |
 | `--max-input-length` | 最大输入 token 数 | `MAX_INPUT_LENGTH` |
 | `--max-generation-num` | 最大生成 token 数 | `MAX_GENERATEION_NUM` |
-| `--candidate-db-top-k` | 第一轮重排后保留的候选数据库数量 | `CANDIDATE_DB_TOP_K` |
-| `--enable-progress-log` | 写入逐样本、逐步骤的详细日志 | 关闭 |
 
 补充说明：
 
-- 当前代码没有 `--qdrant-path` 参数，固定读取 `Data/<dataset>/qdrant_column_index`。
-- 当前代码固定使用 `dataset_name` 作为 Qdrant collection 名称。
 - prompt 模板固定为 `Templates/zero_shot/binary_classification_database.txt`。
-- 当前 prompt 裁剪预算由 `resolve_prompt_token_cap()` 控制。实际调用未传入脚本级常量，因此使用工具函数默认值：soft cap 为 `0.85 * max_input_length`，hard cap 为 `max_input_length - 512`。日志中还会记录脚本级 `PROMPT_BUDGET_RATIO = 0.8` 和 `PROMPT_BUDGET_BUFFER = 512`。
+- prompt 裁剪预算由 `resolve_prompt_token_cap()` 控制：soft cap 为 `0.85 * max_input_length`，hard cap 为 `max_input_length - 512`。
+- 第一轮 LLM 的分支规则固定为：候选数据库不超过 3 个时直接选择 Top-1，否则选择 Top-3 并进入第二轮。
 
 ### 5.4 `Baseline/baseline_schema_linking.py`
 
@@ -334,6 +383,7 @@ SQL generator 可通过 `--input-path` 直接读取统一 SL 文件，也可同�
 | `--database-model-name` | 数据库预测模型 | 与 `--answer-llm-name` 相同 |
 | `--db-info-path` | `db_info.json` 路径 | `Data/<dataset>/db_info.json` |
 | `--qdrant-path` | 本地 Qdrant 索引目录 | `Data/<dataset>/qdrant_column_index` |
+| `--collection-name` | Qdrant collection 名称 | `meta.json` 中的名称，缺失时使用 dataset 名 |
 | `--prediction-path` | 统一 SL prediction 输出路径 | `results/sl/table_to_column/<dataset>/<model>/prediction.json` |
 
 补充说明：
@@ -355,7 +405,7 @@ Spider-Agent-TC 会把当前数据集的执行函数和 `terminate` 作为原生
 
 执行后端：
 
-- Spider2 使用 Snowflake。通过 `--snowflake-credential-path` 传入 JSON；支持 `account`、`username`/`user`、`password`/`pat`/`token`、`warehouse`、`role`。连接 database 始终取当前样本的 `predict_db_id`，不会采用 credential 中的默认 database 或 gold database。
+- Spider2 使用 Snowflake。通过 `--snowflake-credential-path` 传入 JSON；支持 `account`、`username`/`user`、`password`/`pat`/`token`、`warehouse`、`role`。连接 database 始终取预处理后样本的 `predict_db_id`，不会采用 credential 中的默认 database；仅 `method: autolink` 的显式 oracle-database 模式会先把它设为 gold database。
 - MMQA 默认在 `Data/MMQA/Sqlite_database` 定位只读 SQLite；BIRD 默认在 `Data/BIRD/Raw_data/dev_databases` 定位。可以用 `--database-root` 覆盖。SQLite 使用 `mode=ro`，禁止 `ATTACH`。
 
 Spider2 示例：
@@ -387,7 +437,7 @@ SQL 预测文件使用统一 `predictions` 契约，每条记录包含 `id`、`p
 ## 7. 常见注意事项
 
 1. `build_column_index.py` 可通过 `--model-name` 指定 embedding 模型，但查询阶段使用 [`config.py`](config.py) 中的 `EMBEDDING_MODEL_NAME`，两者应保持一致。
-2. `global_coarse_retrieval.py` 当前没有读取 Qdrant `meta.json`，collection 名必须和 `--dataset-name` 一致。
+2. 并发 Slurm job 应各自把 Qdrant 索引复制到节点本地目录，并通过 `--qdrant-path` 使用自己的副本；不要共享同一个嵌入式索引目录。
 3. `baseline_schema_linking.py` 和 `table_to_column.py` 只读取 `results/db` 或显式统一输入；跨模型组合请传入 `--database-model-name`。
 4. `Spider2` 的 hint 读取方式和其他数据集不同：`external_knowledge` 会优先作为文档文件名解析。
 5. 如果使用 `openai` provider，可以导出 `OPENAI_API_KEY`，或通过 `OPENAI_CREDENTIAL_PATH` / `--credential-path` 指向 JSON 凭据文件；代码不会自动加载 `.env`。

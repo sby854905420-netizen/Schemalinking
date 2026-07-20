@@ -25,7 +25,7 @@ from Utils.render_tools import SchemaTextRenderer
 from Utils.schema_selection import DbInfoSchemaStore
 from Utils.tools import load_db_info_index
 from Utils.value_utils import get_row_value
-from Utils.artifact_paths import reject_logs_prediction_input, require_results_output
+from Utils.artifact_paths import require_results_output
 from Utils.sql_prediction_store import (
     build_sql_prediction_path,
     initialize_sql_prediction_file,
@@ -80,7 +80,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--max-input-length", type=int, default=DEFAULT_MAX_INPUT_LENGTH)
     parser.add_argument("--max-generation-num", type=int, default=DEFAULT_SQL_GENERATION_NUM)
-    parser.add_argument("--max-agent-rounds", type=int, default=10)
+    parser.add_argument("--max-agent-rounds", type=int, default=20)
     parser.add_argument("--max-llm-retries", type=int, default=2)
     parser.add_argument("--rollout-number", type=int, default=1)
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -197,10 +197,22 @@ def _failure_record(
     )
 
 
-def load_schema_records(path: Path, dataset_name: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def load_schema_records(
+    path: Path,
+    dataset_name: str,
+    *,
+    gold_records: Sequence[Mapping[str, Any]] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     payload = legacy.load_json(path)
     unified = validate_prediction_file(payload)
-    return unified_to_native_schema_records(unified, dataset_name), unified
+    return (
+        unified_to_native_schema_records(
+            unified,
+            dataset_name,
+            gold_records=gold_records,
+        ),
+        unified,
+    )
 
 
 def _write_sql_prediction(
@@ -453,7 +465,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     tool_schemas = build_tool_schemas(dataset_name)
 
     explicit_input_path = (
-        reject_logs_prediction_input(resolve_project_path(args.input_path))
+        resolve_project_path(args.input_path)
         if args.input_path
         else None
     )
@@ -462,9 +474,24 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     if not input_path.is_file():
         raise FileNotFoundError(f"Could not find unified SL prediction: {input_path}")
-    schema_records, unified_sl_payload = load_schema_records(input_path, dataset_name)
+    gold_records = None
+    if dataset_path.is_file():
+        loaded_gold_records = legacy.load_json(dataset_path)
+        if not isinstance(loaded_gold_records, list):
+            raise ValueError(f"Expected a list of dataset rows in {dataset_path}.")
+        gold_records = loaded_gold_records
+    schema_records, unified_sl_payload = load_schema_records(
+        input_path,
+        dataset_name,
+        gold_records=gold_records,
+    )
     sl_method = str(unified_sl_payload["method"])
     schema_llm_name = unified_sl_payload["model_names"]["schema_linking"]
+    if sl_method == "autolink" and args.include_key_columns:
+        raise ValueError(
+            "AutoLink gold-database filtering cannot be combined with "
+            "--include-key-columns because unpredicted columns must be discarded."
+        )
     dataset_index = legacy.load_dataset_index(dataset_path)
     db_info_index = load_db_info_index(db_info_path)
     executor_factory = ExecutorFactory(

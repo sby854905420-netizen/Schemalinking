@@ -18,7 +18,13 @@ from config import RESULTS_ROOT
 from Utils.json_utils import atomic_write_json, load_json, upsert_ordered_record
 
 
-METHOD_NAMES = {"prompt_baseline", "table_to_column", "rag_column_retrieval"}
+METHOD_NAMES = {
+    "autolink",
+    "linkalign",
+    "prompt_baseline",
+    "rag_column_retrieval",
+    "table_to_column",
+}
 PHASE_STATUSES = {"not_run", "success", "empty", "failed", "not_supported"}
 SAMPLE_STATUSES = {"success", "partial", "failed"}
 STAGE_NAMES = {
@@ -324,9 +330,7 @@ def _validate_measure(value: Any, *, allow_float: bool, where: str) -> None:
         raise PredictionValidationError(f"{where} contains an invalid usage value.")
 
 
-def normalize_identifier(value: Any) -> str:
-    """Remove display-only fences and a single unambiguous wrapper quote."""
-
+def _strip_display_fences(value: Any) -> str:
     text = str(value or "").strip()
     if text.startswith("```"):
         lines = text.splitlines()
@@ -335,6 +339,13 @@ def normalize_identifier(value: Any) -> str:
         if lines and lines[-1].strip() == "```":
             lines = lines[:-1]
         text = "\n".join(lines).strip()
+    return text
+
+
+def normalize_identifier(value: Any) -> str:
+    """Remove display-only fences and a single unambiguous wrapper quote."""
+
+    text = _strip_display_fences(value)
     for quote in ('"', "'", "`"):
         if len(text) >= 2 and text.startswith(quote) and text.endswith(quote) and text.count(quote) == 2:
             text = text[1:-1].strip()
@@ -348,11 +359,124 @@ def normalize_table_name(db_id: str, table_name: Any) -> str:
     return table[len(prefix) :] if db_id and table.startswith(prefix) else table
 
 
-def normalize_tables(db_id: str, table_names: Sequence[Any] | None) -> list[dict[str, str]]:
+def split_qualified_identifier(value: Any) -> tuple[str, ...]:
+    """Split a dotted identifier without splitting dots inside Snowflake quotes.
+
+    An empty tuple denotes a malformed identifier (for example, an unclosed
+    quote or an empty component).  Components retain their original quoting so
+    callers can preserve Snowflake's quoted-identifier case semantics.
+    """
+
+    text = _strip_display_fences(value)
+    if not text:
+        return ()
+    parts: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if quote is not None:
+            current.append(char)
+            if char == quote:
+                if quote == '"' and index + 1 < len(text) and text[index + 1] == '"':
+                    current.append(text[index + 1])
+                    index += 1
+                else:
+                    quote = None
+        elif char in ('"', "`"):
+            quote = char
+            current.append(char)
+        elif char == ".":
+            component = "".join(current).strip()
+            if not component:
+                return ()
+            parts.append(component)
+            current = []
+        else:
+            current.append(char)
+        index += 1
+
+    component = "".join(current).strip()
+    if quote is not None or not component:
+        return ()
+    parts.append(component)
+    return tuple(parts)
+
+
+def snowflake_identifier_key(value: Any) -> tuple[str, ...]:
+    """Return Snowflake's semantic key for a possibly-qualified identifier.
+
+    Unquoted components are case-insensitive and therefore normalized to upper
+    case.  Double-quoted components retain exact case, including escaped quote
+    handling.  A malformed identifier has an empty key.
+    """
+
+    parts = split_qualified_identifier(value)
+    keys: list[str] = []
+    for part in parts:
+        if len(part) >= 2 and part.startswith('"') and part.endswith('"'):
+            keys.append(part[1:-1].replace('""', '"'))
+        elif len(part) >= 2 and part.startswith("`") and part.endswith("`"):
+            keys.append(part[1:-1])
+        else:
+            keys.append(part.upper())
+    return tuple(keys)
+
+
+def normalize_snowflake_table_name(db_id: str, table_name: Any) -> str:
+    """Remove only a genuine outer DB from a Snowflake three-part name.
+
+    Two-part names are already the unified ``SCHEMA.TABLE`` representation.
+    In particular, ``PAGILA.ACTOR`` must not be shortened to ``ACTOR`` merely
+    because the Spider2 database and schema happen to share the name PAGILA.
+    """
+
+    table = _strip_display_fences(table_name)
+    parts = split_qualified_identifier(table)
+    db_key = snowflake_identifier_key(db_id)
+    if len(parts) >= 3 and db_key and snowflake_identifier_key(parts[0]) == db_key:
+        return ".".join(parts[1:])
+    return table
+
+
+def restore_snowflake_table_name(db_id: str, table_name: Any) -> str:
+    """Restore unified Snowflake names without duplicating a three-part name."""
+
+    table = _strip_display_fences(table_name)
+    parts = split_qualified_identifier(table)
+    if not db_id or not parts or len(parts) >= 3:
+        return table
+    return f"{db_id}.{table}"
+
+
+def _database_identifier_matches(
+    db_id: str,
+    value: Any,
+    *,
+    snowflake: bool,
+) -> bool:
+    if snowflake:
+        db_key = snowflake_identifier_key(db_id)
+        value_key = snowflake_identifier_key(value)
+        return len(db_key) == len(value_key) == 1 and db_key == value_key
+    return normalize_identifier(value) == db_id
+
+
+def normalize_tables(
+    db_id: str,
+    table_names: Sequence[Any] | None,
+    *,
+    snowflake_three_part: bool = False,
+) -> list[dict[str, str]]:
     records: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
     for raw_table in table_names or []:
-        table = normalize_table_name(db_id, raw_table)
+        table = (
+            normalize_snowflake_table_name(db_id, raw_table)
+            if snowflake_three_part
+            else normalize_table_name(db_id, raw_table)
+        )
         key = (db_id, table)
         if not db_id or not table or key in seen:
             continue
@@ -362,7 +486,10 @@ def normalize_tables(db_id: str, table_names: Sequence[Any] | None) -> list[dict
 
 
 def normalize_columns(
-    db_id: str, columns_by_table: Mapping[Any, Sequence[Any]] | None
+    db_id: str,
+    columns_by_table: Mapping[Any, Sequence[Any]] | None,
+    *,
+    snowflake_three_part: bool = False,
 ) -> list[dict[str, str]]:
     records: list[dict[str, str]] = []
     seen: set[tuple[str, str, str]] = set()
@@ -371,7 +498,11 @@ def normalize_columns(
     for raw_table, raw_columns in columns_by_table.items():
         if not isinstance(raw_columns, Sequence) or isinstance(raw_columns, (str, bytes)):
             continue
-        table = normalize_table_name(db_id, raw_table)
+        table = (
+            normalize_snowflake_table_name(db_id, raw_table)
+            if snowflake_three_part
+            else normalize_table_name(db_id, raw_table)
+        )
         for raw_column in raw_columns:
             column = normalize_identifier(raw_column)
             key = (db_id, table, column)
@@ -476,33 +607,255 @@ def build_prediction(
     return prediction
 
 
+def _gold_record_aliases(record: Mapping[str, Any], dataset_name: str) -> list[str]:
+    raw_id = record.get("id", record.get("instance_id"))
+    if raw_id is None:
+        return []
+    sample_id = str(raw_id).strip()
+    if not sample_id:
+        return []
+    if str(dataset_name).strip().lower() == "mmqa":
+        return [f"mmqa_{sample_id}"] if sample_id.isdigit() else []
+    return [sample_id]
+
+
+def _index_gold_records(
+    gold_records: Sequence[Mapping[str, Any]], dataset_name: str
+) -> dict[str, Mapping[str, Any]]:
+    index: dict[str, Mapping[str, Any]] = {}
+    for record in gold_records:
+        if not isinstance(record, Mapping):
+            continue
+        for alias in _gold_record_aliases(record, dataset_name):
+            existing = index.get(alias)
+            if existing is not None and existing is not record:
+                raise PredictionValidationError(
+                    f"Duplicate gold sample id or alias: {alias!r}."
+                )
+            index[alias] = record
+    return index
+
+
+def _native_autolink_record(
+    prediction: Mapping[str, Any],
+    *,
+    dataset_name: str,
+    gold_index: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    sample_id = str(prediction["id"])
+    gold = gold_index.get(sample_id)
+    external_knowledge = prediction.get("external_knowledge")
+    if gold is None:
+        return {
+            "id": sample_id,
+            "question": prediction["question"],
+            "external_knowledge": external_knowledge,
+            "predict_db_id": None,
+            "predict_tables": [],
+            "predict_columns": {},
+            "schema_input_error": (
+                f"AutoLink sample {sample_id!r} could not be matched to a gold record."
+            ),
+        }
+
+    raw_gold_id = gold.get("id", gold.get("instance_id"))
+    gold_sample_id = str(raw_gold_id).strip() if raw_gold_id is not None else ""
+    if not gold_sample_id:
+        return {
+            "id": sample_id,
+            "question": prediction["question"],
+            "external_knowledge": external_knowledge,
+            "predict_db_id": None,
+            "predict_tables": [],
+            "predict_columns": {},
+            "schema_input_error": (
+                f"Gold record for AutoLink sample {sample_id!r} has no stable id."
+            ),
+        }
+
+    predicted_question = str(prediction.get("question") or "").strip()
+    gold_question = str(gold.get("question") or "").strip()
+    if predicted_question != gold_question:
+        return {
+            "id": gold_sample_id,
+            "question": prediction["question"],
+            "external_knowledge": external_knowledge,
+            "predict_db_id": None,
+            "predict_tables": [],
+            "predict_columns": {},
+            "schema_input_error": (
+                f"AutoLink sample {sample_id!r} does not match its gold question."
+            ),
+        }
+
+    if external_knowledge is None:
+        external_knowledge = gold.get("external_knowledge")
+    gold_db_id = normalize_identifier(gold.get("db_id"))
+    if not gold_db_id:
+        return {
+            "id": gold_sample_id,
+            "question": prediction["question"],
+            "external_knowledge": external_knowledge,
+            "predict_db_id": None,
+            "predict_tables": [],
+            "predict_columns": {},
+            "schema_input_error": (
+                f"Gold record for AutoLink sample {sample_id!r} has no db_id."
+            ),
+        }
+
+    snowflake = str(dataset_name).strip().lower() == "spider2"
+
+    def restore_table(table_name: Any) -> str:
+        if snowflake:
+            return restore_snowflake_table_name(gold_db_id, table_name)
+        table = normalize_identifier(table_name)
+        return normalize_table_name(gold_db_id, table)
+
+    final = prediction["schema_linking"]["final"]
+    filtered_columns = [
+        column
+        for column in final["columns"]
+        if _database_identifier_matches(
+            gold_db_id,
+            column.get("db_id"),
+            snowflake=snowflake,
+        )
+    ]
+    if not filtered_columns:
+        return {
+            "id": gold_sample_id,
+            "question": prediction["question"],
+            "external_knowledge": external_knowledge,
+            "predict_db_id": gold_db_id,
+            "predict_tables": [],
+            "predict_columns": {},
+            "schema_input_error": (
+                "AutoLink predicted no columns for gold database "
+                f"{gold_db_id!r}."
+            ),
+        }
+
+    column_table_order: list[str] = []
+    predicted_columns: dict[str, list[str]] = {}
+    for column in filtered_columns:
+        table = restore_table(column.get("table"))
+        column_name = normalize_identifier(column.get("column"))
+        if not table or not column_name:
+            continue
+        if table not in predicted_columns:
+            column_table_order.append(table)
+            predicted_columns[table] = []
+        if column_name not in predicted_columns[table]:
+            predicted_columns[table].append(column_name)
+
+    if not predicted_columns:
+        return {
+            "id": gold_sample_id,
+            "question": prediction["question"],
+            "external_knowledge": external_knowledge,
+            "predict_db_id": gold_db_id,
+            "predict_tables": [],
+            "predict_columns": {},
+            "schema_input_error": (
+                "AutoLink predicted no usable columns for gold database "
+                f"{gold_db_id!r}."
+            ),
+        }
+
+    predicted_tables: list[str] = []
+    for table in final["tables"]:
+        if not _database_identifier_matches(
+            gold_db_id,
+            table.get("db_id"),
+            snowflake=snowflake,
+        ):
+            continue
+        table_name = restore_table(table.get("table"))
+        if (
+            table_name in predicted_columns
+            and table_name not in predicted_tables
+        ):
+            predicted_tables.append(table_name)
+    predicted_tables.extend(
+        table for table in column_table_order if table not in predicted_tables
+    )
+
+    return {
+        "id": gold_sample_id,
+        "question": prediction["question"],
+        "external_knowledge": external_knowledge,
+        "predict_db_id": gold_db_id,
+        "predict_tables": predicted_tables,
+        "predict_columns": predicted_columns,
+    }
+
+
 def unified_to_native_schema_records(
-    payload: Mapping[str, Any], dataset_name: str
+    payload: Mapping[str, Any],
+    dataset_name: str,
+    *,
+    gold_records: Sequence[Mapping[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Adapt unified SL records to the existing SQL generator input contract."""
 
     unified = validate_prediction_file(payload)
+    if unified["dataset"].strip().lower() != str(dataset_name).strip().lower():
+        raise PredictionValidationError(
+            "Prediction dataset does not match the SQL generation dataset."
+        )
+    if unified["method"] == "autolink":
+        if gold_records is None:
+            raise PredictionValidationError(
+                "AutoLink SQL generation requires gold records for database filtering."
+            )
+        gold_index = _index_gold_records(gold_records, dataset_name)
+        return [
+            _native_autolink_record(
+                prediction,
+                dataset_name=dataset_name,
+                gold_index=gold_index,
+            )
+            for prediction in unified["predictions"]
+        ]
+
     snowflake = str(dataset_name).lower() == "spider2"
     records: list[dict[str, Any]] = []
     for prediction in unified["predictions"]:
         selected = prediction["database_selection"]["selected_db_ids"]
-        db_id = selected[0] if selected else None
+        db_id = normalize_identifier(selected[0]) if selected else None
 
         def restore_table(table_name: str) -> str:
-            if snowflake and db_id and not table_name.startswith(f"{db_id}."):
-                return f"{db_id}.{table_name}"
-            return table_name
+            if snowflake and db_id:
+                return restore_snowflake_table_name(db_id, table_name)
+            return normalize_identifier(table_name)
 
         final = prediction["schema_linking"]["final"]
-        predicted_tables = [restore_table(item["table"]) for item in final["tables"]]
+        predicted_tables = [
+            restore_table(item["table"])
+            for item in final["tables"]
+            if db_id
+            and _database_identifier_matches(
+                db_id,
+                item.get("db_id"),
+                snowflake=snowflake,
+            )
+        ]
         predicted_columns: dict[str, list[str]] = {}
         for item in final["columns"]:
+            if not db_id or not _database_identifier_matches(
+                db_id,
+                item.get("db_id"),
+                snowflake=snowflake,
+            ):
+                continue
             table = restore_table(item["table"])
             predicted_columns.setdefault(table, []).append(item["column"])
         records.append(
             {
                 "id": prediction["id"],
                 "question": prediction["question"],
+                "external_knowledge": prediction["external_knowledge"],
                 "predict_db_id": db_id,
                 "predict_tables": predicted_tables,
                 "predict_columns": predicted_columns,
@@ -522,9 +875,13 @@ __all__ = [
     "make_usage",
     "normalize_columns",
     "normalize_identifier",
+    "normalize_snowflake_table_name",
     "normalize_table_name",
     "normalize_tables",
+    "restore_snowflake_table_name",
     "safe_path_component",
+    "snowflake_identifier_key",
+    "split_qualified_identifier",
     "replace_predictions",
     "upsert_prediction",
     "usage_from_efficiency",

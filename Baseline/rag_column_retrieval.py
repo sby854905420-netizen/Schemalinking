@@ -29,7 +29,7 @@ from Utils.prediction_store import (
     upsert_prediction,
 )
 from Utils.value_utils import get_row_value
-from Utils.logging_utils import build_run_log_path, log_run_configuration, setup_task_logger
+from Utils.qdrant_utils import resolve_qdrant_collection_name
 from Utils.tools import (
     build_db_id_filter,
     get_qdrant_client,
@@ -90,18 +90,6 @@ def load_dataset(input_path: Path) -> pd.DataFrame:
     if not input_path.is_file():
         raise FileNotFoundError(f"Could not find input file at {input_path}.")
     return pd.read_json(input_path)
-
-
-def load_qdrant_collection_name(qdrant_path: Path, fallback: str) -> str:
-    meta_path = qdrant_path / "meta.json"
-    if not meta_path.is_file():
-        return fallback
-
-    meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    collections = meta.get("collections")
-    if isinstance(collections, dict) and collections:
-        return str(next(iter(collections)))
-    return fallback
 
 
 def point_payload(point: Any) -> dict[str, Any]:
@@ -401,8 +389,9 @@ def main() -> None:
     input_path = resolve_project_path(args.input_path) if args.input_path else current_dataset_root / "gold_sl.json"
     qdrant_path = resolve_project_path(args.qdrant_path) if args.qdrant_path else current_dataset_root / "qdrant_column_index"
     documents_dir = current_dataset_root / "documents"
-    collection_name = args.collection_name or load_qdrant_collection_name(
-        qdrant_path=qdrant_path,
+    collection_name = resolve_qdrant_collection_name(
+        qdrant_path,
+        explicit_name=args.collection_name,
         fallback=dataset_name,
     )
     top_k = validate_top_k(args.top_k, "top-k")
@@ -433,32 +422,6 @@ def main() -> None:
         schema_linking_model_name=embedding_model_name,
     )
     replace_predictions(prediction_path, [])
-    log_path = build_run_log_path(BASELINE_NAME, dataset_name, embedding_model_name)
-    logger, logger_path = setup_task_logger(BASELINE_NAME, log_path)
-    log_run_configuration(
-        logger,
-        task_name="RAG Column Retrieval Baseline",
-        dataset_name=dataset_name,
-        data_count=len(dataset_df),
-        model_name=BASELINE_NAME,
-        provider=BASELINE_PROVIDER,
-        result_path=prediction_path,
-        extra_fields={
-            "Input path": input_path,
-            "Qdrant path": qdrant_path,
-            "Qdrant collection": collection_name,
-            "Embedding model": embedding_model_name,
-            "Cache dir": cache_dir,
-            "Device": args.device or "auto",
-            "Global top k": global_top_k,
-            "Local top k": local_top_k,
-            "Start index": args.start_index,
-            "Limit": args.limit,
-            "Logger path": logger_path,
-            "Unified prediction path": prediction_path,
-        },
-    )
-
     from Llm.embedding_model_loader import EmbeddingModelLoader
 
     embedder = EmbeddingModelLoader(
@@ -481,7 +444,7 @@ def main() -> None:
         limit=args.limit,
         prediction_path=prediction_path,
     )
-    logger.info("Completed %s records.", processed_count)
+    print(f"Completed {processed_count} RAG baseline records.")
 
 
 if __name__ == "__main__":
