@@ -118,6 +118,14 @@ class TransformersChatBackend:
         messages: Sequence[Mapping[str, Any]],
         generation_config: Mapping[str, Any] | None = None,
     ) -> str:
+        response, _ = self.generate_with_usage(messages, generation_config)
+        return response
+
+    def generate_with_usage(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        generation_config: Mapping[str, Any] | None = None,
+    ) -> tuple[str, int]:
         inputs = self._model_inputs(messages)
         input_length = int(inputs["input_ids"].shape[-1])
         if input_length > self.max_input_length:
@@ -148,7 +156,9 @@ class TransformersChatBackend:
             with self.torch.inference_mode():
                 outputs = self.model.generate(**inputs, use_cache=True, **kwargs)
         generated = outputs[0, input_length:]
-        return self.tokenizer.decode(generated, skip_special_tokens=True).strip()
+        output_length = int(generated.shape[-1])
+        response = self.tokenizer.decode(generated, skip_special_tokens=True).strip()
+        return response, input_length + output_length
 
 
 __all__ = ["TransformersChatBackend"]

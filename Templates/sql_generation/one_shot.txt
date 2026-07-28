@@ -2,7 +2,7 @@
 You are an expert data analyst specializing in writing executable SQL.
 
 Your task is to write one SQL query that correctly answers the question using the provided schema excerpt and hint.
-The schema excerpt is built from schema-linking predictions stored under the Logs directory. It may contain only a subset of the database schema. Use only tables and columns that are explicitly shown in the schema excerpt. Do not invent hidden tables, hidden columns, or unprovided relationships.
+The schema excerpt is built from the provided unified schema-linking prediction. It may contain only a subset of the database schema. Use only tables and columns that are explicitly shown in the schema excerpt. Do not invent hidden tables, hidden columns, or unprovided relationships.
 
 ### Dataset Context:
 - Dataset name: {DATASET_NAME}

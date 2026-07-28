@@ -19,7 +19,7 @@
 | 评估 | [`Evaluation/evaluate_metrics.py`](Evaluation/evaluate_metrics.py) | 计算 LA、EM、Recall、Avg_Ratio、Avg_token、Avg_time |
 | 评估 | [`Evaluation/evaluate_ex.py`](Evaluation/evaluate_ex.py) | 执行预测/gold SQL 并计算 EX |
 
-目录职责和新增文件放置规则见 [`docs/project_structure.md`](docs/project_structure.md)。新结果使用正确拼写的 `database_retrieval`；读取阶段仍兼容历史 `Database_Retrival` 目录及 `*_retrival_*.json` 文件。
+目录职责和新增文件放置规则见 [`docs/project_structure.md`](docs/project_structure.md)。
 
 ## 1. 环境准备
 
@@ -57,7 +57,7 @@ pip install -r requirements.txt
 | `global_coarse_retrieval.py` | `transformers` | 需要 tokenizer 计数和下一 token logits 做 yes/no 重排 |
 | `baseline_schema_linking.py` | `transformers` | schema 渲染器依赖 `answer_llm.tokenizer` |
 | `table_to_column.py` | `transformers` | 依赖 tokenizer 计数、schema 裁剪和本地 embedding 检索 |
-| `sql_generator.py` | Agent：`transformers`；one-shot：`transformers` / `openai` | 默认 Spider-Agent-TC 固定使用本地 Qwen3-Coder；旧 provider 兼容性由 `--generator-mode one_shot` 保留 |
+| `sql_generator.py` | Agent：`transformers`；one-shot：`transformers` / `openai` | 默认 Spider-Agent-TC 固定使用本地 Qwen3-Coder；one-shot 支持普通文本生成 provider |
 
 使用 OpenAI provider 时，代码会优先读取环境变量 `OPENAI_API_KEY`，也可以读取 `OPENAI_CREDENTIAL_PATH` 或项目根目录下的 `gpt_credential.json`。凭据 JSON 支持 `api_key`、`openai_api_key`、`OPENAI_API_KEY`、`key` 字段。
 
@@ -279,7 +279,13 @@ SQL 统一结果独立保存，不修改 Schema Linking 文件：
 results/sql/<sql_method>/<dataset>/<sql_model>/<sl_method>/<sl_model>.json
 ```
 
-SQL generator 可通过 `--input-path` 直接读取统一 SL 文件，也可同时指定 `--sl-method` 和 `--schema-llm-name` 使用默认统一路径。
+SQL generator 可通过 `--input-path` 直接读取统一 SL 文件，也可同时指定 `--sl-method` 和 `--schema-llm-name` 使用默认统一路径。三类输入使用以下样本对齐规则：
+
+- MDB-link 自身的 `prompt_baseline`、`table_to_column` 和 `rag_column_retrieval` 结果直接使用统一预测中的稳定 ID，不做外部 ID 转换。
+- LinkAlign 会与数据源 ID 做严格对齐；当预测 ID 与 gold ID 不同（例如 MMQA 的 `two_table_*`/`three_table_*`）时，必须通过 `--dataset-path` 提供对应源数据。源数据中的 `instance_id` 与统一预测 ID 精确匹配，`gold_id` 作为最终 SQL/evaluation ID；question 必须完全一致。缺少 SL 预测的源样本会按 gold 顺序补成 `failed` 占位，不会调用 SQL 模型。
+- AutoLink 的 MMQA `mmqa_N` 按严格前缀规则映射到 gold ID `N`，并校验 question；它默认使用 `Data/MMQA/gold_sl.json`，不需要额外的映射文件。缺少预测时同样写入 `failed` 占位。
+
+ID 对齐不使用 question、位置或数据库名称作为匹配键；这些字段只用于匹配后的完整性校验，避免重复问题造成误映射。
 
 `method: autolink` 是显式的 oracle-database 对比模式。SQL generator 使用 `Data/<dataset>/gold_sl.json` 按稳定样本 ID 定位 gold `db_id`（MMQA 将 `mmqa_N` 映射到 gold ID `N`，校验 question 完全一致，并以 gold ID 写出 SQL 结果），只保留 AutoLink `schema_linking.final.columns` 中属于该数据库的列；其他数据库的表列全部丢弃。若样本无法可靠匹配 gold 记录，或 gold 数据库没有任何预测列，该样本会在调用 SQL 模型前直接写为 `failed`。为保证不引入预测之外的列，该模式拒绝 `--include-key-columns`。
 
@@ -397,11 +403,11 @@ SQL generator 可通过 `--input-path` 直接读取统一 SL 文件，也可同�
 
 ## 6. SQL Generator：Spider-Agent-TC 与 one-shot 对比
 
-[`Run/sql_generator.py`](Run/sql_generator.py) 默认使用 `spider_agent_tc`：Qwen3-Coder 先输出 XML tool call，执行候选 SQL，再根据 SQLite/Snowflake 返回的样例行或错误迭代修正，最后以 `terminate` 提交 SQL。原有一次提示、一次生成的完整实现保留在 [`Run/one_shot_sql_generator.py`](Run/one_shot_sql_generator.py)，可通过 `--generator-mode one_shot` 继续运行并做消融对比。两种模式共享同一个 `SchemaLinkingAdapter`，只接收 `predict_db_id`、`predict_tables` 和 `predict_columns` 指定的 schema。
+[`Run/sql_generator.py`](Run/sql_generator.py) 统一实现两种 SQL 生成模式。默认的 `spider_agent_tc` 让 Qwen3-Coder 输出 XML tool call，执行候选 SQL，再根据 SQLite/Snowflake 返回的样例行或错误迭代修正，最后以 `terminate` 提交 SQL；`--generator-mode one_shot` 则执行一次提示、一次生成，用于消融对比。两种模式共享同一个 `SchemaLinkingAdapter`，只接收 `predict_db_id`、`predict_tables` 和 `predict_columns` 指定的 schema。
 
-Spider-Agent-TC 会把当前数据集的执行函数和 `terminate` 作为原生 tools 传入 Qwen chat template，并用结构化 tool-call/tool-response 消息维护多轮历史。协议保持严格：不带 `<tool_call>` 的裸 SQL 或 Markdown SQL 不会作为候选查询执行。未通过 `terminate` 验证的运行会在统一 SQL 预测文件旁写入 `<stem>_agent_failures.json`，保存逐轮原始回复和错误，同时不改变预测文件的 schema。
+Spider-Agent-TC 会把当前数据集的执行函数和 `terminate` 作为原生 tools 传入 Qwen chat template，并用结构化 tool-call/tool-response 消息维护多轮历史。协议保持严格：不带 `<tool_call>` 的裸 SQL 或 Markdown SQL 不会作为候选查询执行。未通过 `terminate` 验证的运行会在统一 SQL 预测文件旁写入 `<stem>_agent_failures.json`，保存逐轮原始回复和错误。
 
-主实验配置固定为 `Qwen/Qwen3-Coder-30B-A3B-Instruct`、Transformers BF16、单张 A100 80GB、`cuda:0`、SDPA、输入上限 24576 tokens、输出上限 4096 tokens。默认最多 10 个 Agent round，每次模型调用失败后额外重试 2 次；Spider2、MMQA 和 BIRD 使用同一套生成超参数。
+主实验配置固定为 `Qwen/Qwen3-Coder-30B-A3B-Instruct`、Transformers BF16、单张 A100 80GB、`cuda:0`、SDPA、输入上限 24576 tokens、输出上限 4096 tokens。默认最多 20 个 Agent round，每次模型调用失败后额外重试 2 次；Spider2、MMQA 和 BIRD 使用同一套生成超参数。
 
 执行后端：
 
@@ -430,9 +436,31 @@ python -m Run.sql_generator \
   --resume
 ```
 
-运行旧方法时只需改为 `--generator-mode one_shot`。`--dry-run --limit 1` 只检查输入、Adapter、executor 路由和 prompt 预算，不加载 30B 模型，也不连接数据库。
+LinkAlign MMQA 使用其带 `instance_id`/`gold_id` 的源数据完成 ID 对齐：
 
-SQL 预测文件使用统一 `predictions` 契约，每条记录包含 `id`、`predicted_sql`、`status` 和 `error`。结果逐样本原子写入，`--resume` 会按稳定 id 跳过已经完成的记录。
+```bash
+python -m Run.sql_generator \
+  --dataset-name MMQA \
+  --generator-mode spider_agent_tc \
+  --input-path <linkalign/results/sl/linkalign/MMQA/.../prediction.json> \
+  --dataset-path <linkalign/Data/MMQA/Synthesized_preprocessed_data.json>
+```
+
+旧版 LinkAlign SQL 结果使用 `two_table_*`/`three_table_*` ID；首次切换前应先停止旧生成作业，并且不要添加 `--resume`。生成器会拒绝把旧 ID 与新 ID 混写。完成首次替换后，后续运行可以正常使用 `--resume`。
+
+AutoLink MMQA 已由默认 `gold_sl.json` 提供 `mmqa_N` 映射，只需指定预测文件：
+
+```bash
+python -m Run.sql_generator \
+  --dataset-name MMQA \
+  --generator-mode spider_agent_tc \
+  --input-path <autolink/results/sl/autolink/MMQA/.../prediction.json> \
+  --resume
+```
+
+切换到单次生成时使用 `--generator-mode one_shot`。`--dry-run --limit 1` 不加载模型或连接数据库：两种模式都会检查输入、Adapter 和各自的 prompt 预算，Agent 模式还会检查 executor 路由。
+
+SQL 预测文件使用统一 `predictions` 契约，每条新记录包含 `id`、`predicted_sql`、`status`、`error`、`agent_rounds`、`total_tokens` 和 `elapsed_seconds`。Spider-Agent-TC 的三个统计字段分别表示该样本所有已执行 rollout 的 Agent 轮次总和、全部模型调用的输入与输出 token 总和，以及包含模型生成和 SQL 执行在内的墙钟时间；one-shot 的这三个字段为 `null`。结果逐样本原子写入，`--resume` 会按稳定 id 跳过已经完成的记录；旧版四字段记录仍可读取，但只有重新生成的样本才会获得真实统计值。
 
 ## 7. 常见注意事项
 

@@ -8,21 +8,22 @@ from Utils.schema_selection import (
     canonicalize_snowflake_schema_predictions,
     select_predicted_column_records,
 )
-from Utils.schema_prediction_utils import resolve_predicted_columns, resolve_predicted_tables
+from Utils.schema_prediction_utils import (
+    normalize_predicted_columns,
+    normalize_predicted_tables,
+)
 from Utils.tools import resolve_hint
-from Utils.value_utils import choose_external_knowledge_source, get_row_value
+from Utils.value_utils import choose_external_knowledge_source
 
 from .result_types import AgentInput
 
 
 class AdapterError(ValueError):
-    def __init__(self, code: str, message: str) -> None:
-        super().__init__(message)
-        self.code = code
+    pass
 
 
 class SchemaLinkingAdapter:
-    """Turn legacy MDB-Link logs into a typed, prediction-only agent input."""
+    """Turn a validated schema prediction into a typed agent input."""
 
     def __init__(
         self,
@@ -43,28 +44,47 @@ class SchemaLinkingAdapter:
         self,
         row: Mapping[str, Any],
         source_row: Mapping[str, Any] | None = None,
-        *,
-        fallback_sample_id: str = "",
     ) -> AgentInput:
         source = source_row or {}
         schema_input_error = str(row.get("schema_input_error") or "").strip()
         if schema_input_error:
-            raise AdapterError("schema_input_error", schema_input_error)
-        sample_id_value = get_row_value(row, "id", "instance_id") or get_row_value(
-            source, "id", "instance_id"
+            raise AdapterError(schema_input_error)
+        raw_sample_id = row.get("id")
+        raw_question = row.get("question")
+        raw_predict_db_id = row.get("predict_db_id")
+        sample_id = raw_sample_id.strip() if isinstance(raw_sample_id, str) else ""
+        question = raw_question.strip() if isinstance(raw_question, str) else ""
+        predict_db_id = (
+            raw_predict_db_id.strip() if isinstance(raw_predict_db_id, str) else ""
         )
-        sample_id = str(sample_id_value or fallback_sample_id).strip()
-        question = str(row.get("question") or source.get("question") or "").strip()
-        predict_db_id = str(get_row_value(row, "predict_db_id") or "").strip()
         if not sample_id:
-            raise AdapterError("missing_id", "Missing stable sample id.")
+            raise AdapterError("Missing stable sample id.")
         if not question:
-            raise AdapterError("missing_question", "Missing question.")
+            raise AdapterError("Missing question.")
         if not predict_db_id:
-            raise AdapterError("missing_predict_db_id", "Missing predicted database.")
+            raise AdapterError("Missing predicted database.")
 
-        predicted_columns = resolve_predicted_columns(row)
-        predicted_tables = resolve_predicted_tables(row)
+        raw_predicted_columns = row.get("predict_columns")
+        raw_predicted_tables = row.get("predict_tables")
+        if not isinstance(raw_predicted_columns, Mapping):
+            raise AdapterError("Predicted columns must be a mapping.")
+        if any(
+            not isinstance(table, str)
+            or not isinstance(columns, list)
+            or any(not isinstance(column, str) for column in columns)
+            for table, columns in raw_predicted_columns.items()
+        ):
+            raise AdapterError(
+                "Predicted columns must map table names to lists of column names.",
+            )
+        if not isinstance(raw_predicted_tables, list) or any(
+            not isinstance(table, str) for table in raw_predicted_tables
+        ):
+            raise AdapterError(
+                "Predicted tables must be a list of table names.",
+            )
+        predicted_columns = normalize_predicted_columns(raw_predicted_columns)
+        predicted_tables = normalize_predicted_tables(raw_predicted_tables)
         name_diagnostics: dict[str, Any] = {}
         if self.dataset_name.strip().lower() == "spider2":
             (
@@ -87,7 +107,6 @@ class SchemaLinkingAdapter:
         if not selected_records:
             if predict_db_id not in self.schema_store.db_info_index:
                 raise AdapterError(
-                    "invalid_predict_db_id",
                     f"Predicted database '{predict_db_id}' is absent from db_info.json.",
                 )
             unresolved = [
@@ -100,13 +119,12 @@ class SchemaLinkingAdapter:
                 else ""
             )
             raise AdapterError(
-                "empty_predicted_schema",
                 f"No selected schema columns.{detail}",
             )
 
-        # Only question/hint/id are read from source data here. Any method-specific
-        # preparation (including AutoLink's explicit oracle-database filtering) has
-        # already been materialized in the prediction row.
+        # Method-specific preparation (including AutoLink's explicit
+        # oracle-database filtering) has already been materialized in the row.
+        # The source row is used only as the authoritative hint source.
         hint_source = choose_external_knowledge_source(source, row)
         hint = resolve_hint(
             hint_source,

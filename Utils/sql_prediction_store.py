@@ -78,6 +78,9 @@ def upsert_sql_prediction(
     predicted_sql: str | None,
     status: str,
     error: str | None = None,
+    agent_rounds: int | None = None,
+    total_tokens: int | None = None,
+    elapsed_seconds: float | None = None,
 ) -> None:
     output_path = Path(path)
     payload = validate_sql_prediction_file(output_path)
@@ -90,6 +93,11 @@ def upsert_sql_prediction(
             None
             if error is None
             else {"stage": "sql_generation", "message": str(error)}
+        ),
+        "agent_rounds": None if agent_rounds is None else int(agent_rounds),
+        "total_tokens": None if total_tokens is None else int(total_tokens),
+        "elapsed_seconds": (
+            None if elapsed_seconds is None else round(float(elapsed_seconds), 6)
         ),
     }
     payload["predictions"] = upsert_ordered_record(payload["predictions"], record)
@@ -144,11 +152,16 @@ def validate_sql_prediction_file(
         raise ValueError("SQL predictions must be a list.")
     seen: set[str] = set()
     for record in payload["predictions"]:
-        if not isinstance(record, dict) or set(record) != {
+        legacy_fields = {
             "id",
             "predicted_sql",
             "status",
             "error",
+        }
+        metric_fields = {"agent_rounds", "total_tokens", "elapsed_seconds"}
+        if not isinstance(record, dict) or frozenset(record) not in {
+            frozenset(legacy_fields),
+            frozenset(legacy_fields | metric_fields),
         }:
             raise ValueError("SQL prediction contains an invalid record.")
         if not isinstance(record["id"], str) or not record["id"] or record["id"] in seen:
@@ -160,6 +173,22 @@ def validate_sql_prediction_file(
             record["predicted_sql"], str
         ):
             raise ValueError("predicted_sql must be a string or null.")
+        if metric_fields.issubset(record):
+            for key in ("agent_rounds", "total_tokens"):
+                value = record[key]
+                if value is not None and (
+                    not isinstance(value, int)
+                    or isinstance(value, bool)
+                    or value < 0
+                ):
+                    raise ValueError(f"SQL prediction {key} is invalid.")
+            elapsed_seconds = record["elapsed_seconds"]
+            if elapsed_seconds is not None and (
+                not isinstance(elapsed_seconds, (int, float))
+                or isinstance(elapsed_seconds, bool)
+                or elapsed_seconds < 0
+            ):
+                raise ValueError("SQL prediction elapsed_seconds is invalid.")
         error = record["error"]
         if error is not None and (
             not isinstance(error, dict)

@@ -45,5 +45,6 @@ class AgentResult:
     stop_reason: str
     execution_verified: bool
     rounds: int = 0
+    total_tokens: int = 0
     error: str = ""
     messages: tuple[dict[str, Any], ...] = field(default_factory=tuple, repr=False)

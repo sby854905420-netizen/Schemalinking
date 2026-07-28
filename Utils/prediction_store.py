@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -607,33 +607,188 @@ def build_prediction(
     return prediction
 
 
-def _gold_record_aliases(record: Mapping[str, Any], dataset_name: str) -> list[str]:
-    raw_id = record.get("id", record.get("instance_id"))
-    if raw_id is None:
-        return []
-    sample_id = str(raw_id).strip()
-    if not sample_id:
-        return []
+def _gold_record_id(record: Mapping[str, Any]) -> str:
+    raw_id = record.get("id")
+    return str(raw_id).strip() if raw_id is not None else ""
+
+
+def _autolink_prediction_id(gold_id: str, dataset_name: str) -> str:
     if str(dataset_name).strip().lower() == "mmqa":
-        return [f"mmqa_{sample_id}"] if sample_id.isdigit() else []
-    return [sample_id]
+        return f"mmqa_{gold_id}" if gold_id.isdigit() else ""
+    return gold_id
 
 
-def _index_gold_records(
-    gold_records: Sequence[Mapping[str, Any]], dataset_name: str
-) -> dict[str, Mapping[str, Any]]:
-    index: dict[str, Mapping[str, Any]] = {}
-    for record in gold_records:
+def _source_record_id(record: Mapping[str, Any]) -> str:
+    for key in ("instance_id", "id"):
+        raw_id = record.get(key)
+        if raw_id is not None:
+            sample_id = str(raw_id).strip()
+            if sample_id:
+                return sample_id
+    return ""
+
+
+def _canonical_source_id(record: Mapping[str, Any]) -> str:
+    """Return the SQL/evaluation id represented by one dataset row."""
+
+    raw_gold_id = record.get("gold_id")
+    if raw_gold_id is not None:
+        gold_id = str(raw_gold_id).strip()
+        if gold_id:
+            return gold_id
+    return _source_record_id(record)
+
+
+def _validated_linkalign_sources(
+    source_records: Sequence[Mapping[str, Any]], dataset_name: str
+) -> tuple[list[Mapping[str, Any]], dict[str, Mapping[str, Any]]]:
+    ordered: list[Mapping[str, Any]] = []
+    source_index: dict[str, Mapping[str, Any]] = {}
+    canonical_ids: set[str] = set()
+    require_gold_id = str(dataset_name).strip().lower() == "mmqa"
+    for index, record in enumerate(source_records):
         if not isinstance(record, Mapping):
-            continue
-        for alias in _gold_record_aliases(record, dataset_name):
-            existing = index.get(alias)
-            if existing is not None and existing is not record:
-                raise PredictionValidationError(
-                    f"Duplicate gold sample id or alias: {alias!r}."
-                )
-            index[alias] = record
-    return index
+            raise PredictionValidationError(
+                f"Dataset source row {index} must be a JSON object."
+            )
+        raw_instance_id = record.get("instance_id")
+        instance_id = (
+            str(raw_instance_id).strip() if raw_instance_id is not None else ""
+        )
+        if not instance_id and not require_gold_id:
+            instance_id = _source_record_id(record)
+        if not instance_id:
+            raise PredictionValidationError(
+                f"LinkAlign dataset source row {index} has no instance_id. "
+                "Pass --dataset-path with the LinkAlign synthesized source data."
+            )
+        raw_gold_id = record.get("gold_id")
+        gold_id = str(raw_gold_id).strip() if raw_gold_id is not None else ""
+        if require_gold_id and not gold_id:
+            raise PredictionValidationError(
+                f"LinkAlign MMQA dataset source row {index} has no gold_id."
+            )
+        source_id = instance_id
+        canonical_id = _canonical_source_id(record)
+        if canonical_id in canonical_ids:
+            raise PredictionValidationError(
+                f"Duplicate canonical dataset id: {canonical_id!r}."
+            )
+        if source_id in source_index:
+            raise PredictionValidationError(
+                f"Duplicate dataset source id: {source_id!r}."
+            )
+        canonical_ids.add(canonical_id)
+        ordered.append(record)
+        source_index[source_id] = record
+    return ordered, source_index
+
+
+def _validated_gold_records(
+    gold_records: Sequence[Mapping[str, Any]], dataset_name: str
+) -> tuple[list[Mapping[str, Any]], dict[str, Mapping[str, Any]]]:
+    ordered: list[Mapping[str, Any]] = []
+    prediction_index: dict[str, Mapping[str, Any]] = {}
+    for index, record in enumerate(gold_records):
+        if not isinstance(record, Mapping):
+            raise PredictionValidationError(
+                f"Gold dataset row {index} must be a JSON object."
+            )
+        gold_id = _gold_record_id(record)
+        if not gold_id:
+            raise PredictionValidationError(
+                f"Gold dataset row {index} has no id."
+            )
+        prediction_id = _autolink_prediction_id(gold_id, dataset_name)
+        if not prediction_id:
+            raise PredictionValidationError(
+                f"Gold dataset row {index} has an invalid AutoLink id: {gold_id!r}."
+            )
+        if prediction_id in prediction_index:
+            raise PredictionValidationError(f"Duplicate gold dataset id: {gold_id!r}.")
+        ordered.append(record)
+        prediction_index[prediction_id] = record
+    return ordered, prediction_index
+
+
+def _prefailed_native_record(
+    *,
+    sample_id: str,
+    question: Any,
+    external_knowledge: Any,
+    message: str,
+    source_id: str = "",
+    predict_db_id: str | None = None,
+) -> dict[str, Any]:
+    record = {
+        "id": sample_id,
+        "question": str(question or ""),
+        "external_knowledge": external_knowledge,
+        "predict_db_id": predict_db_id,
+        "predict_tables": [],
+        "predict_columns": {},
+        "schema_input_error": message,
+    }
+    if source_id and source_id != sample_id:
+        record["source_id"] = source_id
+    return record
+
+
+def _missing_prediction_record(
+    source: Mapping[str, Any],
+    method: str,
+    *,
+    source_id: str,
+    canonical_id: str,
+) -> dict[str, Any]:
+    return _prefailed_native_record(
+        sample_id=canonical_id,
+        source_id=source_id,
+        question=source.get("question"),
+        external_knowledge=source.get("external_knowledge"),
+        message=(
+            f"Missing {method} schema-linking prediction for source sample "
+            f"{source_id!r}."
+        ),
+    )
+
+
+def _order_and_fill_native_records(
+    records: Sequence[dict[str, Any]],
+    source_records: Sequence[Mapping[str, Any]],
+    *,
+    method: str,
+    source_id_for: Callable[[Mapping[str, Any]], str],
+    canonical_id_for: Callable[[Mapping[str, Any]], str],
+) -> list[dict[str, Any]]:
+    records_by_id: dict[str, dict[str, Any]] = {}
+    for record in records:
+        sample_id = str(record.get("id") or "").strip()
+        if not sample_id:
+            raise PredictionValidationError("Native schema record has no stable id.")
+        if sample_id in records_by_id:
+            raise PredictionValidationError(
+                f"Multiple predictions map to canonical sample id {sample_id!r}."
+            )
+        records_by_id[sample_id] = record
+
+    result: list[dict[str, Any]] = []
+    for source in source_records:
+        source_id = source_id_for(source)
+        canonical_id = canonical_id_for(source)
+        record = records_by_id.pop(canonical_id, None)
+        result.append(
+            record
+            if record is not None
+            else _missing_prediction_record(
+                source,
+                method,
+                source_id=source_id,
+                canonical_id=canonical_id,
+            )
+        )
+    result.extend(records_by_id.values())
+    return result
 
 
 def _native_autolink_record(
@@ -646,63 +801,41 @@ def _native_autolink_record(
     gold = gold_index.get(sample_id)
     external_knowledge = prediction.get("external_knowledge")
     if gold is None:
-        return {
-            "id": sample_id,
-            "question": prediction["question"],
-            "external_knowledge": external_knowledge,
-            "predict_db_id": None,
-            "predict_tables": [],
-            "predict_columns": {},
-            "schema_input_error": (
+        return _prefailed_native_record(
+            sample_id=sample_id,
+            question=prediction["question"],
+            external_knowledge=external_knowledge,
+            message=(
                 f"AutoLink sample {sample_id!r} could not be matched to a gold record."
             ),
-        }
+        )
 
-    raw_gold_id = gold.get("id", gold.get("instance_id"))
-    gold_sample_id = str(raw_gold_id).strip() if raw_gold_id is not None else ""
-    if not gold_sample_id:
-        return {
-            "id": sample_id,
-            "question": prediction["question"],
-            "external_knowledge": external_knowledge,
-            "predict_db_id": None,
-            "predict_tables": [],
-            "predict_columns": {},
-            "schema_input_error": (
-                f"Gold record for AutoLink sample {sample_id!r} has no stable id."
-            ),
-        }
+    gold_sample_id = _gold_record_id(gold)
 
     predicted_question = str(prediction.get("question") or "").strip()
     gold_question = str(gold.get("question") or "").strip()
     if predicted_question != gold_question:
-        return {
-            "id": gold_sample_id,
-            "question": prediction["question"],
-            "external_knowledge": external_knowledge,
-            "predict_db_id": None,
-            "predict_tables": [],
-            "predict_columns": {},
-            "schema_input_error": (
+        return _prefailed_native_record(
+            sample_id=gold_sample_id,
+            question=prediction["question"],
+            external_knowledge=external_knowledge,
+            message=(
                 f"AutoLink sample {sample_id!r} does not match its gold question."
             ),
-        }
+        )
 
     if external_knowledge is None:
         external_knowledge = gold.get("external_knowledge")
     gold_db_id = normalize_identifier(gold.get("db_id"))
     if not gold_db_id:
-        return {
-            "id": gold_sample_id,
-            "question": prediction["question"],
-            "external_knowledge": external_knowledge,
-            "predict_db_id": None,
-            "predict_tables": [],
-            "predict_columns": {},
-            "schema_input_error": (
+        return _prefailed_native_record(
+            sample_id=gold_sample_id,
+            question=prediction["question"],
+            external_knowledge=external_knowledge,
+            message=(
                 f"Gold record for AutoLink sample {sample_id!r} has no db_id."
             ),
-        }
+        )
 
     snowflake = str(dataset_name).strip().lower() == "spider2"
 
@@ -723,18 +856,16 @@ def _native_autolink_record(
         )
     ]
     if not filtered_columns:
-        return {
-            "id": gold_sample_id,
-            "question": prediction["question"],
-            "external_knowledge": external_knowledge,
-            "predict_db_id": gold_db_id,
-            "predict_tables": [],
-            "predict_columns": {},
-            "schema_input_error": (
+        return _prefailed_native_record(
+            sample_id=gold_sample_id,
+            question=prediction["question"],
+            external_knowledge=external_knowledge,
+            predict_db_id=gold_db_id,
+            message=(
                 "AutoLink predicted no columns for gold database "
                 f"{gold_db_id!r}."
             ),
-        }
+        )
 
     column_table_order: list[str] = []
     predicted_columns: dict[str, list[str]] = {}
@@ -750,18 +881,16 @@ def _native_autolink_record(
             predicted_columns[table].append(column_name)
 
     if not predicted_columns:
-        return {
-            "id": gold_sample_id,
-            "question": prediction["question"],
-            "external_knowledge": external_knowledge,
-            "predict_db_id": gold_db_id,
-            "predict_tables": [],
-            "predict_columns": {},
-            "schema_input_error": (
+        return _prefailed_native_record(
+            sample_id=gold_sample_id,
+            question=prediction["question"],
+            external_knowledge=external_knowledge,
+            predict_db_id=gold_db_id,
+            message=(
                 "AutoLink predicted no usable columns for gold database "
                 f"{gold_db_id!r}."
             ),
-        }
+        )
 
     predicted_tables: list[str] = []
     for table in final["tables"]:
@@ -791,6 +920,126 @@ def _native_autolink_record(
     }
 
 
+def _native_non_autolink_record(
+    prediction: Mapping[str, Any],
+    *,
+    dataset_name: str,
+    sample_id: str,
+    source: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    source_id = _source_record_id(source or {})
+    if source is not None:
+        predicted_question = str(prediction.get("question") or "").strip()
+        source_question = str(source.get("question") or "").strip()
+        if predicted_question != source_question:
+            return _prefailed_native_record(
+                sample_id=sample_id,
+                source_id=source_id,
+                question=prediction.get("question"),
+                external_knowledge=prediction.get("external_knowledge"),
+                message=(
+                    f"Schema-linking sample {prediction['id']!r} does not match "
+                    f"dataset sample {source_id!r}."
+                ),
+            )
+
+    selected = prediction["database_selection"]["selected_db_ids"]
+    db_id = normalize_identifier(selected[0]) if selected else None
+    snowflake = str(dataset_name).lower() == "spider2"
+
+    def restore_table(table_name: str) -> str:
+        if snowflake and db_id:
+            return restore_snowflake_table_name(db_id, table_name)
+        return normalize_identifier(table_name)
+
+    final = prediction["schema_linking"]["final"]
+    predicted_tables = [
+        restore_table(item["table"])
+        for item in final["tables"]
+        if db_id
+        and _database_identifier_matches(
+            db_id,
+            item.get("db_id"),
+            snowflake=snowflake,
+        )
+    ]
+    predicted_columns: dict[str, list[str]] = {}
+    for item in final["columns"]:
+        if not db_id or not _database_identifier_matches(
+            db_id,
+            item.get("db_id"),
+            snowflake=snowflake,
+        ):
+            continue
+        table = restore_table(item["table"])
+        predicted_columns.setdefault(table, []).append(item["column"])
+    record = {
+        "id": sample_id,
+        "question": prediction["question"],
+        "external_knowledge": prediction["external_knowledge"],
+        "predict_db_id": db_id,
+        "predict_tables": predicted_tables,
+        "predict_columns": predicted_columns,
+    }
+    if source_id and source_id != sample_id:
+        record["source_id"] = source_id
+    return record
+
+
+def _native_non_autolink_records(
+    unified: Mapping[str, Any],
+    dataset_name: str,
+    source_records: Sequence[Mapping[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    predictions = unified["predictions"]
+    if unified["method"] != "linkalign":
+        return [
+            _native_non_autolink_record(
+                prediction,
+                dataset_name=dataset_name,
+                sample_id=prediction["id"],
+                source=None,
+            )
+            for prediction in predictions
+        ]
+    if source_records is None:
+        raise PredictionValidationError(
+            "LinkAlign SQL generation requires dataset source records containing "
+            "the instance_id-to-gold_id mapping."
+        )
+
+    ordered_sources, source_id_index = _validated_linkalign_sources(
+        source_records, dataset_name
+    )
+    records: list[dict[str, Any]] = []
+    for prediction in predictions:
+        prediction_id = str(prediction["id"])
+        source = source_id_index.get(prediction_id)
+        if source is None:
+            raise PredictionValidationError(
+                f"LinkAlign sample {prediction_id!r} is absent from the dataset "
+                "source mapping. Pass --dataset-path with matching instance_id and "
+                "gold_id fields."
+            )
+
+        canonical_id = _canonical_source_id(source)
+        records.append(
+            _native_non_autolink_record(
+                prediction,
+                dataset_name=dataset_name,
+                sample_id=canonical_id,
+                source=source,
+            )
+        )
+    return _order_and_fill_native_records(
+        records,
+        ordered_sources,
+        method=str(unified["method"]),
+        source_id_for=_source_record_id,
+        canonical_id_for=_canonical_source_id,
+    )
+
+
 def unified_to_native_schema_records(
     payload: Mapping[str, Any],
     dataset_name: str,
@@ -809,8 +1058,10 @@ def unified_to_native_schema_records(
             raise PredictionValidationError(
                 "AutoLink SQL generation requires gold records for database filtering."
             )
-        gold_index = _index_gold_records(gold_records, dataset_name)
-        return [
+        ordered_gold_records, gold_index = _validated_gold_records(
+            gold_records, dataset_name
+        )
+        records = [
             _native_autolink_record(
                 prediction,
                 dataset_name=dataset_name,
@@ -818,50 +1069,14 @@ def unified_to_native_schema_records(
             )
             for prediction in unified["predictions"]
         ]
-
-    snowflake = str(dataset_name).lower() == "spider2"
-    records: list[dict[str, Any]] = []
-    for prediction in unified["predictions"]:
-        selected = prediction["database_selection"]["selected_db_ids"]
-        db_id = normalize_identifier(selected[0]) if selected else None
-
-        def restore_table(table_name: str) -> str:
-            if snowflake and db_id:
-                return restore_snowflake_table_name(db_id, table_name)
-            return normalize_identifier(table_name)
-
-        final = prediction["schema_linking"]["final"]
-        predicted_tables = [
-            restore_table(item["table"])
-            for item in final["tables"]
-            if db_id
-            and _database_identifier_matches(
-                db_id,
-                item.get("db_id"),
-                snowflake=snowflake,
-            )
-        ]
-        predicted_columns: dict[str, list[str]] = {}
-        for item in final["columns"]:
-            if not db_id or not _database_identifier_matches(
-                db_id,
-                item.get("db_id"),
-                snowflake=snowflake,
-            ):
-                continue
-            table = restore_table(item["table"])
-            predicted_columns.setdefault(table, []).append(item["column"])
-        records.append(
-            {
-                "id": prediction["id"],
-                "question": prediction["question"],
-                "external_knowledge": prediction["external_knowledge"],
-                "predict_db_id": db_id,
-                "predict_tables": predicted_tables,
-                "predict_columns": predicted_columns,
-            }
+        return _order_and_fill_native_records(
+            records,
+            ordered_gold_records,
+            method="autolink",
+            source_id_for=_gold_record_id,
+            canonical_id_for=_gold_record_id,
         )
-    return records
+    return _native_non_autolink_records(unified, dataset_name, gold_records)
 
 
 __all__ = [

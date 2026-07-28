@@ -530,8 +530,8 @@ def _snowflake_table_candidates(
             return suffix_matches
         db_key = snowflake_identifier_key(db_id)
         if db_key and key[0] == db_key[0]:
-            # Historical unified artifacts may contain DB.TABLE here because
-            # a bare TABLE was prefixed before db_info was available.
+            # A bare model prediction is restored as DB.TABLE before db_info
+            # lookup; resolve it only when the table basename is unique.
             return set(basename_index.get(key[-1], set()))
         return set()
     return set(basename_index.get(key[0], set()))

@@ -78,11 +78,19 @@ class SpiderAgentTC:
         self.max_observation_chars = max_observation_chars
         self.generation_config = dict(generation_config or {})
 
-    def _generate_with_retries(self, messages: list[dict[str, Any]]) -> str:
+    def _generate_with_retries(
+        self, messages: list[dict[str, Any]]
+    ) -> tuple[str, int]:
         last_error: Exception | None = None
         for _ in range(self.max_llm_retries + 1):
             try:
-                return self.backend.generate(messages, self.generation_config)
+                generate_with_usage = getattr(self.backend, "generate_with_usage", None)
+                if callable(generate_with_usage):
+                    response, total_tokens = generate_with_usage(
+                        messages, self.generation_config
+                    )
+                    return str(response), max(0, int(total_tokens))
+                return self.backend.generate(messages, self.generation_config), 0
             except Exception as exc:  # a temporary model failure is sample-local
                 last_error = exc
         assert last_error is not None
@@ -95,12 +103,14 @@ class SpiderAgentTC:
         trace: list[dict[str, Any]] = []
         last_legal_sql = ""
         last_error = ""
+        total_tokens = 0
         execute_function = execute_tool_for_dataset(agent_input.dataset_name)
 
         for round_number in range(1, self.max_agent_rounds + 1):
             messages = self.prompt_builder.build_messages(agent_input, history)
             try:
-                response = self._generate_with_retries(messages)
+                response, round_tokens = self._generate_with_retries(messages)
+                total_tokens += round_tokens
             except Exception as exc:
                 last_error = _safe_error(exc)
                 trace.append(
@@ -113,6 +123,7 @@ class SpiderAgentTC:
                         stop_reason="llm_error",
                         execution_verified=False,
                         rounds=round_number,
+                        total_tokens=total_tokens,
                         error=last_error,
                         messages=tuple(trace),
                     )
@@ -122,6 +133,7 @@ class SpiderAgentTC:
                     stop_reason="llm_error",
                     execution_verified=False,
                     rounds=round_number,
+                    total_tokens=total_tokens,
                     error=last_error,
                     messages=tuple(trace),
                 )
@@ -206,6 +218,7 @@ class SpiderAgentTC:
                     stop_reason="terminate",
                     execution_verified=True,
                     rounds=round_number,
+                    total_tokens=total_tokens,
                     messages=tuple(trace),
                 )
 
@@ -233,6 +246,7 @@ class SpiderAgentTC:
                 stop_reason="max_rounds",
                 execution_verified=False,
                 rounds=self.max_agent_rounds,
+                total_tokens=total_tokens,
                 error=last_error,
                 messages=tuple(trace),
             )
@@ -242,6 +256,7 @@ class SpiderAgentTC:
             stop_reason="max_rounds",
             execution_verified=False,
             rounds=self.max_agent_rounds,
+            total_tokens=total_tokens,
             error=last_error,
             messages=tuple(trace),
         )

@@ -41,18 +41,6 @@ def normalize_predicted_columns(value: Any) -> dict[str, list[str]]:
     return normalized
 
 
-def parse_predicted_columns_from_text(value: Any) -> dict[str, list[str]]:
-    if not isinstance(value, str) or not value.strip():
-        return {}
-    return normalize_predicted_columns(value)
-
-
-def resolve_predicted_columns(row: Mapping[str, Any]) -> dict[str, list[str]]:
-    return normalize_predicted_columns(
-        row.get("predict_columns")
-    ) or parse_predicted_columns_from_text(row.get("predict_columns_text"))
-
-
 def normalize_predicted_tables(value: Any) -> list[str]:
     if isinstance(value, str):
         try:
@@ -76,16 +64,7 @@ def normalize_predicted_tables(value: Any) -> list[str]:
     return normalized
 
 
-def resolve_predicted_tables(row: Mapping[str, Any]) -> list[str]:
-    return normalize_predicted_tables(
-        row.get("predict_tables")
-    ) or normalize_predicted_tables(row.get("predict_tables_text"))
-
-
 __all__ = [
     "normalize_predicted_columns",
     "normalize_predicted_tables",
-    "parse_predicted_columns_from_text",
-    "resolve_predicted_columns",
-    "resolve_predicted_tables",
 ]
